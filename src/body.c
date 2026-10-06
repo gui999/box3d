@@ -1464,9 +1464,10 @@ void b3Body_SetType( b3BodyId bodyId, b3BodyType type )
 		while ( shapeId != B3_NULL_INDEX )
 		{
 			b3Shape* shape = b3Array_Get( world->shapes, shapeId );
-			if ( shape->type == b3_compoundShape || shape->type == b3_heightShape || shape->type == b3_voxelGridShape )
+			if ( shape->type == b3_compoundShape || shape->type == b3_heightShape )
 			{
-				// Setting the body type is not supported for bodies with compound shapes
+				// Setting the body type is not supported for bodies with compound or height shapes
+				world->locked = false;
 				return;
 			}
 
@@ -1614,6 +1615,19 @@ void b3Body_SetType( b3BodyId bodyId, b3BodyType type )
 
 		shapeId = shape->nextShapeId;
 		b3DestroyShapeProxy( shape, &world->broadPhase );
+		if ( shape->type == b3_voxelGridShape )
+		{
+			// A voxel grid on a moving body has the AABB of its boxes, on a static body that of the whole grid
+			if ( type == b3_staticBody )
+			{
+				shape->flags &= (uint8_t)~b3_tightGridBounds;
+			}
+			else
+			{
+				shape->flags |= b3_tightGridBounds;
+			}
+			shape->localCentroid = b3GetShapeCentroid( shape );
+		}
 		bool forcePairCreation = true;
 		b3CreateShapeProxy( shape, &world->broadPhase, type, transform, forcePairCreation );
 	}

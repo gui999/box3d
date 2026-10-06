@@ -915,6 +915,169 @@ static int VoxelGridCharacterQueries( void )
 	return 0;
 }
 
+
+// Dynamic voxel grids: shards made of 0.5 m boxes
+
+#define SHARD_CELL 0.5f
+#define SHARD_CELL_VOXELS 5
+
+typedef struct Shard
+{
+	b3VoxelGridModule* module;
+	b3VoxelGrid* grid;
+	int sizeX, sizeY, sizeZ;
+} Shard;
+
+static int ShardPaddedIndex( const Shard* shard, int i, int j, int k )
+{
+	return ( ( j + 1 ) * ( shard->sizeZ + 2 ) + ( k + 1 ) ) * ( shard->sizeX + 2 ) + ( i + 1 );
+}
+
+// A block of sizeX x sizeY x sizeZ cells, each one solid 0.5 m box. The grid origin is the body origin.
+static bool MakeShard( Shard* shard, int sizeX, int sizeY, int sizeZ )
+{
+	shard->sizeX = sizeX;
+	shard->sizeY = sizeY;
+	shard->sizeZ = sizeZ;
+
+	float box[6] = { 0.0f, 0.0f, 0.0f, SHARD_CELL, SHARD_CELL, SHARD_CELL };
+	shard->module = b3CreateVoxelGridModule( box, 1, SHARD_CELL, SHARD_CELL_VOXELS );
+	if ( shard->module == NULL )
+	{
+		return false;
+	}
+
+	int paddedCount = ( sizeX + 2 ) * ( sizeY + 2 ) * ( sizeZ + 2 );
+	int* padded = (int*)b3Alloc( paddedCount * sizeof( int ) );
+	for ( int i = 0; i < paddedCount; ++i )
+	{
+		padded[i] = -1;
+	}
+
+	for ( int j = 0; j < sizeY; ++j )
+	{
+		for ( int k = 0; k < sizeZ; ++k )
+		{
+			for ( int i = 0; i < sizeX; ++i )
+			{
+				padded[ShardPaddedIndex( shard, i, j, k )] = 0;
+			}
+		}
+	}
+
+	b3VoxelGridDef def = { 0 };
+	def.cellCountX = sizeX;
+	def.cellCountY = sizeY;
+	def.cellCountZ = sizeZ;
+	def.origin = b3Vec3_zero;
+	def.cellMeters = SHARD_CELL;
+	def.cellVoxels = SHARD_CELL_VOXELS;
+	def.maxBoxesPerCell = 1;
+	def.modules = &shard->module;
+	def.moduleCount = 1;
+	def.paddedCells = padded;
+	shard->grid = b3CreateVoxelGrid( &def );
+	b3Free( padded, paddedCount * sizeof( int ) );
+	return shard->grid != NULL;
+}
+
+static void DestroyShard( Shard* shard )
+{
+	b3ReleaseVoxelGrid( shard->grid );
+	b3ReleaseVoxelGridModule( shard->module );
+}
+
+static b3BodyId CreateShardBody( b3WorldId worldId, const Shard* shard, b3Vec3 position, float friction, b3ShapeId* shapeId )
+{
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	bodyDef.position = position;
+	b3BodyId bodyId = b3CreateBody( worldId, &bodyDef );
+
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	shapeDef.baseMaterial.friction = friction;
+	b3ShapeId id = b3CreateVoxelGridShape( bodyId, &shapeDef, shard->grid );
+	if ( shapeId != NULL )
+	{
+		*shapeId = id;
+	}
+	return bodyId;
+}
+
+// The mass, center and inertia of a grid on a dynamic body come from its boxes
+static int VoxelGridDynamicMass( void )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	Shard shard;
+	ENSURE( MakeShard( &shard, 8, 4, 8 ) );
+	b3ShapeId shapeId;
+	b3BodyId bodyId = CreateShardBody( worldId, &shard, ( b3Vec3 ){ 10.0f, 5.0f, 10.0f }, 0.6f, &shapeId );
+	ENSURE( B3_IS_NON_NULL( shapeId ) );
+
+	// 4 x 2 x 4 m of the default density
+	float density = b3DefaultShapeDef().density;
+	float mass = density * 4.0f * 2.0f * 4.0f;
+	ENSURE_SMALL( b3Body_GetMass( bodyId ) - mass, 1.0e-3f * mass );
+
+	b3Vec3 center = b3Body_GetLocalCenter( bodyId );
+	ENSURE_SMALL( center.x - 2.0f, 1.0e-4f );
+	ENSURE_SMALL( center.y - 1.0f, 1.0e-4f );
+	ENSURE_SMALL( center.z - 2.0f, 1.0e-4f );
+
+	b3Matrix3 inertia = b3Body_GetLocalRotationalInertia( bodyId );
+	float expectedX = mass / 12.0f * ( 2.0f * 2.0f + 4.0f * 4.0f );
+	float expectedY = mass / 12.0f * ( 4.0f * 4.0f + 4.0f * 4.0f );
+	ENSURE_SMALL( inertia.cx.x - expectedX, 1.0e-3f * expectedX );
+	ENSURE_SMALL( inertia.cy.y - expectedY, 1.0e-3f * expectedY );
+	ENSURE_SMALL( inertia.cz.z - expectedX, 1.0e-3f * expectedX );
+	printf( "  shard mass %.0f kg, inertia %.0f %.0f %.0f\n", b3Body_GetMass( bodyId ), inertia.cx.x, inertia.cy.y, inertia.cz.z );
+
+	// The AABB is that of the boxes, not of the grid's cell array (they coincide here), and it follows the body
+	b3AABB aabb = b3Shape_GetAABB( shapeId );
+	ENSURE( aabb.lowerBound.x < 10.0f + 0.1f && aabb.upperBound.x > 14.0f - 0.1f );
+
+	DestroyShard( &shard );
+	b3DestroyWorld( worldId );
+	return 0;
+}
+
+// A shard dropped on a static hull ground rests there and falls asleep
+static int VoxelGridShardOnHull( void )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	b3BodyDef groundDef = b3DefaultBodyDef();
+	groundDef.position = ( b3Vec3 ){ 0.0f, -0.5f, 0.0f };
+	b3BodyId groundId = b3CreateBody( worldId, &groundDef );
+	b3BoxHull ground = b3MakeBoxHull( 20.0f, 0.5f, 20.0f );
+	b3ShapeDef groundShape = b3DefaultShapeDef();
+	groundShape.baseMaterial.friction = 0.6f;
+	b3CreateHullShape( groundId, &groundShape, &ground.base );
+
+	Shard shard;
+	ENSURE( MakeShard( &shard, 8, 4, 8 ) );
+	b3BodyId bodyId = CreateShardBody( worldId, &shard, ( b3Vec3 ){ -2.0f, 0.3f, -2.0f }, 0.6f, NULL );
+
+	for ( int i = 0; i < 300; ++i )
+	{
+		b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	}
+
+	b3Pos p = b3Body_GetPosition( bodyId );
+	printf( "  shard on hull: position %.4f %.4f %.4f, awake %d\n", p.x, p.y, p.z, b3Body_IsAwake( bodyId ) );
+	ENSURE_SMALL( p.y, 0.003f );
+	ENSURE_SMALL( p.x + 2.0f, 0.01f );
+	ENSURE_SMALL( p.z + 2.0f, 0.01f );
+	ENSURE( b3Body_IsAwake( bodyId ) == false );
+
+	DestroyShard( &shard );
+	b3DestroyWorld( worldId );
+	return 0;
+}
+
 int VoxelGridTest( void )
 {
 	RUN_SUBTEST( VoxelGridModuleCover );
@@ -932,5 +1095,7 @@ int VoxelGridTest( void )
 	RUN_SUBTEST( VoxelGridSetCellRestoresSupport );
 	RUN_SUBTEST( VoxelGridRecovery );
 	RUN_SUBTEST( VoxelGridCharacterQueries );
+	RUN_SUBTEST( VoxelGridDynamicMass );
+	RUN_SUBTEST( VoxelGridShardOnHull );
 	return 0;
 }

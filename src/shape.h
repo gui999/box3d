@@ -23,6 +23,9 @@ typedef enum b3ShapeFlags
 	b3_enablePreSolveEvents = 0x10,
 	b3_enlargedAABB = 0x20,
 	b3_enableSpeculative = 0x40,
+
+	// A voxel grid on a kinematic or dynamic body: its AABB is that of the occupied boxes, not the whole grid
+	b3_tightGridBounds = 0x80,
 } b3ShapeFlags;
 
 typedef struct b3Shape

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "voxel_grid.h"
+#include "aabb.h"
 
 #include "platform.h"
 #include "shape.h"
@@ -274,6 +275,35 @@ const float* b3VoxelGridModule_GetBoxes( const b3VoxelGridModule* module )
 	return module->boxes;
 }
 
+// The bounds of the boxes of all occupied cells, inverted (lower above upper) when there are none.
+static void b3RecomputeOccupiedBounds( b3VoxelGrid* grid )
+{
+	b3AABB bounds = { { FLT_MAX, FLT_MAX, FLT_MAX }, { -FLT_MAX, -FLT_MAX, -FLT_MAX } };
+	for ( int j = 0; j < grid->size[1]; ++j )
+	{
+		for ( int k = 0; k < grid->size[2]; ++k )
+		{
+			for ( int i = 0; i < grid->size[0]; ++i )
+			{
+				int index = grid->paddedModules[b3VoxelGridPaddedIndex( grid, i, j, k )];
+				if ( index < 0 || grid->modules[index]->boxCount == 0 )
+				{
+					continue;
+				}
+
+				const b3VoxelGridModule* module = grid->modules[index];
+				b3Vec3 corner = { grid->origin.x + (float)i * grid->cellMeters, grid->origin.y + (float)j * grid->cellMeters,
+								  grid->origin.z + (float)k * grid->cellMeters };
+				bounds.lowerBound = b3Min( bounds.lowerBound, b3Add( corner, module->bounds.lowerBound ) );
+				bounds.upperBound = b3Max( bounds.upperBound, b3Add( corner, module->bounds.upperBound ) );
+			}
+		}
+	}
+
+	// Stays inverted when there is nothing, so that adding a cell does not stretch the bounds to the origin
+	grid->occupiedBounds = bounds;
+}
+
 b3VoxelGrid* b3CreateVoxelGrid( const b3VoxelGridDef* def )
 {
 	if ( def->cellCountX < 1 || def->cellCountY < 1 || def->cellCountZ < 1 || def->cellVoxels < 1 || def->cellVoxels > 32 ||
@@ -358,6 +388,7 @@ b3VoxelGrid* b3CreateVoxelGrid( const b3VoxelGridDef* def )
 	}
 	grid->moduleCount = def->moduleCount;
 
+	b3RecomputeOccupiedBounds( grid );
 	return grid;
 }
 
@@ -413,11 +444,58 @@ int b3VoxelGrid_AddModule( b3VoxelGrid* grid, b3VoxelGridModule* module )
 
 void b3VoxelGrid_SetCells( b3VoxelGrid* grid, const int* paddedCells, const int* modules, int count )
 {
-	for ( int i = 0; i < count; ++i )
+	// The occupied bounds grow with the cells added and are recomputed when a box that touched them goes
+	b3AABB occupied = grid->occupiedBounds;
+	bool recompute = false;
+	int sx = grid->size[0] + 2, sz = grid->size[2] + 2;
+	for ( int n = 0; n < count; ++n )
 	{
-		B3_ASSERT( 0 <= paddedCells[i] && paddedCells[i] < grid->paddedCount );
-		B3_ASSERT( -1 <= modules[i] && modules[i] < grid->moduleCount );
-		grid->paddedModules[paddedCells[i]] = modules[i];
+		int padded = paddedCells[n];
+		B3_ASSERT( 0 <= padded && padded < grid->paddedCount );
+		B3_ASSERT( -1 <= modules[n] && modules[n] < grid->moduleCount );
+
+		int oldIndex = grid->paddedModules[padded];
+		int newIndex = modules[n];
+		grid->paddedModules[padded] = newIndex;
+
+		// The padding ring is not part of the shape
+		int i = padded % sx - 1;
+		int k = ( padded / sx ) % sz - 1;
+		int j = padded / ( sx * sz ) - 1;
+		if ( i < 0 || i >= grid->size[0] || j < 0 || j >= grid->size[1] || k < 0 || k >= grid->size[2] || oldIndex == newIndex )
+		{
+			continue;
+		}
+
+		b3Vec3 corner = { grid->origin.x + (float)i * grid->cellMeters, grid->origin.y + (float)j * grid->cellMeters,
+						  grid->origin.z + (float)k * grid->cellMeters };
+
+		if ( oldIndex >= 0 && grid->modules[oldIndex]->boxCount > 0 && recompute == false )
+		{
+			const b3AABB* old = &grid->modules[oldIndex]->bounds;
+			const float tolerance = 1.0e-4f;
+			b3Vec3 lower = b3Add( corner, old->lowerBound );
+			b3Vec3 upper = b3Add( corner, old->upperBound );
+			recompute = lower.x <= occupied.lowerBound.x + tolerance || lower.y <= occupied.lowerBound.y + tolerance ||
+						lower.z <= occupied.lowerBound.z + tolerance || upper.x >= occupied.upperBound.x - tolerance ||
+						upper.y >= occupied.upperBound.y - tolerance || upper.z >= occupied.upperBound.z - tolerance;
+		}
+
+		if ( newIndex >= 0 && grid->modules[newIndex]->boxCount > 0 )
+		{
+			const b3AABB* added = &grid->modules[newIndex]->bounds;
+			occupied.lowerBound = b3Min( occupied.lowerBound, b3Add( corner, added->lowerBound ) );
+			occupied.upperBound = b3Max( occupied.upperBound, b3Add( corner, added->upperBound ) );
+		}
+	}
+
+	if ( recompute )
+	{
+		b3RecomputeOccupiedBounds( grid );
+	}
+	else
+	{
+		grid->occupiedBounds = occupied;
 	}
 }
 
@@ -454,6 +532,124 @@ b3AABB b3VoxelGrid_GetBounds( const b3VoxelGrid* grid )
 b3AABB b3ComputeVoxelGridAABB( const b3VoxelGrid* grid, b3Transform transform )
 {
 	return b3AABB_Transform( transform, grid->bounds );
+}
+
+static inline bool b3IsOccupiedBoundsEmpty( const b3VoxelGrid* grid )
+{
+	return grid->occupiedBounds.lowerBound.x > grid->occupiedBounds.upperBound.x;
+}
+
+b3AABB b3ComputeVoxelGridOccupiedAABB( const b3VoxelGrid* grid, b3Transform transform )
+{
+	if ( b3IsOccupiedBoundsEmpty( grid ) )
+	{
+		b3Vec3 point = b3TransformPoint( transform, grid->origin );
+		return (b3AABB){ point, point };
+	}
+
+	return b3AABB_Transform( transform, grid->occupiedBounds );
+}
+
+b3ShapeExtent b3ComputeVoxelGridExtent( const b3VoxelGrid* grid, b3Vec3 localCenter )
+{
+	b3ShapeExtent extent = { B3_HUGE, b3Vec3_zero };
+	if ( b3IsOccupiedBoundsEmpty( grid ) )
+	{
+		return extent;
+	}
+
+	const b3AABB* bounds = &grid->occupiedBounds;
+	b3Vec3 size = b3Sub( bounds->upperBound, bounds->lowerBound );
+
+	// A body this thick cannot pass through anything thinner than its own motion before a contact sees it
+	extent.minExtent = 0.5f * b3MinFloat( size.x, b3MinFloat( size.y, size.z ) );
+
+	b3Vec3 farthest = b3FarthestPointOnAABB( *bounds, localCenter );
+	extent.maxExtent = b3Abs( b3Sub( farthest, localCenter ) );
+	return extent;
+}
+
+bool b3IsVoxelBoxEnclosed( const b3VoxelGrid* grid, int cell, int box )
+{
+	const b3VoxelGridModule* module = b3GetVoxelGridCellModule( grid, cell );
+	if ( module->boundaryFaces[box] == 0 && module->coveredFaces[box] != 0x3f )
+	{
+		// Nothing outside the cell can cover a face that is inside it
+		return false;
+	}
+
+	return b3GetVoxelBoxCoveredFaces( grid, cell, box ) == 0x3f;
+}
+
+// The boxes of a grid are disjoint, so mass, center and inertia are sums over them.
+b3MassData b3ComputeVoxelGridMass( const b3VoxelGrid* grid, float density )
+{
+	b3MassData massData = { 0 };
+	int cellCount = grid->size[0] * grid->size[1] * grid->size[2];
+
+	// Pass one: mass and center
+	float mass = 0.0f;
+	b3Vec3 center = b3Vec3_zero;
+	for ( int cell = 0; cell < cellCount; ++cell )
+	{
+		const b3VoxelGridModule* module = b3GetVoxelGridCellModule( grid, cell );
+		if ( module == NULL )
+		{
+			continue;
+		}
+
+		b3Vec3 corner = b3VoxelGridCellCorner( grid, cell );
+		for ( int box = 0; box < module->boxCount; ++box )
+		{
+			const float* b = module->boxes + 6 * box;
+			float boxMass = density * ( b[3] - b[0] ) * ( b[4] - b[1] ) * ( b[5] - b[2] );
+			b3Vec3 boxCenter = { corner.x + 0.5f * ( b[0] + b[3] ), corner.y + 0.5f * ( b[1] + b[4] ),
+								 corner.z + 0.5f * ( b[2] + b[5] ) };
+			mass += boxMass;
+			center = b3MulAdd( center, boxMass, boxCenter );
+		}
+	}
+
+	if ( mass <= 0.0f )
+	{
+		return massData;
+	}
+
+	center = b3MulSV( 1.0f / mass, center );
+
+	// Pass two: inertia about the center. Each box about its own center, then shifted.
+	b3Matrix3 inertia = b3Mat3_zero;
+	for ( int cell = 0; cell < cellCount; ++cell )
+	{
+		const b3VoxelGridModule* module = b3GetVoxelGridCellModule( grid, cell );
+		if ( module == NULL )
+		{
+			continue;
+		}
+
+		b3Vec3 corner = b3VoxelGridCellCorner( grid, cell );
+		for ( int box = 0; box < module->boxCount; ++box )
+		{
+			const float* b = module->boxes + 6 * box;
+			float dx = b[3] - b[0], dy = b[4] - b[1], dz = b[5] - b[2];
+			float boxMass = density * dx * dy * dz;
+			b3Vec3 boxCenter = { corner.x + 0.5f * ( b[0] + b[3] ), corner.y + 0.5f * ( b[1] + b[4] ),
+								 corner.z + 0.5f * ( b[2] + b[5] ) };
+
+			float k = boxMass / 12.0f;
+			b3Matrix3 own = b3Mat3_zero;
+			own.cx.x = k * ( dy * dy + dz * dz );
+			own.cy.y = k * ( dx * dx + dz * dz );
+			own.cz.z = k * ( dx * dx + dy * dy );
+
+			inertia = b3AddMM( inertia, b3AddMM( own, b3Steiner( boxMass, b3Sub( center, boxCenter ) ) ) );
+		}
+	}
+
+	massData.mass = mass;
+	massData.center = center;
+	massData.inertia = inertia;
+	return massData;
 }
 
 bool b3QueryVoxelGrid( const b3VoxelGrid* grid, b3AABB bounds, b3VoxelBoxFcn* fcn, void* context )

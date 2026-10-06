@@ -63,9 +63,8 @@ static float b3ComputeShapeMargin( b3Shape* shape )
 		case b3_compoundShape:
 		case b3_voxelGridShape:
 		{
-			// Static-only shapes: broadphase uses speculative distance for static
-			// proxies, so the per-shape margin is never consumed in practice.
-			// Return the cap so any incidental use is generous.
+			// Static shapes use the speculative distance in the broadphase and never consume this margin. A voxel grid on a
+			// moving body does: the cap keeps its fat AABB generous.
 			return B3_MAX_AABB_MARGIN;
 		}
 
@@ -166,7 +165,6 @@ static b3Shape* b3CreateShapeInternal( b3World* world, b3Body* body, b3WorldTran
 
 		case b3_voxelGridShape:
 			// The shape holds a reference, released when the shape is destroyed
-			B3_ASSERT( body->type == b3_staticBody );
 			shape->voxelGrid = (b3VoxelGrid*)geometry;
 			b3RetainVoxelGrid( shape->voxelGrid );
 			break;
@@ -191,6 +189,11 @@ static b3Shape* b3CreateShapeInternal( b3World* world, b3Body* body, b3WorldTran
 	shape->flags |= def->enableHitEvents ? b3_enableHitEvents : 0;
 	shape->flags |= def->enablePreSolveEvents ? b3_enablePreSolveEvents : 0;
 	shape->flags |= def->enableSpeculativeContact ? b3_enableSpeculative : 0;
+	if ( shapeType == b3_voxelGridShape && body->type != b3_staticBody )
+	{
+		// A grid that moves has an AABB that follows its boxes
+		shape->flags |= b3_tightGridBounds;
+	}
 	shape->proxyKey = B3_NULL_INDEX;
 	shape->localCentroid = b3GetShapeCentroid( shape );
 	shape->aabbMargin = b3ComputeShapeMargin( shape );
@@ -282,10 +285,9 @@ static b3ShapeId b3CreateShape( b3BodyId bodyId, const b3ShapeDef* def, const vo
 	}
 
 	b3Body* body = b3GetBodyFullId( world, bodyId );
-	if ( body->type != b3_staticBody &&
-		 ( shapeType == b3_compoundShape || shapeType == b3_heightShape || shapeType == b3_voxelGridShape ) )
+	if ( body->type != b3_staticBody && ( shapeType == b3_compoundShape || shapeType == b3_heightShape ) )
 	{
-		// Compound, height and voxel grid shapes must be on static bodies.
+		// Compound and height shapes must be on static bodies. A voxel grid can be on any body.
 		return b3_nullShapeId;
 	}
 
@@ -591,7 +593,8 @@ b3AABB b3ComputeShapeAABB( const b3Shape* shape, b3Transform transform )
 			return b3ComputeHeightFieldAABB( shape->heightField, transform );
 
 		case b3_voxelGridShape:
-			return b3ComputeVoxelGridAABB( shape->voxelGrid, transform );
+			return ( shape->flags & b3_tightGridBounds ) ? b3ComputeVoxelGridOccupiedAABB( shape->voxelGrid, transform )
+														 : b3ComputeVoxelGridAABB( shape->voxelGrid, transform );
 
 		case b3_hullShape:
 			return b3ComputeHullAABB( shape->hull, transform );
@@ -648,6 +651,9 @@ b3AABB b3ComputeSweptShapeAABB( const b3Shape* shape, const b3Sweep* sweep, floa
 		case b3_sphereShape:
 			return b3ComputeSweptSphereAABB( &shape->sphere, xf1, xf2 );
 
+		case b3_voxelGridShape:
+			return b3AABB_Union( b3ComputeVoxelGridOccupiedAABB( shape->voxelGrid, xf1 ), b3ComputeVoxelGridOccupiedAABB( shape->voxelGrid, xf2 ) );
+
 		default:
 			B3_ASSERT( false );
 			return (b3AABB){ xf1.p, xf1.p };
@@ -680,7 +686,8 @@ b3Vec3 b3GetShapeCentroid( const b3Shape* shape )
 			return b3AABB_Center( aabb );
 		}
 		case b3_voxelGridShape:
-			return b3AABB_Center( shape->voxelGrid->bounds );
+			return b3AABB_Center( ( shape->flags & b3_tightGridBounds ) ? b3ComputeVoxelGridOccupiedAABB( shape->voxelGrid, b3Transform_identity )
+																			 : shape->voxelGrid->bounds );
 		default:
 			return b3Vec3_zero;
 	}
@@ -745,6 +752,9 @@ b3MassData b3ComputeShapeMass( const b3Shape* shape )
 		case b3_sphereShape:
 			return b3ComputeSphereMass( &shape->sphere, shape->density );
 
+		case b3_voxelGridShape:
+			return b3ComputeVoxelGridMass( shape->voxelGrid, shape->density );
+
 		default:
 			return (b3MassData){ 0 };
 	}
@@ -791,6 +801,10 @@ b3ShapeExtent b3ComputeShapeExtent( const b3Shape* shape, b3Vec3 localCenter )
 
 		case b3_hullShape:
 			extent = b3ComputeHullExtent( shape->hull, localCenter );
+			break;
+
+		case b3_voxelGridShape:
+			extent = b3ComputeVoxelGridExtent( shape->voxelGrid, localCenter );
 			break;
 
 		case b3_meshShape:
@@ -1678,7 +1692,8 @@ void b3Shape_VoxelGridSetCells( b3ShapeId shapeId, const int* paddedCells, const
 	b3Transform gridTransform = b3ToRelativeTransform( b3GetBodyTransformQuick( world, body ), b3Pos_zero );
 
 	// Boxes in the cells next to a changed cell change their covered faces
-	b3AABB affected = b3AABB_Transform( gridTransform, b3AABB_Inflate( changed, grid->cellMeters ) );
+	// The cached query bounds of a contact are in the grid frame
+	b3AABB affected = b3AABB_Inflate( changed, grid->cellMeters );
 	b3AABB wakeBounds = b3AABB_Transform( gridTransform, b3AABB_Inflate( changed, 2.0f * B3_SPECULATIVE_DISTANCE ) );
 
 	int shapeIndex = shape->id;

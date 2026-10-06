@@ -4,6 +4,7 @@
 #pragma once
 
 #include "core.h"
+#include "math_internal.h"
 
 #include "box3d/collision.h"
 #include "box3d/types.h"
@@ -60,6 +61,10 @@ struct b3VoxelGrid
 
 	// The whole grid, occupied or not, so a cell update never moves it.
 	b3AABB bounds;
+
+	// The bounds of the boxes of the occupied cells, in the grid frame. A grid on a moving body uses it for its AABB, which
+	// moves every step and wants to be tight. Kept up to date by b3VoxelGrid_SetCells.
+	b3AABB occupiedBounds;
 
 	int paddedCount;
 	int* paddedModules;
@@ -135,3 +140,16 @@ uint8_t b3GetVoxelBoxCoveredFaces( const b3VoxelGrid* grid, int cell, int box );
 
 // Does the normal (the box's outward direction toward the other shape) have a component into a covered face?
 bool b3IsNormalIntoCoveredFace( uint8_t coveredFaces, b3Vec3 normal );
+
+// Mass of the solid boxes of a grid: exact for a union of disjoint boxes. The inertia is about the returned center.
+b3MassData b3ComputeVoxelGridMass( const b3VoxelGrid* grid, float density );
+
+// The AABB of the occupied boxes under a transform
+b3AABB b3ComputeVoxelGridOccupiedAABB( const b3VoxelGrid* grid, b3Transform transform );
+
+// Collision extents of the occupied boxes about a local center: half the thinnest side of the occupied bounds and the farthest
+// corner on each axis. A grid with no boxes is not a collision hazard (huge minimum extent).
+b3ShapeExtent b3ComputeVoxelGridExtent( const b3VoxelGrid* grid, b3Vec3 localCenter );
+
+// Is a box covered on every face, so that nothing can touch it?
+bool b3IsVoxelBoxEnclosed( const b3VoxelGrid* grid, int cell, int box );

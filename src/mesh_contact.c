@@ -1211,37 +1211,111 @@ bool b3ComputeMeshManifolds( b3World* world, int workerIndex, b3Contact* contact
 // manifolds then go through the same clustering as a mesh, so boxes that make one flat surface give one manifold of at most
 // four points, and impulses carry over by (feature id, key).
 
-// The bound on boxes in one contact. A body over a very dense region sees only the first boxes in cell order.
-#define B3_MAX_VOXEL_CONTACT_BOXES 512
+// The bound on boxes in one grid contact. Over it the boxes closest to the other shape are kept.
+#define B3_MAX_VOXEL_CONTACT_BOXES 2048
+
+typedef struct b3VoxelBoxCandidate
+{
+	int key;
+
+	// How far the box is from the other shape's bounds, negative when they overlap
+	float gap;
+} b3VoxelBoxCandidate;
 
 typedef struct b3VoxelKeyContext
 {
 	const b3VoxelGrid* grid;
-	int* keys;
+	b3AABB region;
+	b3VoxelBoxCandidate* candidates;
 	int capacity;
 	int count;
+	int worst;
+	bool overflowed;
 } b3VoxelKeyContext;
+
+// The largest separation along an axis between two boxes: negative by the least overlap when they overlap on every axis
+static inline float b3BoxGap( b3AABB a, b3AABB b )
+{
+	float gapX = b3MaxFloat( a.lowerBound.x - b.upperBound.x, b.lowerBound.x - a.upperBound.x );
+	float gapY = b3MaxFloat( a.lowerBound.y - b.upperBound.y, b.lowerBound.y - a.upperBound.y );
+	float gapZ = b3MaxFloat( a.lowerBound.z - b.upperBound.z, b.lowerBound.z - a.upperBound.z );
+	return b3MaxFloat( gapX, b3MaxFloat( gapY, gapZ ) );
+}
 
 static bool b3CollectVoxelKeysCallback( int cell, int box, b3AABB bounds, void* context )
 {
-	B3_UNUSED( bounds );
 	b3VoxelKeyContext* keyContext = context;
-	if ( keyContext->count == keyContext->capacity )
+
+	// Boxes covered on every face are inside solid and can never be touched
+	if ( b3IsVoxelBoxEnclosed( keyContext->grid, cell, box ) )
 	{
-		return false;
+		return true;
 	}
 
-	keyContext->keys[keyContext->count] = b3VoxelGridKey( keyContext->grid, cell, box );
-	keyContext->count += 1;
+	b3VoxelBoxCandidate candidate = { b3VoxelGridKey( keyContext->grid, cell, box ), b3BoxGap( bounds, keyContext->region ) };
+	if ( keyContext->count < keyContext->capacity )
+	{
+		keyContext->candidates[keyContext->count] = candidate;
+		keyContext->count += 1;
+		if ( keyContext->count == keyContext->capacity )
+		{
+			keyContext->worst = 0;
+			for ( int i = 1; i < keyContext->count; ++i )
+			{
+				if ( keyContext->candidates[i].gap > keyContext->candidates[keyContext->worst].gap )
+				{
+					keyContext->worst = i;
+				}
+			}
+		}
+		return true;
+	}
+
+	// Full: the box closest to the other shape replaces the farthest one kept
+	keyContext->overflowed = true;
+	if ( candidate.gap < keyContext->candidates[keyContext->worst].gap )
+	{
+		keyContext->candidates[keyContext->worst] = candidate;
+		keyContext->worst = 0;
+		for ( int i = 1; i < keyContext->count; ++i )
+		{
+			if ( keyContext->candidates[i].gap > keyContext->candidates[keyContext->worst].gap )
+			{
+				keyContext->worst = i;
+			}
+		}
+	}
 	return true;
 }
 
-static void b3RefreshVoxelCache( b3Contact* contact, const b3VoxelGrid* grid, b3WorldTransform xfA, const b3AABB* bounds )
+static void b3SortVoxelCandidates( b3VoxelBoxCandidate* candidates, int count )
+{
+#define LESS( i, j ) candidates[(int)i].key < candidates[(int)j].key
+#define SWAP( i, j )                                                                                                             \
+	do                                                                                                                           \
+	{                                                                                                                            \
+		b3VoxelBoxCandidate tmp = candidates[(int)i];                                                                            \
+		candidates[(int)i] = candidates[(int)j];                                                                                 \
+		candidates[(int)j] = tmp;                                                                                                \
+	}                                                                                                                            \
+	while ( 0 )
+	QSORT( count, LESS, SWAP );
+#undef LESS
+#undef SWAP
+}
+
+// Refresh the boxes the other shape may touch. The query bounds are kept in the grid frame, so a grid that moves refreshes its
+// boxes as one that stays does.
+static void b3RefreshVoxelCache( b3Contact* contact, const b3VoxelGrid* grid, b3WorldTransform xfA, const b3AABB* bounds,
+								 b3Arena arena )
 {
 	b3MeshContact* meshContact = &contact->meshContact;
 
-	// If the dynamic body didn't move out of the cached query bounds we are done
-	if ( b3AABB_Contains( meshContact->queryBounds, *bounds ) )
+	b3Transform gridTransform = b3ToRelativeTransform( xfA, b3Pos_zero );
+	b3AABB localBounds = b3AABB_Transform( b3InvertTransform( gridTransform ), *bounds );
+
+	// If the other shape didn't move out of the cached query bounds we are done
+	if ( b3AABB_Contains( meshContact->queryBounds, localBounds ) )
 	{
 		return;
 	}
@@ -1249,18 +1323,14 @@ static void b3RefreshVoxelCache( b3Contact* contact, const b3VoxelGrid* grid, b3
 	// Enlarge to the query bounds to absorb small movement
 	float radius = B3_MAX_AABB_MARGIN + B3_SPECULATIVE_DISTANCE;
 	b3Vec3 extension = { radius, radius, radius };
-	meshContact->queryBounds.lowerBound = b3Sub( bounds->lowerBound, extension );
-	meshContact->queryBounds.upperBound = b3Add( bounds->upperBound, extension );
+	meshContact->queryBounds.lowerBound = b3Sub( localBounds.lowerBound, extension );
+	meshContact->queryBounds.upperBound = b3Add( localBounds.upperBound, extension );
 
-	// Bounds are in world space. Convert to the local grid frame.
-	b3Transform gridTransform = b3ToRelativeTransform( xfA, b3Pos_zero );
-	b3AABB localBounds = b3AABB_Transform( b3InvertTransform( gridTransform ), meshContact->queryBounds );
+	b3VoxelBoxCandidate* candidates = b3Bump( &arena, B3_MAX_VOXEL_CONTACT_BOXES * sizeof( b3VoxelBoxCandidate ) );
+	b3VoxelKeyContext keyContext = { grid, localBounds, candidates, B3_MAX_VOXEL_CONTACT_BOXES, 0, 0, false };
+	b3QueryVoxelGrid( grid, meshContact->queryBounds, b3CollectVoxelKeysCallback, &keyContext );
 
-	int keys[B3_MAX_VOXEL_CONTACT_BOXES];
-	b3VoxelKeyContext keyContext = { grid, keys, B3_MAX_VOXEL_CONTACT_BOXES, 0 };
-	b3QueryVoxelGrid( grid, localBounds, b3CollectVoxelKeysCallback, &keyContext );
-
-	if ( keyContext.count == B3_MAX_VOXEL_CONTACT_BOXES )
+	if ( keyContext.overflowed )
 	{
 		static bool s_once = false;
 		if ( s_once == false )
@@ -1268,23 +1338,27 @@ static void b3RefreshVoxelCache( b3Contact* contact, const b3VoxelGrid* grid, b3
 			b3Log( "WARNING: dense voxel grid detected, box buffer capacity of %d reached", B3_MAX_VOXEL_CONTACT_BOXES );
 			s_once = true;
 		}
+
+		// The query walks the cells in order, so only a full buffer that took replacements needs sorting
+		b3SortVoxelCandidates( candidates, keyContext.count );
 	}
 
 	// Keys are ascending, so match with the old cache by merging
-	b3ContactCache contactCache[B3_MAX_VOXEL_CONTACT_BOXES];
-
 	int count = keyContext.count;
+	b3ContactCache* contactCache = b3Bump( &arena, ( count + 1 ) * sizeof( b3ContactCache ) );
+
 	int index2 = 0;
 	for ( int index1 = 0; index1 < count; ++index1 )
 	{
 		contactCache[index1] = (b3ContactCache){ 0 };
 
-		while ( index2 < meshContact->triangleCache.count && meshContact->triangleCache.data[index2].triangleIndex < keys[index1] )
+		while ( index2 < meshContact->triangleCache.count &&
+				meshContact->triangleCache.data[index2].triangleIndex < candidates[index1].key )
 		{
 			index2 += 1;
 		}
 
-		if ( index2 < meshContact->triangleCache.count && meshContact->triangleCache.data[index2].triangleIndex == keys[index1] )
+		if ( index2 < meshContact->triangleCache.count && meshContact->triangleCache.data[index2].triangleIndex == candidates[index1].key )
 		{
 			contactCache[index1] = meshContact->triangleCache.data[index2].cache;
 		}
@@ -1294,7 +1368,7 @@ static void b3RefreshVoxelCache( b3Contact* contact, const b3VoxelGrid* grid, b3
 	b3Array_Resize( meshContact->triangleCache, count );
 	for ( int i = 0; i < count; ++i )
 	{
-		meshContact->triangleCache.data[i] = (b3TriangleCache){ keys[i], contactCache[i] };
+		meshContact->triangleCache.data[i] = (b3TriangleCache){ candidates[i].key, contactCache[i] };
 	}
 }
 
@@ -1306,7 +1380,7 @@ bool b3ComputeVoxelGridManifolds( b3World* world, int workerIndex, b3Contact* co
 	const b3VoxelGrid* grid = shapeA->voxelGrid;
 	b3TaskContext* context = b3Array_Get( world->taskContexts, workerIndex );
 
-	b3RefreshVoxelCache( contact, grid, xfA, &shapeB->aabb );
+	b3RefreshVoxelCache( contact, grid, xfA, &shapeB->aabb, arena );
 
 	b3MeshContact* meshContact = &contact->meshContact;
 	int boxCount = meshContact->triangleCache.count;
