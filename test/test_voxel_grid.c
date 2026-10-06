@@ -348,6 +348,86 @@ static int VoxelGridRestAndSleep( void )
 	return 0;
 }
 
+// A proxy that sank into the floor is pushed out through the exposed face, never into a seam between two floor boxes
+static int VoxelGridRecovery( void )
+{
+	// The third column holds a 2 m tall pillar wall that starts at x = 4
+	Floor floor;
+	ENSURE( MakeFloor( &floor, 4, -1, -1, 2 ) );
+	b3Transform transform = b3Transform_identity;
+
+	// A capsule sunk 2 cm into the slab top, centred on the seam at x = 2
+	{
+		b3Vec3 points[2] = { { 2.0f, SLAB_HEIGHT - 0.02f + 0.35f, 1.0f }, { 2.0f, SLAB_HEIGHT - 0.02f + 1.05f, 1.0f } };
+		b3ShapeProxy proxy = { points, 2, 0.35f };
+		b3Vec3 pushes[3];
+		int count = b3RecoverVoxelGrid( floor.grid, transform, &proxy, pushes );
+		printf( "  seam recovery: %d pushes, up %.4f, x %.4f, z %.4f\n", count, pushes[1].y, pushes[0].x, pushes[2].z );
+		ENSURE( count >= 2 );
+		ENSURE_SMALL( pushes[1].y - 0.02f, 1.0e-4f );
+		ENSURE( pushes[0].x == 0.0f );
+		ENSURE( pushes[2].z == 0.0f );
+	}
+
+	// The same capsule on the seam between four slabs at the corner (x = 2, z = 2)
+	{
+		b3Vec3 points[2] = { { 2.0f, SLAB_HEIGHT - 0.02f + 0.35f, 2.0f }, { 2.0f, SLAB_HEIGHT - 0.02f + 1.05f, 2.0f } };
+		b3ShapeProxy proxy = { points, 2, 0.35f };
+		b3Vec3 pushes[3];
+		int count = b3RecoverVoxelGrid( floor.grid, transform, &proxy, pushes );
+		ENSURE( count >= 4 );
+		ENSURE_SMALL( pushes[1].y - 0.02f, 1.0e-4f );
+		ENSURE( pushes[0].x == 0.0f );
+		ENSURE( pushes[2].z == 0.0f );
+	}
+
+	// A box sunk 2 cm into the floor and 3 cm into the wall face at x = 4 leaves through both exposed faces
+	{
+		b3Vec3 points[8];
+		MakeBoxProxy( ( b3Vec3 ){ 3.78f, SLAB_HEIGHT - 0.02f + 0.25f, 1.0f }, 0.25f );
+		for ( int i = 0; i < 8; ++i )
+		{
+			points[i] = BoxPoints[i];
+		}
+		b3ShapeProxy proxy = { points, 8, 0.0f };
+		b3Vec3 pushes[3];
+		int count = b3RecoverVoxelGrid( floor.grid, transform, &proxy, pushes );
+		printf( "  corner recovery: %d pushes, x %.4f, y %.4f, z %.4f\n", count, pushes[0].x, pushes[1].y, pushes[2].z );
+		ENSURE( count >= 2 );
+		ENSURE_SMALL( pushes[0].x + 0.03f, 1.0e-4f );
+		ENSURE_SMALL( pushes[1].y - 0.02f, 1.0e-4f );
+		ENSURE( pushes[2].z == 0.0f );
+	}
+
+	// Resting on the surface, or clear of it, nothing pushes
+	{
+		b3Vec3 points[2] = { { 2.0f, SLAB_HEIGHT + 0.35f, 1.0f }, { 2.0f, SLAB_HEIGHT + 1.05f, 1.0f } };
+		b3ShapeProxy proxy = { points, 2, 0.35f };
+		b3Vec3 pushes[3];
+		ENSURE( b3RecoverVoxelGrid( floor.grid, transform, &proxy, pushes ) == 0 );
+		points[0].y += 0.5f;
+		points[1].y += 0.5f;
+		ENSURE( b3RecoverVoxelGrid( floor.grid, transform, &proxy, pushes ) == 0 );
+	}
+
+	// A grid turned a quarter about Y: the push is answered in world space
+	{
+		b3Transform turned = { { 0.0f, 0.0f, 0.0f }, b3MakeQuatFromAxisAngle( b3Vec3_axisY, 0.5f * B3_PI ) };
+		// The seam at grid x = 2 is the world line z = -2, the floor top stays at y = 0.4
+		b3Vec3 points[2] = { { 1.0f, SLAB_HEIGHT - 0.02f + 0.35f, -2.0f }, { 1.0f, SLAB_HEIGHT - 0.02f + 1.05f, -2.0f } };
+		b3ShapeProxy proxy = { points, 2, 0.35f };
+		b3Vec3 pushes[3];
+		int count = b3RecoverVoxelGrid( floor.grid, turned, &proxy, pushes );
+		ENSURE( count >= 2 );
+		ENSURE_SMALL( pushes[1].y - 0.02f, 1.0e-4f );
+		ENSURE_SMALL( b3Length( pushes[0] ), 1.0e-6f );
+		ENSURE_SMALL( b3Length( pushes[2] ), 1.0e-6f );
+	}
+
+	DestroyFloor( &floor );
+	return 0;
+}
+
 // A box slides over the seams between slabs. Resting on a flat floor made of several boxes it must keep its direction:
 // no vertical or lateral velocity spikes. The gravity is scaled up to make the contact penetrate deeper, which is when a
 // ghost contact on a seam face wins the separating axis test.
@@ -849,6 +929,7 @@ int VoxelGridTest( void )
 	RUN_SUBTEST( VoxelGridLandingImpulse );
 	RUN_SUBTEST( VoxelGridSetCellWakes );
 	RUN_SUBTEST( VoxelGridSetCellRestoresSupport );
+	RUN_SUBTEST( VoxelGridRecovery );
 	RUN_SUBTEST( VoxelGridCharacterQueries );
 	return 0;
 }

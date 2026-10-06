@@ -984,6 +984,131 @@ bool b3OverlapVoxelGrid( const b3VoxelGrid* grid, b3Transform shapeTransform, co
 	return context.overlap;
 }
 
+// Recovery of a proxy that sank into the grid
+
+typedef struct b3VoxelRecoverContext
+{
+	const b3VoxelGrid* grid;
+	const b3ShapeProxy* proxy;
+	b3AABB query;
+	// The deepest signed push along each grid axis
+	float push[3];
+	int count;
+} b3VoxelRecoverContext;
+
+static bool b3VoxelRecoverFcn( int cell, int box, b3AABB boxBounds, void* context )
+{
+	b3VoxelRecoverContext* recover = context;
+	const b3VoxelGrid* grid = recover->grid;
+	const b3VoxelGridModule* module = b3GetVoxelGridCellModule( grid, cell );
+	b3Vec3 corner = b3VoxelGridCellCorner( grid, cell );
+
+	// The query box is a loose bound of the proxy, so confirm the proxy touches the box itself
+	b3Vec3 points[B3_MAX_SHAPE_CAST_POINTS];
+	int count = b3MinInt( recover->proxy->count, B3_MAX_SHAPE_CAST_POINTS );
+	for ( int i = 0; i < count; ++i )
+	{
+		points[i] = b3Sub( recover->proxy->points[i], corner );
+	}
+
+	const b3HullData* hull = &module->hulls[box].base;
+	b3DistanceInput input;
+	input.proxyA = (b3ShapeProxy){ b3GetHullPoints( hull ), hull->vertexCount, 0.0f };
+	input.proxyB = (b3ShapeProxy){ points, count, recover->proxy->radius };
+	input.transform = b3Transform_identity;
+	input.useRadii = true;
+	b3SimplexCache cache = { 0 };
+	if ( b3ShapeDistance( &input, &cache, NULL, 0 ).distance >= B3_OVERLAP_SLOP )
+	{
+		return true;
+	}
+
+	// Only a face that solid does not cover can push the proxy out: the faces on a seam between two boxes cannot, so a proxy
+	// across a seam goes straight up or out through the exposed face and never into the seam.
+	uint8_t covered = b3GetVoxelBoxCoveredFaces( grid, cell, box );
+
+	const float* lowerQuery = &recover->query.lowerBound.x;
+	const float* upperQuery = &recover->query.upperBound.x;
+	const float* lowerBox = &boxBounds.lowerBound.x;
+	const float* upperBox = &boxBounds.upperBound.x;
+
+	// Boxes that only touch the query, or miss it by the proxy's rounded shape, have nothing to push out of
+	for ( int axis = 0; axis < 3; ++axis )
+	{
+		float depth = b3MinFloat( upperQuery[axis], upperBox[axis] ) - b3MaxFloat( lowerQuery[axis], lowerBox[axis] );
+		if ( depth <= 1.0e-5f )
+		{
+			return true;
+		}
+	}
+
+	int bestAxis = -1;
+	float bestPush = 0.0f;
+	for ( int axis = 0; axis < 3; ++axis )
+	{
+		// Out through the + face moves the proxy up past the box's upper bound, through the - face down past its lower
+		if ( ( covered & ( 1 << ( 2 * axis + 1 ) ) ) == 0 )
+		{
+			float distance = upperBox[axis] - lowerQuery[axis];
+			if ( distance > 0.0f && ( bestAxis < 0 || distance < fabsf( bestPush ) ) )
+			{
+				bestAxis = axis;
+				bestPush = distance;
+			}
+		}
+
+		if ( ( covered & ( 1 << ( 2 * axis ) ) ) == 0 )
+		{
+			float distance = upperQuery[axis] - lowerBox[axis];
+			if ( distance > 0.0f && ( bestAxis < 0 || distance < fabsf( bestPush ) ) )
+			{
+				bestAxis = axis;
+				bestPush = -distance;
+			}
+		}
+	}
+
+	if ( bestAxis < 0 || fabsf( bestPush ) <= 1.0e-5f )
+	{
+		return true;
+	}
+
+	recover->count += 1;
+	if ( fabsf( bestPush ) > fabsf( recover->push[bestAxis] ) )
+	{
+		recover->push[bestAxis] = bestPush;
+	}
+
+	return true;
+}
+
+int b3RecoverVoxelGrid( const b3VoxelGrid* grid, b3Transform shapeTransform, const b3ShapeProxy* proxy, b3Vec3 pushes[3] )
+{
+	pushes[0] = pushes[1] = pushes[2] = b3Vec3_zero;
+
+	b3Vec3 localPoints[B3_MAX_SHAPE_CAST_POINTS];
+	b3ShapeProxy localProxy = b3MakeLocalProxy( proxy, shapeTransform, localPoints );
+
+	b3AABB bounds = b3ComputeProxyAABB( &localProxy );
+	if ( b3AABB_Overlaps( bounds, grid->bounds ) == false )
+	{
+		return 0;
+	}
+
+	b3VoxelRecoverContext context = { grid, &localProxy, bounds, { 0.0f, 0.0f, 0.0f }, 0 };
+	b3QueryVoxelGrid( grid, bounds, b3VoxelRecoverFcn, &context );
+
+	// Each push is along a grid axis, answer it in the world frame
+	b3Vec3 axes[3] = { b3RotateVector( shapeTransform.q, b3Vec3_axisX ), b3RotateVector( shapeTransform.q, b3Vec3_axisY ),
+					   b3RotateVector( shapeTransform.q, b3Vec3_axisZ ) };
+	for ( int axis = 0; axis < 3; ++axis )
+	{
+		pushes[axis] = b3MulSV( context.push[axis], axes[axis] );
+	}
+
+	return context.count;
+}
+
 // Character mover
 
 typedef struct b3VoxelMoverContext

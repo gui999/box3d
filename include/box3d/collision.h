@@ -768,6 +768,12 @@ B3_API b3CastOutput b3ShapeCastVoxelGrid( const b3VoxelGrid* grid, const b3Shape
 /// Overlap shape versus voxel grid.
 B3_API bool b3OverlapVoxelGrid( const b3VoxelGrid* grid, b3Transform shapeTransform, const b3ShapeProxy* proxy );
 
+/// Recover a proxy in world space that sank into a voxel grid. For each of the grid's axes, pushes[axis] is the deepest
+/// push along that axis that moves the proxy out through the exposed face of a box, in world space (zero when no box pushes
+/// that way). A face that solid voxels cover, such as the seam between two floor boxes, never pushes, so a proxy across a
+/// seam is pushed straight out of the surface. Returns the number of boxes that pushed.
+B3_API int b3RecoverVoxelGrid( const b3VoxelGrid* grid, b3Transform shapeTransform, const b3ShapeProxy* proxy, b3Vec3 pushes[3] );
+
 /// Compute the bounding box of a transformed voxel grid.
 B3_API b3AABB b3ComputeVoxelGridAABB( const b3VoxelGrid* grid, b3Transform transform );
 
