@@ -665,3 +665,110 @@ B3_API b3PlaneSolverResult b3SolvePlanes( b3Vec3 targetDelta, b3CollisionPlane* 
 B3_API b3Vec3 b3ClipVector( b3Vec3 vector, const b3CollisionPlane* planes, int count );
 
 /**@}*/ // character
+
+/**
+ * @addtogroup voxel_grid
+ * @{
+ */
+
+/// A module is a set of solid axis-aligned boxes in one cell's frame (minimum corner at the cell origin) with everything
+/// derived from them for collision: prebuilt box hulls and which box faces solid voxels cover. Reference counted and
+/// immutable, so many grids and cells may share one. Create it off the main thread if you like.
+typedef struct b3VoxelGridModule b3VoxelGridModule;
+
+/// A grid of cells, each naming a module or none, with a one cell ring of padding that only informs face cover. Reference counted.
+/// A grid is not thread safe: edit it between steps only.
+typedef struct b3VoxelGrid b3VoxelGrid;
+
+/// Definition of a voxel grid.
+typedef struct b3VoxelGridDef
+{
+	/// The collidable cells along each axis.
+	int cellCountX, cellCountY, cellCountZ;
+
+	/// The corner of cell (0, 0, 0) in the shape frame.
+	b3Vec3 origin;
+
+	/// The edge length of a cell in meters.
+	float cellMeters;
+
+	/// The voxels along a cell edge, at most 32. Module boxes that lie on this lattice take part in face cover.
+	int cellVoxels;
+
+	/// The most boxes a cell may hold. Fixes the width of the per-box contact keys: cells times the next power of two at
+	/// least this must fit in 31 bits. Zero means cellVoxels^3.
+	int maxBoxesPerCell;
+
+	/// The modules, retained by the grid. May be NULL with a zero count to add modules later.
+	b3VoxelGridModule* const* modules;
+	int moduleCount;
+
+	/// The module index of each cell of the padded grid, (cellCountX + 2) * (cellCountY + 2) * (cellCountZ + 2) entries, -1 for
+	/// an empty cell, laid out as ( ( j + 1 ) * ( cellCountZ + 2 ) + ( k + 1 ) ) * ( cellCountX + 2 ) + ( i + 1 ) for cell
+	/// (i, j, k). May be NULL for an empty grid.
+	const int* paddedCells;
+} b3VoxelGridDef;
+
+/// Derive a module from boxes. boxes holds boxCount * 6 floats: minimum x y z then maximum x y z of each box in meters in
+/// the cell frame. Boxes must not overlap. The result has a reference count of one, owned by the caller.
+/// This only uses the allocator, so it is safe to call from any thread.
+B3_API b3VoxelGridModule* b3CreateVoxelGridModule( const float* boxes, int boxCount, float cellMeters, int cellVoxels );
+
+/// Retain a module.
+B3_API void b3RetainVoxelGridModule( b3VoxelGridModule* module );
+
+/// Release a module, destroying it with the last reference. Thread safe.
+B3_API void b3ReleaseVoxelGridModule( b3VoxelGridModule* module );
+
+/// Get the number of references to a module. A module cache holding the only one may drop it. Thread safe.
+B3_API int b3VoxelGridModule_GetReferenceCount( const b3VoxelGridModule* module );
+
+/// Get a module's box count.
+B3_API int b3VoxelGridModule_GetBoxCount( const b3VoxelGridModule* module );
+
+/// Get a module's boxes (minimum xyz, maximum xyz per box, cell frame).
+B3_API const float* b3VoxelGridModule_GetBoxes( const b3VoxelGridModule* module );
+
+/// Create a grid. Returns NULL for an invalid definition. The result has a reference count of one, owned by the caller.
+B3_API b3VoxelGrid* b3CreateVoxelGrid( const b3VoxelGridDef* def );
+
+/// Retain a grid.
+B3_API void b3RetainVoxelGrid( b3VoxelGrid* grid );
+
+/// Release a grid, destroying it with the last reference (a shape holds one).
+B3_API void b3ReleaseVoxelGrid( b3VoxelGrid* grid );
+
+/// Append a module to a grid, retained. Returns its index, or -1 when it has more boxes than a cell can hold.
+/// Does not touch contacts, use b3Shape_VoxelGridAddModule for a grid on a live shape.
+B3_API int b3VoxelGrid_AddModule( b3VoxelGrid* grid, b3VoxelGridModule* module );
+
+/// Set cells of the padded grid: count pairs of padded cell index and module index (-1 empties). Does not touch
+/// contacts, use b3Shape_VoxelGridSetCells for a grid on a live shape.
+B3_API void b3VoxelGrid_SetCells( b3VoxelGrid* grid, const int* paddedCells, const int* modules, int count );
+
+/// Get the number of cells of the padded grid.
+B3_API int b3VoxelGrid_GetPaddedCellCount( const b3VoxelGrid* grid );
+
+/// Get the number of modules.
+B3_API int b3VoxelGrid_GetModuleCount( const b3VoxelGrid* grid );
+
+/// Get the number of solid boxes in the collidable cells.
+B3_API int b3VoxelGrid_GetBoxCount( const b3VoxelGrid* grid );
+
+/// Get the bounds of the whole grid in the shape frame.
+B3_API b3AABB b3VoxelGrid_GetBounds( const b3VoxelGrid* grid );
+
+/// Ray cast versus a voxel grid in local space. A ray that starts inside a box reports a hit at the origin with zero fraction
+/// and zero normal. triangleIndex is the cell and childIndex the box in that cell.
+B3_API b3CastOutput b3RayCastVoxelGrid( const b3VoxelGrid* grid, const b3RayCastInput* input );
+
+/// Shape cast versus a voxel grid in local space. A hit whose normal passes through a face solid voxels cover is ignored.
+B3_API b3CastOutput b3ShapeCastVoxelGrid( const b3VoxelGrid* grid, const b3ShapeCastInput* input );
+
+/// Overlap shape versus voxel grid.
+B3_API bool b3OverlapVoxelGrid( const b3VoxelGrid* grid, b3Transform shapeTransform, const b3ShapeProxy* proxy );
+
+/// Compute the bounding box of a transformed voxel grid.
+B3_API b3AABB b3ComputeVoxelGridAABB( const b3VoxelGrid* grid, b3Transform transform );
+
+/**@}*/ // voxel_grid

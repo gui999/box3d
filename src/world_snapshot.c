@@ -565,6 +565,11 @@ static void b3SerShapes( b3RecBuffer* buf, b3World* world, b3Recording* rec )
 				b3SnapW_U32( buf, gid );
 				break;
 			}
+			case b3_voxelGridShape:
+				// Voxel grids are owned by the application and have no registry geometry. A snapshot of a world with
+				// one cannot be restored, so mark the shape unsupported instead of asserting.
+				b3SnapW_I32( buf, -1 );
+				break;
 			default:
 				// A live shape must have a known geometry type. Fail loudly rather than emit a shape
 				// with no geometry that would silently lose its collision on restore.

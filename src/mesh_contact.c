@@ -6,6 +6,7 @@
 #include "physics_world.h"
 #include "qsort.h"
 #include "shape.h"
+#include "voxel_grid.h"
 
 #include "box3d/types.h"
 
@@ -522,6 +523,267 @@ typedef struct b3Cluster
 	int pointCount;
 } b3Cluster;
 
+// Clusters accepted manifolds by normal, reduces each cluster to one manifold and matches them with the previous manifolds
+// so impulses carry over. The local manifolds are in frame B. Shared by meshes, height fields and voxel grids. Returns false when
+// there is nothing to solve, with the contact manifolds freed.
+static bool b3BuildClusterManifolds( b3World* world, b3Contact* contact, b3LocalManifold** acceptedManifolds,
+									 int acceptedManifoldCount, b3WorldTransform xfA, b3WorldTransform xfB, float restOffset,
+									 b3Arena arena )
+{
+	if ( acceptedManifoldCount == 0 )
+	{
+		if ( contact->manifoldCount > 0 )
+		{
+			b3FreeManifolds( world, contact->manifolds, contact->manifoldCount );
+			contact->manifolds = NULL;
+			contact->manifoldCount = 0;
+		}
+		return false;
+	}
+
+	b3Cluster* clusters = b3Bump( &arena, acceptedManifoldCount * sizeof( b3Cluster ) );
+	int* clusterMemberships = b3Bump( &arena, acceptedManifoldCount * sizeof( int ) );
+
+	// Cluster tolerance is tighter than the warm starting manifold matching tolerance. These
+	// serve different purposes.
+	const float clusterThreshold = 0.996f;
+	int clusterCount = 0;
+	int clusterPointCount = 0;
+	for ( int i = 0; i < acceptedManifoldCount; ++i )
+	{
+		clusterMemberships[i] = B3_NULL_INDEX;
+
+		const b3LocalManifold* manifold = acceptedManifolds[i];
+		clusterPointCount += manifold->pointCount;
+
+		// Cluster based on the triangle normal and contact normal.
+		// The first cluster found is accepted because the tolerance is tight.
+		// todo consider requiring the triangles to be connect by an edge.
+		// todo consider looking for the best cluster instead of the first one within tolerance
+		// This bool is here to allow quick testing with and without clustering.
+		bool allowClustering = true;
+		b3Vec3 manifoldNormal = manifold->normal;
+		b3Vec3 triangleNormal = manifold->triangleNormal;
+		int clusterIndex = B3_NULL_INDEX;
+		for ( int j = 0; j < clusterCount && allowClustering; ++j )
+		{
+			float cosManifoldAngle = b3Dot( clusters[j].manifoldNormal, manifoldNormal );
+			float cosTriangleAngle = b3Dot( clusters[j].triangleNormal, triangleNormal );
+			if ( cosManifoldAngle <= clusterThreshold || cosTriangleAngle <= clusterThreshold )
+			{
+				continue;
+			}
+
+#if 0
+			// todo there could be later triangles that create the connection
+			// then failure to cluster breaks greedy impulse warm starting
+			bool edgeConnected = false;
+
+			for ( int k = 0; k < i; ++k )
+			{
+				if ( clusterMemberships[k] != j )
+				{
+					continue;
+				}
+
+				const b3LocalManifold* other = acceptedManifolds[k];
+				if ( b3TrianglesShareEdge( manifold->i1, manifold->i2, manifold->i3, other->i1, other->i2, other->i3 ) )
+				{
+					edgeConnected = true;
+					break;
+				}
+			}
+
+			if ( edgeConnected )
+			{
+				clusterIndex = j;
+				break;
+			}
+#else
+
+			// Found a cluster
+			clusterIndex = j;
+			break;
+#endif
+		}
+
+		if ( clusterIndex != B3_NULL_INDEX )
+		{
+			clusterMemberships[i] = clusterIndex;
+			clusters[clusterIndex].pointCapacity += manifold->pointCount;
+		}
+		else
+		{
+			clusters[clusterCount].manifoldNormal = manifoldNormal;
+			clusters[clusterCount].triangleNormal = triangleNormal;
+			clusters[clusterCount].pointCapacity = manifold->pointCount;
+			clusterMemberships[i] = clusterCount;
+			clusterCount += 1;
+		}
+	}
+
+	if ( clusterPointCount == 0 )
+	{
+		return false;
+	}
+
+	// Setup clusters
+	b3LocalManifoldPoint* clusterPoints = b3Bump( &arena, clusterPointCount * sizeof( b3LocalManifoldPoint ) );
+	int pointOffset = 0;
+
+	for ( int i = 0; i < clusterCount; ++i )
+	{
+		b3Cluster* cluster = clusters + i;
+		cluster->points = clusterPoints + pointOffset;
+		cluster->pointCount = 0;
+		pointOffset += cluster->pointCapacity;
+	}
+
+	// Populate clusters
+	for ( int i = 0; i < acceptedManifoldCount; ++i )
+	{
+		int clusterIndex = clusterMemberships[i];
+		if ( clusterIndex == B3_NULL_INDEX )
+		{
+			continue;
+		}
+
+		B3_ASSERT( 0 <= clusterIndex && clusterIndex < clusterCount );
+
+		b3LocalManifold* am = acceptedManifolds[i];
+		b3Cluster* cm = clusters + clusterIndex;
+		for ( int j = 0; j < am->pointCount; ++j )
+		{
+			B3_ASSERT( cm->pointCount < cm->pointCapacity );
+			b3LocalManifoldPoint* ap = am->points + j;
+			b3LocalManifoldPoint* cp = cm->points + cm->pointCount;
+
+			cp->triangleIndex = am->triangleIndex;
+			cp->point = ap->point;
+			cp->separation = ap->separation;
+			cp->pair = ap->pair;
+			cm->pointCount += 1;
+		}
+	}
+
+	// Simplify clusters
+	for ( int i = 0; i < clusterCount; ++i )
+	{
+		b3Cluster* cm = clusters + i;
+		B3_ASSERT( cm->pointCount == cm->pointCapacity );
+		int reducedCount = b3ReduceCluster( cm->points, cm->pointCount, cm->triangleNormal, arena );
+		cm->pointCount = reducedCount;
+	}
+
+	// Make a temporary copy of previous manifolds
+	int oldManifoldCount = contact->manifoldCount;
+	b3Manifold* oldManifolds = NULL;
+	if ( oldManifoldCount > 0 )
+	{
+		oldManifolds = b3Bump( &arena, oldManifoldCount * sizeof( b3Manifold ) );
+		memcpy( oldManifolds, contact->manifolds, oldManifoldCount * sizeof( b3Manifold ) );
+	}
+
+	// Resize manifolds if needed
+	if ( oldManifoldCount != clusterCount )
+	{
+		b3FreeManifolds( world, contact->manifolds, contact->manifoldCount );
+		contact->manifolds = b3AllocateManifolds( world, clusterCount );
+		contact->manifoldCount = (uint16_t)clusterCount;
+	}
+	else
+	{
+		// Mem zero manifolds
+		memset( contact->manifolds, 0, contact->manifoldCount * sizeof( b3Manifold ) );
+	}
+
+	bool* consumed = NULL;
+	if ( oldManifoldCount > 0 )
+	{
+		consumed = b3Bump( &arena, oldManifoldCount * sizeof( bool ) );
+		memset( consumed, 0, oldManifoldCount * sizeof( bool ) );
+	}
+
+	b3Matrix3 matrixB = b3MakeMatrixFromQuat( xfB.q );
+	b3Vec3 offsetA = b3SubPos( xfB.p, xfA.p );
+
+	const float normalMatchTolerance = 0.995f;
+	for ( int i = 0; i < clusterCount; ++i )
+	{
+		b3Cluster* cm = clusters + i;
+		int pointCount = cm->pointCount;
+		B3_ASSERT( 0 < pointCount && pointCount <= B3_MAX_MANIFOLD_POINTS );
+
+		b3Manifold* manifold = contact->manifolds + i;
+		manifold->pointCount = pointCount;
+		manifold->normal = b3MulMV( matrixB, cm->manifoldNormal );
+
+		b3Vec3 clusterNormal = b3MulMV( matrixB, cm->manifoldNormal );
+		float bestDot = normalMatchTolerance;
+		int bestIndex = B3_NULL_INDEX;
+
+		for ( int j = 0; j < oldManifoldCount; ++j )
+		{
+			if ( consumed[j] == true )
+			{
+				continue;
+			}
+
+			float dot = b3Dot( oldManifolds[j].normal, clusterNormal );
+			if ( dot > bestDot )
+			{
+				bestIndex = j;
+				bestDot = dot;
+			}
+		}
+
+		b3Manifold* matchedManifold = NULL;
+		if ( bestIndex != B3_NULL_INDEX )
+		{
+			matchedManifold = oldManifolds + bestIndex;
+			manifold->frictionImpulse = matchedManifold->frictionImpulse;
+			manifold->rollingImpulse = matchedManifold->rollingImpulse;
+			manifold->twistImpulse = matchedManifold->twistImpulse;
+			consumed[bestIndex] = true;
+		}
+
+		for ( int j = 0; j < pointCount; ++j )
+		{
+			const b3LocalManifoldPoint* source = cm->points + j;
+			b3ManifoldPoint* target = manifold->points + j;
+
+			// Contact points are computed in frame B
+			target->anchorB = b3MulMV( matrixB, source->point );
+			target->anchorA = b3Add( target->anchorB, offsetA );
+			target->separation = source->separation - restOffset;
+			target->featureId = b3MakeFeatureId( source->pair );
+			target->triangleIndex = source->triangleIndex;
+
+			// Preserve normal impulse if possible
+			if ( matchedManifold != NULL )
+			{
+				int oldPointCount = matchedManifold->pointCount;
+				for ( int k = 0; k < oldPointCount; ++k )
+				{
+					b3ManifoldPoint* oldPt = matchedManifold->points + k;
+
+					if ( target->featureId == oldPt->featureId && target->triangleIndex == oldPt->triangleIndex )
+					{
+						target->normalImpulse = oldPt->normalImpulse;
+						target->persisted = true;
+
+						// claimed
+						oldPt->triangleIndex = B3_NULL_INDEX;
+						break;
+					}
+				}
+			}
+		}
+	}
+
+	return true;
+}
+
 bool b3ComputeMeshManifolds( b3World* world, int workerIndex, b3Contact* contact, const b3Shape* shapeA, const int* materialMap,
 							 b3WorldTransform xfA, const b3Shape* shapeB, b3WorldTransform xfB, bool isFast, b3Arena arena )
 {
@@ -834,256 +1096,12 @@ bool b3ComputeMeshManifolds( b3World* world, int workerIndex, b3Contact* contact
 
 	B3_ASSERT( acceptedManifoldCount <= triangleCount );
 
-	if ( acceptedManifoldCount == 0 )
-	{
-		if ( contact->manifoldCount > 0 )
-		{
-			b3FreeManifolds( world, contact->manifolds, contact->manifoldCount );
-			contact->manifolds = NULL;
-			contact->manifoldCount = 0;
-		}
-		return false;
-	}
-
-	b3Cluster* clusters = b3Bump( &arena, acceptedManifoldCount * sizeof( b3Cluster ) );
-	int* clusterMemberships = b3Bump( &arena, acceptedManifoldCount * sizeof( int ) );
-
-	// Cluster tolerance is tighter than the warm starting manifold matching tolerance. These
-	// serve different purposes.
-	const float clusterThreshold = 0.996f;
-	int clusterCount = 0;
-	int clusterPointCount = 0;
-	for ( int i = 0; i < acceptedManifoldCount; ++i )
-	{
-		clusterMemberships[i] = B3_NULL_INDEX;
-
-		const b3LocalManifold* manifold = acceptedManifolds[i];
-		clusterPointCount += manifold->pointCount;
-
-		// Cluster based on the triangle normal and contact normal.
-		// The first cluster found is accepted because the tolerance is tight.
-		// todo consider requiring the triangles to be connect by an edge.
-		// todo consider looking for the best cluster instead of the first one within tolerance
-		// This bool is here to allow quick testing with and without clustering.
-		bool allowClustering = true;
-		b3Vec3 manifoldNormal = manifold->normal;
-		b3Vec3 triangleNormal = manifold->triangleNormal;
-		int clusterIndex = B3_NULL_INDEX;
-		for ( int j = 0; j < clusterCount && allowClustering; ++j )
-		{
-			float cosManifoldAngle = b3Dot( clusters[j].manifoldNormal, manifoldNormal );
-			float cosTriangleAngle = b3Dot( clusters[j].triangleNormal, triangleNormal );
-			if ( cosManifoldAngle <= clusterThreshold || cosTriangleAngle <= clusterThreshold )
-			{
-				continue;
-			}
-
-#if 0
-			// todo there could be later triangles that create the connection
-			// then failure to cluster breaks greedy impulse warm starting
-			bool edgeConnected = false;
-
-			for ( int k = 0; k < i; ++k )
-			{
-				if ( clusterMemberships[k] != j )
-				{
-					continue;
-				}
-
-				const b3LocalManifold* other = acceptedManifolds[k];
-				if ( b3TrianglesShareEdge( manifold->i1, manifold->i2, manifold->i3, other->i1, other->i2, other->i3 ) )
-				{
-					edgeConnected = true;
-					break;
-				}
-			}
-
-			if ( edgeConnected )
-			{
-				clusterIndex = j;
-				break;
-			}
-#else
-
-			// Found a cluster
-			clusterIndex = j;
-			break;
-#endif
-		}
-
-		if ( clusterIndex != B3_NULL_INDEX )
-		{
-			clusterMemberships[i] = clusterIndex;
-			clusters[clusterIndex].pointCapacity += manifold->pointCount;
-		}
-		else
-		{
-			clusters[clusterCount].manifoldNormal = manifoldNormal;
-			clusters[clusterCount].triangleNormal = triangleNormal;
-			clusters[clusterCount].pointCapacity = manifold->pointCount;
-			clusterMemberships[i] = clusterCount;
-			clusterCount += 1;
-		}
-	}
-
-	if ( clusterPointCount == 0 )
+	if ( b3BuildClusterManifolds( world, contact, acceptedManifolds, acceptedManifoldCount, xfA, xfB, restOffset, arena ) == false )
 	{
 		return false;
 	}
 
-	// Setup clusters
-	b3LocalManifoldPoint* clusterPoints = b3Bump( &arena, clusterPointCount * sizeof( b3LocalManifoldPoint ) );
-	int pointOffset = 0;
-
-	for ( int i = 0; i < clusterCount; ++i )
-	{
-		b3Cluster* cluster = clusters + i;
-		cluster->points = clusterPoints + pointOffset;
-		cluster->pointCount = 0;
-		pointOffset += cluster->pointCapacity;
-	}
-
-	// Populate clusters
-	for ( int i = 0; i < acceptedManifoldCount; ++i )
-	{
-		int clusterIndex = clusterMemberships[i];
-		if ( clusterIndex == B3_NULL_INDEX )
-		{
-			continue;
-		}
-
-		B3_ASSERT( 0 <= clusterIndex && clusterIndex < clusterCount );
-
-		b3LocalManifold* am = acceptedManifolds[i];
-		b3Cluster* cm = clusters + clusterIndex;
-		for ( int j = 0; j < am->pointCount; ++j )
-		{
-			B3_ASSERT( cm->pointCount < cm->pointCapacity );
-			b3LocalManifoldPoint* ap = am->points + j;
-			b3LocalManifoldPoint* cp = cm->points + cm->pointCount;
-
-			cp->triangleIndex = am->triangleIndex;
-			cp->point = ap->point;
-			cp->separation = ap->separation;
-			cp->pair = ap->pair;
-			cm->pointCount += 1;
-		}
-	}
-
-	// Simplify clusters
-	for ( int i = 0; i < clusterCount; ++i )
-	{
-		b3Cluster* cm = clusters + i;
-		B3_ASSERT( cm->pointCount == cm->pointCapacity );
-		int reducedCount = b3ReduceCluster( cm->points, cm->pointCount, cm->triangleNormal, arena );
-		cm->pointCount = reducedCount;
-	}
-
-	// Make a temporary copy of previous manifolds
-	int oldManifoldCount = contact->manifoldCount;
-	b3Manifold* oldManifolds = NULL;
-	if ( oldManifoldCount > 0 )
-	{
-		oldManifolds = b3Bump( &arena, oldManifoldCount * sizeof( b3Manifold ) );
-		memcpy( oldManifolds, contact->manifolds, oldManifoldCount * sizeof( b3Manifold ) );
-	}
-
-	// Resize manifolds if needed
-	if ( oldManifoldCount != clusterCount )
-	{
-		b3FreeManifolds( world, contact->manifolds, contact->manifoldCount );
-		contact->manifolds = b3AllocateManifolds( world, clusterCount );
-		contact->manifoldCount = (uint16_t)clusterCount;
-	}
-	else
-	{
-		// Mem zero manifolds
-		memset( contact->manifolds, 0, contact->manifoldCount * sizeof( b3Manifold ) );
-	}
-
-	bool* consumed = NULL;
-	if ( oldManifoldCount > 0 )
-	{
-		consumed = b3Bump( &arena, oldManifoldCount * sizeof( bool ) );
-		memset( consumed, 0, oldManifoldCount * sizeof( bool ) );
-	}
-
-	b3Matrix3 matrixB = b3MakeMatrixFromQuat( xfB.q );
-	b3Vec3 offsetA = b3SubPos( xfB.p, xfA.p );
-
-	const float normalMatchTolerance = 0.995f;
-	for ( int i = 0; i < clusterCount; ++i )
-	{
-		b3Cluster* cm = clusters + i;
-		int pointCount = cm->pointCount;
-		B3_ASSERT( 0 < pointCount && pointCount <= B3_MAX_MANIFOLD_POINTS );
-
-		b3Manifold* manifold = contact->manifolds + i;
-		manifold->pointCount = pointCount;
-		manifold->normal = b3MulMV( matrixB, cm->manifoldNormal );
-
-		b3Vec3 clusterNormal = b3MulMV( matrixB, cm->manifoldNormal );
-		float bestDot = normalMatchTolerance;
-		int bestIndex = B3_NULL_INDEX;
-
-		for ( int j = 0; j < oldManifoldCount; ++j )
-		{
-			if ( consumed[j] == true )
-			{
-				continue;
-			}
-
-			float dot = b3Dot( oldManifolds[j].normal, clusterNormal );
-			if ( dot > bestDot )
-			{
-				bestIndex = j;
-				bestDot = dot;
-			}
-		}
-
-		b3Manifold* matchedManifold = NULL;
-		if ( bestIndex != B3_NULL_INDEX )
-		{
-			matchedManifold = oldManifolds + bestIndex;
-			manifold->frictionImpulse = matchedManifold->frictionImpulse;
-			manifold->rollingImpulse = matchedManifold->rollingImpulse;
-			manifold->twistImpulse = matchedManifold->twistImpulse;
-			consumed[bestIndex] = true;
-		}
-
-		for ( int j = 0; j < pointCount; ++j )
-		{
-			const b3LocalManifoldPoint* source = cm->points + j;
-			b3ManifoldPoint* target = manifold->points + j;
-
-			// Contact points are computed in frame B
-			target->anchorB = b3MulMV( matrixB, source->point );
-			target->anchorA = b3Add( target->anchorB, offsetA );
-			target->separation = source->separation - restOffset;
-			target->featureId = b3MakeFeatureId( source->pair );
-			target->triangleIndex = source->triangleIndex;
-
-			// Preserve normal impulse if possible
-			if ( matchedManifold != NULL )
-			{
-				int oldPointCount = matchedManifold->pointCount;
-				for ( int k = 0; k < oldPointCount; ++k )
-				{
-					b3ManifoldPoint* oldPt = matchedManifold->points + k;
-
-					if ( target->featureId == oldPt->featureId && target->triangleIndex == oldPt->triangleIndex )
-					{
-						target->normalImpulse = oldPt->normalImpulse;
-						target->persisted = true;
-
-						// claimed
-						oldPt->triangleIndex = B3_NULL_INDEX;
-						break;
-					}
-				}
-			}
-		}
-	}
+	int clusterCount = contact->manifoldCount;
 
 	const b3SurfaceMaterial* materialsA = b3GetShapeMaterials( shapeA );
 	const b3SurfaceMaterial* materialB = b3GetShapeMaterials( shapeB );
@@ -1180,6 +1198,283 @@ bool b3ComputeMeshManifolds( b3World* world, int workerIndex, b3Contact* contact
 
 	contact->rollingResistance = materialB->rollingResistance * radiusB;
 
+	b3Vec3 tangentVelocityB = b3RotateVector( xfB.q, materialB->tangentVelocity );
+	contact->tangentVelocity = b3Sub( tangentVelocityA, tangentVelocityB );
+	return true;
+}
+
+// Voxel grid contacts
+//
+// A voxel grid contact is a mesh contact whose cache is keyed by box instead of triangle: the key is ( cell << boxBits ) | box,
+// ascending, and each entry holds the SAT or simplex cache of that box against shape B. Each box is collided through the
+// convex code on its prebuilt hull. A box with covered faces never pushes through them: see b3CollideHullFaces. The
+// manifolds then go through the same clustering as a mesh, so boxes that make one flat surface give one manifold of at most
+// four points, and impulses carry over by (feature id, key).
+
+// The bound on boxes in one contact. A body over a very dense region sees only the first boxes in cell order.
+#define B3_MAX_VOXEL_CONTACT_BOXES 512
+
+typedef struct b3VoxelKeyContext
+{
+	const b3VoxelGrid* grid;
+	int* keys;
+	int capacity;
+	int count;
+} b3VoxelKeyContext;
+
+static bool b3CollectVoxelKeysCallback( int cell, int box, b3AABB bounds, void* context )
+{
+	B3_UNUSED( bounds );
+	b3VoxelKeyContext* keyContext = context;
+	if ( keyContext->count == keyContext->capacity )
+	{
+		return false;
+	}
+
+	keyContext->keys[keyContext->count] = b3VoxelGridKey( keyContext->grid, cell, box );
+	keyContext->count += 1;
+	return true;
+}
+
+static void b3RefreshVoxelCache( b3Contact* contact, const b3VoxelGrid* grid, b3WorldTransform xfA, const b3AABB* bounds )
+{
+	b3MeshContact* meshContact = &contact->meshContact;
+
+	// If the dynamic body didn't move out of the cached query bounds we are done
+	if ( b3AABB_Contains( meshContact->queryBounds, *bounds ) )
+	{
+		return;
+	}
+
+	// Enlarge to the query bounds to absorb small movement
+	float radius = B3_MAX_AABB_MARGIN + B3_SPECULATIVE_DISTANCE;
+	b3Vec3 extension = { radius, radius, radius };
+	meshContact->queryBounds.lowerBound = b3Sub( bounds->lowerBound, extension );
+	meshContact->queryBounds.upperBound = b3Add( bounds->upperBound, extension );
+
+	// Bounds are in world space. Convert to the local grid frame.
+	b3Transform gridTransform = b3ToRelativeTransform( xfA, b3Pos_zero );
+	b3AABB localBounds = b3AABB_Transform( b3InvertTransform( gridTransform ), meshContact->queryBounds );
+
+	int keys[B3_MAX_VOXEL_CONTACT_BOXES];
+	b3VoxelKeyContext keyContext = { grid, keys, B3_MAX_VOXEL_CONTACT_BOXES, 0 };
+	b3QueryVoxelGrid( grid, localBounds, b3CollectVoxelKeysCallback, &keyContext );
+
+	if ( keyContext.count == B3_MAX_VOXEL_CONTACT_BOXES )
+	{
+		static bool s_once = false;
+		if ( s_once == false )
+		{
+			b3Log( "WARNING: dense voxel grid detected, box buffer capacity of %d reached", B3_MAX_VOXEL_CONTACT_BOXES );
+			s_once = true;
+		}
+	}
+
+	// Keys are ascending, so match with the old cache by merging
+	b3ContactCache contactCache[B3_MAX_VOXEL_CONTACT_BOXES];
+
+	int count = keyContext.count;
+	int index2 = 0;
+	for ( int index1 = 0; index1 < count; ++index1 )
+	{
+		contactCache[index1] = (b3ContactCache){ 0 };
+
+		while ( index2 < meshContact->triangleCache.count && meshContact->triangleCache.data[index2].triangleIndex < keys[index1] )
+		{
+			index2 += 1;
+		}
+
+		if ( index2 < meshContact->triangleCache.count && meshContact->triangleCache.data[index2].triangleIndex == keys[index1] )
+		{
+			contactCache[index1] = meshContact->triangleCache.data[index2].cache;
+		}
+	}
+
+	// Save new cache
+	b3Array_Resize( meshContact->triangleCache, count );
+	for ( int i = 0; i < count; ++i )
+	{
+		meshContact->triangleCache.data[i] = (b3TriangleCache){ keys[i], contactCache[i] };
+	}
+}
+
+bool b3ComputeVoxelGridManifolds( b3World* world, int workerIndex, b3Contact* contact, const b3Shape* shapeA, b3WorldTransform xfA,
+								  const b3Shape* shapeB, b3WorldTransform xfB, bool isFast, b3Arena arena )
+{
+	B3_ASSERT( shapeA->type == b3_voxelGridShape );
+
+	const b3VoxelGrid* grid = shapeA->voxelGrid;
+	b3TaskContext* context = b3Array_Get( world->taskContexts, workerIndex );
+
+	b3RefreshVoxelCache( contact, grid, xfA, &shapeB->aabb );
+
+	b3MeshContact* meshContact = &contact->meshContact;
+	int boxCount = meshContact->triangleCache.count;
+	b3TriangleCache* boxCaches = meshContact->triangleCache.data;
+
+	b3LocalManifold** acceptedManifolds = b3Bump( &arena, ( boxCount + 1 ) * sizeof( b3LocalManifold* ) );
+	int acceptedManifoldCount = 0;
+	b3LocalManifold* manifoldBuffer = b3Bump( &arena, ( boxCount + 1 ) * sizeof( b3LocalManifold ) );
+	b3LocalManifoldPoint* pointBuffer = b3Bump( &arena, ( boxCount + 1 ) * B3_MAX_MANIFOLD_POINTS * sizeof( b3LocalManifoldPoint ) );
+
+	// The transform from the grid frame into the frame of B
+	b3Transform transformAtoB = b3InvMulWorldTransforms( xfB, xfA );
+
+	const b3HullData* hullB = shapeB->type == b3_hullShape ? shapeB->hull : NULL;
+
+	int currentCell = B3_NULL_INDEX;
+	const b3VoxelGridModule* module = NULL;
+	b3Transform transformCellToB = b3Transform_identity;
+	b3Transform transformBtoCell = b3Transform_identity;
+
+	for ( int index = 0; index < boxCount; ++index )
+	{
+		int key = boxCaches[index].triangleIndex;
+		int cell = b3VoxelGridKeyCell( grid, key );
+		int box = b3VoxelGridKeyBox( grid, key );
+
+		if ( cell != currentCell )
+		{
+			currentCell = cell;
+			module = b3GetVoxelGridCellModule( grid, cell );
+			B3_ASSERT( module != NULL );
+
+			// Hulls live in the cell frame
+			b3Vec3 corner = b3VoxelGridCellCorner( grid, cell );
+			transformCellToB = transformAtoB;
+			transformCellToB.p = b3Add( transformAtoB.p, b3RotateVector( transformAtoB.q, corner ) );
+			transformBtoCell = b3InvertTransform( transformCellToB );
+		}
+
+		if ( box >= module->boxCount )
+		{
+			// The cache is stale after an edit that was not announced. Drop the box instead of reading past the module.
+			B3_ASSERT( false );
+			continue;
+		}
+
+		const b3HullData* hullA = &module->hulls[box].base;
+		b3ContactCache* cache = &boxCaches[index].cache;
+
+		b3LocalManifoldPoint points[B3_MAX_POINTS_PER_TRIANGLE];
+		b3LocalManifold manifold = { 0 };
+		manifold.points = points;
+		manifold.feature = b3_featureNone;
+		int pointCapacity = B3_MAX_POINTS_PER_TRIANGLE;
+
+		switch ( shapeB->type )
+		{
+			case b3_capsuleShape:
+				b3CollideHullAndCapsule( &manifold, pointCapacity, hullA, &shapeB->capsule, transformBtoCell, &cache->simplexCache );
+				break;
+
+			case b3_hullShape:
+				// Cached edge contact is dangerous at high speed because the hull can rotate around the edge and tunnel
+				// through the box.
+				if ( isFast && cache->satCache.type == b3_edgePairAxis )
+				{
+					cache->satCache = (b3SATCache){ 0 };
+				}
+
+				b3CollideHulls( &manifold, pointCapacity, hullA, hullB, transformBtoCell, &cache->satCache );
+				context->satCallCount += 1;
+				context->satCacheHitCount += cache->satCache.hit;
+				break;
+
+			case b3_sphereShape:
+				b3CollideHullAndSphere( &manifold, pointCapacity, hullA, &shapeB->sphere, transformBtoCell, &cache->simplexCache );
+				break;
+
+			default:
+				B3_ASSERT( false );
+				return false;
+		}
+
+		if ( manifold.pointCount == 0 )
+		{
+			continue;
+		}
+
+		// A contact that would push through a face solid covers is answered on the exposed faces instead
+		uint8_t covered = b3GetVoxelBoxCoveredFaces( grid, cell, box );
+		if ( covered != 0 && b3IsNormalIntoCoveredFace( covered, manifold.normal ) )
+		{
+			int exposed = ~covered & 0x3f;
+			manifold.pointCount = 0;
+			switch ( shapeB->type )
+			{
+				case b3_capsuleShape:
+					b3CollideHullFacesAndCapsule( &manifold, pointCapacity, hullA, exposed, &shapeB->capsule, transformBtoCell );
+					break;
+
+				case b3_hullShape:
+					b3CollideHullFaces( &manifold, pointCapacity, hullA, exposed, hullB, transformBtoCell, &cache->satCache );
+					break;
+
+				default:
+					b3CollideHullFacesAndSphere( &manifold, pointCapacity, hullA, exposed, &shapeB->sphere, transformBtoCell );
+					break;
+			}
+
+			if ( manifold.pointCount == 0 )
+			{
+				continue;
+			}
+		}
+
+		// Keep the points in frame B, like a mesh manifold
+		b3LocalManifold* accepted = manifoldBuffer + acceptedManifoldCount;
+		int pointCount = b3MinInt( manifold.pointCount, B3_MAX_MANIFOLD_POINTS );
+		B3_ASSERT( manifold.pointCount <= B3_MAX_MANIFOLD_POINTS );
+		*accepted = (b3LocalManifold){ 0 };
+		accepted->points = pointBuffer + acceptedManifoldCount * B3_MAX_MANIFOLD_POINTS;
+		accepted->pointCount = pointCount;
+		accepted->normal = b3RotateVector( transformCellToB.q, manifold.normal );
+		accepted->triangleNormal = accepted->normal;
+		accepted->triangleIndex = key;
+		accepted->feature = b3_featureHullFace;
+		for ( int i = 0; i < pointCount; ++i )
+		{
+			accepted->points[i] = manifold.points[i];
+			accepted->points[i].point = b3TransformPoint( transformCellToB, manifold.points[i].point );
+		}
+
+		acceptedManifolds[acceptedManifoldCount++] = accepted;
+	}
+
+	if ( b3BuildClusterManifolds( world, contact, acceptedManifolds, acceptedManifoldCount, xfA, xfB, B3_MESH_REST_OFFSET, arena ) ==
+		 false )
+	{
+		return false;
+	}
+
+	// One material for the whole grid
+	const b3SurfaceMaterial* materialA = b3GetShapeMaterials( shapeA );
+	const b3SurfaceMaterial* materialB = b3GetShapeMaterials( shapeB );
+
+	// Keep these updated in case the values on the shapes are modified
+	contact->friction =
+		world->frictionCallback( materialA->friction, materialA->userMaterialId, materialB->friction, materialB->userMaterialId );
+	contact->restitution = world->restitutionCallback( materialA->restitution, materialA->userMaterialId, materialB->restitution,
+													   materialB->userMaterialId );
+
+	float radiusB = 0.0f;
+	if ( shapeB->type == b3_sphereShape )
+	{
+		radiusB = shapeB->sphere.radius;
+	}
+	else if ( shapeB->type == b3_capsuleShape )
+	{
+		radiusB = shapeB->capsule.radius;
+	}
+	else if ( shapeB->type == b3_hullShape )
+	{
+		radiusB = shapeB->hull->innerRadius;
+	}
+
+	contact->rollingResistance = materialB->rollingResistance * radiusB;
+
+	b3Vec3 tangentVelocityA = b3RotateVector( xfA.q, materialA->tangentVelocity );
 	b3Vec3 tangentVelocityB = b3RotateVector( xfB.q, materialB->tangentVelocity );
 	contact->tangentVelocity = b3Sub( tangentVelocityA, tangentVelocityB );
 	return true;

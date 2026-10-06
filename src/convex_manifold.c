@@ -2586,3 +2586,168 @@ void b3CollideHulls( b3LocalManifold* manifold, int capacity, const b3HullData* 
 }
 
 #endif
+
+// Terra Prime: voxel grid boxes.
+// A box face that solid covers cannot be touched from outside. When the regular manifold pushes through such a face the
+// contact is answered again on the faces that are exposed: the exposed face the other shape penetrates least, found by the
+// separating axis test over only those face axes of hull A (faceMask, bit per face). Hull B is clipped against the face's
+// side planes, so a shape that lies beyond the face leaves the contact to the neighbouring box that owns that space.
+bool b3CollideHullFaces( b3LocalManifold* manifold, int capacity, const b3HullData* hullA, int faceMask, const b3HullData* hullB,
+						 b3Transform transformBtoA, b3SATCache* cache )
+{
+	manifold->pointCount = 0;
+
+	const b3Plane* planes = b3GetHullPlanes( hullA );
+	const b3Vec3* pointsB = b3GetHullPoints( hullB );
+	int countB = hullB->vertexCount;
+
+	b3Vec3 pointsInA[B3_MAX_HULL_VERTICES];
+	B3_ASSERT( countB <= B3_MAX_HULL_VERTICES );
+	for ( int i = 0; i < countB; ++i )
+	{
+		pointsInA[i] = b3TransformPoint( transformBtoA, pointsB[i] );
+	}
+
+	int bestFace = B3_NULL_INDEX;
+	int bestVertex = 0;
+	float bestSeparation = -FLT_MAX;
+	for ( int face = 0; face < hullA->faceCount; ++face )
+	{
+		if ( ( faceMask & ( 1 << face ) ) == 0 )
+		{
+			continue;
+		}
+
+		// The deepest vertex of B below the face plane
+		float minSeparation = FLT_MAX;
+		int vertex = 0;
+		for ( int i = 0; i < countB; ++i )
+		{
+			float separation = b3PlaneSeparation( planes[face], pointsInA[i] );
+			if ( separation < minSeparation )
+			{
+				minSeparation = separation;
+				vertex = i;
+			}
+		}
+
+		if ( minSeparation > bestSeparation )
+		{
+			bestSeparation = minSeparation;
+			bestFace = face;
+			bestVertex = vertex;
+		}
+	}
+
+	if ( bestFace == B3_NULL_INDEX || bestSeparation >= B3_SPECULATIVE_DISTANCE )
+	{
+		return false;
+	}
+
+	b3SeparatingAxis query = {
+		.normal = planes[bestFace].normal,
+		.separation = bestSeparation,
+		.indexA = bestFace,
+		.indexB = bestVertex,
+		.type = b3_faceAxisA,
+	};
+
+	return b3BuildFaceAContact( manifold, capacity, hullA, hullB, transformBtoA, query, cache );
+}
+
+bool b3CollideHullFacesAndSphere( b3LocalManifold* manifold, int capacity, const b3HullData* hullA, int faceMask,
+								  const b3Sphere* sphereB, b3Transform transformBtoA )
+{
+	manifold->pointCount = 0;
+	if ( capacity < 1 )
+	{
+		return false;
+	}
+
+	const b3Plane* planes = b3GetHullPlanes( hullA );
+	b3Vec3 center = b3TransformPoint( transformBtoA, sphereB->center );
+
+	int bestFace = B3_NULL_INDEX;
+	float bestDistance = -FLT_MAX;
+	for ( int face = 0; face < hullA->faceCount; ++face )
+	{
+		if ( ( faceMask & ( 1 << face ) ) == 0 )
+		{
+			continue;
+		}
+
+		float distance = b3PlaneSeparation( planes[face], center );
+		if ( distance > bestDistance )
+		{
+			bestDistance = distance;
+			bestFace = face;
+		}
+	}
+
+	float radius = sphereB->radius;
+	if ( bestFace == B3_NULL_INDEX || bestDistance - radius >= B3_SPECULATIVE_DISTANCE )
+	{
+		return false;
+	}
+
+	b3Vec3 normal = planes[bestFace].normal;
+
+	// Project the center onto the face, take the deepest point of the sphere and use the half-way point
+	b3Vec3 cA = b3MulSub( center, bestDistance, normal );
+	b3Vec3 cB = b3MulSub( center, radius, normal );
+
+	manifold->normal = normal;
+	manifold->pointCount = 1;
+
+	b3LocalManifoldPoint* pt = manifold->points + 0;
+	pt->point = b3Lerp( cA, cB, 0.5f );
+	pt->separation = bestDistance - radius;
+	pt->pair = b3FeaturePair_single;
+	return true;
+}
+
+bool b3CollideHullFacesAndCapsule( b3LocalManifold* manifold, int capacity, const b3HullData* hullA, int faceMask,
+								   const b3Capsule* capsuleB, b3Transform transformBtoA )
+{
+	manifold->pointCount = 0;
+	if ( capacity < 2 )
+	{
+		return false;
+	}
+
+	const b3Plane* planes = b3GetHullPlanes( hullA );
+	b3Vec3 c1 = b3TransformPoint( transformBtoA, capsuleB->center1 );
+	b3Vec3 c2 = b3TransformPoint( transformBtoA, capsuleB->center2 );
+
+	int bestFace = B3_NULL_INDEX;
+	float bestDistance = -FLT_MAX;
+	for ( int face = 0; face < hullA->faceCount; ++face )
+	{
+		if ( ( faceMask & ( 1 << face ) ) == 0 )
+		{
+			continue;
+		}
+
+		float distance = b3MinFloat( b3PlaneSeparation( planes[face], c1 ), b3PlaneSeparation( planes[face], c2 ) );
+		if ( distance > bestDistance )
+		{
+			bestDistance = distance;
+			bestFace = face;
+		}
+	}
+
+	if ( bestFace == B3_NULL_INDEX || bestDistance - capsuleB->radius >= B3_SPECULATIVE_DISTANCE )
+	{
+		return false;
+	}
+
+	b3SeparatingAxis query = {
+		.normal = planes[bestFace].normal,
+		.separation = bestDistance - capsuleB->radius,
+		.indexA = bestFace,
+		.indexB = 0,
+		.type = b3_faceAxisA,
+	};
+
+	return b3BuildHullFaceAndCapsuleContact( manifold, hullA, capsuleB, transformBtoA, query );
+}

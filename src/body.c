@@ -1464,7 +1464,7 @@ void b3Body_SetType( b3BodyId bodyId, b3BodyType type )
 		while ( shapeId != B3_NULL_INDEX )
 		{
 			b3Shape* shape = b3Array_Get( world->shapes, shapeId );
-			if ( shape->type == b3_compoundShape || shape->type == b3_heightShape )
+			if ( shape->type == b3_compoundShape || shape->type == b3_heightShape || shape->type == b3_voxelGridShape )
 			{
 				// Setting the body type is not supported for bodies with compound shapes
 				return;

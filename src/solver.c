@@ -528,7 +528,7 @@ static void b3SolveContinuous( b3World* world, int bodySimIndex, b3TaskContext* 
 		fastShape->aabb = box2;
 
 		// No continuous collision for meshes
-		if ( fastShape->type == b3_meshShape || fastShape->type == b3_heightShape )
+		if ( fastShape->type == b3_meshShape || fastShape->type == b3_heightShape || fastShape->type == b3_voxelGridShape )
 		{
 			continue;
 		}

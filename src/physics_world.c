@@ -22,6 +22,7 @@
 #include "shape.h"
 #include "solver.h"
 #include "solver_set.h"
+#include "voxel_grid.h"
 
 #include "box3d/box3d.h"
 #include "box3d/constants.h"
@@ -1341,6 +1342,9 @@ static bool DrawQueryCallback( int proxyId, uint64_t userData, void* context )
 				case b3_sphereShape:
 					debugShape.sphere = &shape->sphere;
 					shape->userShape = world->createDebugShape( &debugShape, world->userDebugShapeContext );
+					break;
+				case b3_voxelGridShape:
+					// No debug geometry for voxel grids
 					break;
 				default:
 					B3_ASSERT( false );
@@ -4063,6 +4067,17 @@ void b3ValidateContacts( b3World* world )
 					{
 						int triangleIndex = contact->meshContact.triangleCache.data[i].triangleIndex;
 						B3_ASSERT( 0 <= triangleIndex && triangleIndex < triangleCount );
+					}
+				}
+				else if ( shapeA->type == b3_voxelGridShape )
+				{
+					// The cache holds voxel keys, cell and box
+					const b3VoxelGrid* grid = shapeA->voxelGrid;
+					int cellCount = grid->size[0] * grid->size[1] * grid->size[2];
+					for ( int i = 0; i < cacheCount; ++i )
+					{
+						int key = contact->meshContact.triangleCache.data[i].triangleIndex;
+						B3_ASSERT( 0 <= b3VoxelGridKeyCell( grid, key ) && b3VoxelGridKeyCell( grid, key ) < cellCount );
 					}
 				}
 				else

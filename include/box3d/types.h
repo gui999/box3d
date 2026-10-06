@@ -450,6 +450,10 @@ typedef enum b3ShapeType
 	/// A sphere with an offset
 	b3_sphereShape,
 
+	/// A static grid of cells whose modules are sets of solid axis-aligned boxes (Terra Prime). Appended after the
+	/// original shape types so existing values are unchanged.
+	b3_voxelGridShape,
+
 	/// The number of shape types
 	b3_shapeTypeCount
 } b3ShapeType;

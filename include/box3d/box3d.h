@@ -828,6 +828,22 @@ B3_API b3ShapeId b3CreateMeshShape( b3BodyId bodyId, const b3ShapeDef* def, cons
 /// @return the shape id for accessing the shape
 B3_API b3ShapeId b3CreateHeightFieldShape( b3BodyId bodyId, const b3ShapeDef* def, const b3HeightFieldData* heightField );
 
+/// Create a voxel grid shape and attach it to a static body. One shape stands for the whole grid: boxes are not shapes.
+/// The shape retains the grid. Contacts are not created until the next time step.
+/// @return the shape id, or b3_nullShapeId for a non static body
+B3_API b3ShapeId b3CreateVoxelGridShape( b3BodyId bodyId, const b3ShapeDef* def, b3VoxelGrid* grid );
+
+/// Get the shape's voxel grid. Asserts the type is correct.
+B3_API b3VoxelGrid* b3Shape_GetVoxelGrid( b3ShapeId shapeId );
+
+/// Append a module to the shape's grid. Returns its index, or -1 when it has more boxes than a cell can hold.
+/// Call between steps.
+B3_API int b3Shape_VoxelGridAddModule( b3ShapeId shapeId, b3VoxelGridModule* module );
+
+/// Set cells of the shape's grid (see b3VoxelGrid_SetCells), refreshing the contacts of the shape in place and waking
+/// bodies near the changed cells. Call between steps.
+B3_API void b3Shape_VoxelGridSetCells( b3ShapeId shapeId, const int* paddedCells, const int* modules, int count );
+
 /// Baked compound shapes are only allowed on static bodies.
 /// Note: runtime compounds are achieved by adding multiple shapes to a body.
 /// Runtime compounds can be dynamic and/or kinematic.
