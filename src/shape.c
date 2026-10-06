@@ -1741,6 +1741,18 @@ void b3Shape_VoxelGridSetCells( b3ShapeId shapeId, const int* paddedCells, const
 	}
 	b3Free( wake.bodyIds, wake.capacity * sizeof( int ) );
 
+	if ( body->type != b3_staticBody )
+	{
+		// The boxes of a grid on a moving body changed: the body wakes, its centroid follows its boxes and a dynamic body takes
+		// the mass of the boxes that are left. A body that defers its mass computation keeps doing so.
+		b3WakeBody( world, body );
+		shape->localCentroid = b3GetShapeCentroid( shape );
+		if ( body->type == b3_dynamicBody && ( body->flags & b3_dirtyMass ) == 0 )
+		{
+			b3UpdateBodyMassData( world, body );
+		}
+	}
+
 	world->locked = false;
 }
 
@@ -2558,8 +2570,97 @@ static bool b3CompoundTimeOfImpactFcn( const b3CompoundData* compound, int child
 	return true;
 }
 
+b3TOIOutput b3ShapeTimeOfImpact( b3Shape* shapeA, b3Shape* shapeB, b3Sweep* sweepA, b3Sweep* sweepB, float maxFraction );
+
+// Time of impact of a voxel grid that moves (B) against any shape A that is taken as static. The grid is the union of its
+// boxes, so its time of impact is the earliest of theirs. Each exposed box is a hull in the body frame (a box covered on every
+// face cannot reach anything before the boxes around it) and goes through the same routine as any hull against A. The bounds
+// of the sweeping boxes against the bounds of A first leave out the boxes that cannot reach it.
+static b3TOIOutput b3VoxelGridTimeOfImpact( b3Shape* shapeA, b3Shape* shapeB, b3Sweep* sweepA, b3Sweep* sweepB, float maxFraction )
+{
+	const b3VoxelGrid* grid = shapeB->voxelGrid;
+	b3TOIOutput best = { 0 };
+
+	b3Transform xfA = {
+		.p = b3Sub( sweepA->c1, b3RotateVector( sweepA->q1, sweepA->localCenter ) ),
+		.q = sweepA->q1,
+	};
+	b3Transform xfB1 = {
+		.p = b3Sub( sweepB->c1, b3RotateVector( sweepB->q1, sweepB->localCenter ) ),
+		.q = sweepB->q1,
+	};
+	b3Transform xfB2 = {
+		.p = b3Sub( sweepB->c2, b3RotateVector( sweepB->q2, sweepB->localCenter ) ),
+		.q = sweepB->q2,
+	};
+
+	float margin = 2.0f * B3_SPECULATIVE_DISTANCE;
+	b3AABB boundsA = b3ComputeShapeAABB( shapeA, xfA );
+	boundsA = b3AABB_Inflate( boundsA, margin );
+
+	// The whole grid first
+	b3AABB sweptGrid = b3AABB_Union( b3ComputeVoxelGridOccupiedAABB( grid, xfB1 ), b3ComputeVoxelGridOccupiedAABB( grid, xfB2 ) );
+	if ( b3AABB_Overlaps( sweptGrid, boundsA ) == false )
+	{
+		return best;
+	}
+
+	float bestFraction = maxFraction;
+	int cellCount = grid->size[0] * grid->size[1] * grid->size[2];
+	for ( int cell = 0; cell < cellCount; ++cell )
+	{
+		const b3VoxelGridModule* module = b3GetVoxelGridCellModule( grid, cell );
+		if ( module == NULL || module->boxCount == 0 )
+		{
+			continue;
+		}
+
+		b3Vec3 corner = b3VoxelGridCellCorner( grid, cell );
+		b3AABB moduleBounds = { b3Add( corner, module->bounds.lowerBound ), b3Add( corner, module->bounds.upperBound ) };
+		b3AABB sweptModule = b3AABB_Union( b3AABB_Transform( xfB1, moduleBounds ), b3AABB_Transform( xfB2, moduleBounds ) );
+		if ( b3AABB_Overlaps( sweptModule, boundsA ) == false )
+		{
+			continue;
+		}
+
+		for ( int box = 0; box < module->boxCount; ++box )
+		{
+			b3AABB local = b3GetVoxelBoxLocalBounds( module, box );
+			local.lowerBound = b3Add( local.lowerBound, corner );
+			local.upperBound = b3Add( local.upperBound, corner );
+			b3AABB swept = b3AABB_Union( b3AABB_Transform( xfB1, local ), b3AABB_Transform( xfB2, local ) );
+			if ( b3AABB_Overlaps( swept, boundsA ) == false || b3IsVoxelBoxEnclosed( grid, cell, box ) )
+			{
+				continue;
+			}
+
+			// The box as a hull shape in the body frame
+			b3Vec3 extent = b3AABB_Extents( local );
+			b3BoxHull hull = b3MakeOffsetBoxHull( extent.x, extent.y, extent.z, b3AABB_Center( local ) );
+			b3Shape boxShape = { 0 };
+			boxShape.type = b3_hullShape;
+			boxShape.hull = &hull.base;
+			boxShape.sensorIndex = B3_NULL_INDEX;
+
+			b3TOIOutput output = b3ShapeTimeOfImpact( shapeA, &boxShape, sweepA, sweepB, bestFraction );
+			if ( 0.0f < output.fraction && output.fraction < bestFraction )
+			{
+				best = output;
+				bestFraction = output.fraction;
+			}
+		}
+	}
+
+	return best;
+}
+
 b3TOIOutput b3ShapeTimeOfImpact( b3Shape* shapeA, b3Shape* shapeB, b3Sweep* sweepA, b3Sweep* sweepB, float maxFraction )
 {
+	if ( shapeB->type == b3_voxelGridShape )
+	{
+		return b3VoxelGridTimeOfImpact( shapeA, shapeB, sweepA, sweepB, maxFraction );
+	}
+
 	bool isSensor = shapeA->sensorIndex != B3_NULL_INDEX;
 
 	b3ShapeType typeA = shapeA->type;

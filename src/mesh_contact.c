@@ -1701,8 +1701,9 @@ bool b3ComputeVoxelGridManifolds( b3World* world, int workerIndex, b3Contact* co
 //
 // Both grids are sets of boxes. The boxes of grid A that grid B can reach are listed, and each one asks grid B for the boxes
 // within speculative distance of it. A pair of boxes is collided as two hulls. A box covered on every face is left out, and a
-// contact that would push through a covered face of either box is answered on the exposed faces of that box (the other box is
-// then clipped to them) or dropped when the answer is covered on the other side. The accepted manifolds go through the same
+// contact that would push through a covered face of either box is answered on the exposed faces of that box, the other box
+// being clipped to them. That answer is final: its normal is a face normal of one box and tilted in the frame of the other, so
+// it is not tested against the covered faces of the other box. The accepted manifolds go through the same
 // clustering as every other grid contact, so one flat landing of two shards is a manifold of at most four points however many
 // box pairs touch. Pairs are keyed by a hash of both box keys, kept sorted in the contact cache so the separating axes carry
 // over.
@@ -1867,12 +1868,6 @@ static void b3CollideVoxelBoxes( b3LocalManifold* manifold, int capacity, const 
 	{
 		manifold->pointCount = 0;
 		b3CollideHullFaces( manifold, capacity, hullA, ~coveredA & 0x3f, hullB, transformBtoA, &scratch );
-		if ( manifold->pointCount > 0 && coveredB != 0 &&
-			 b3IsNormalIntoCoveredFace( coveredB, b3InvRotateVector( transformBtoA.q, b3Neg( manifold->normal ) ) ) )
-		{
-			// The other box leaves this contact to its neighbour
-			manifold->pointCount = 0;
-		}
 		return;
 	}
 
@@ -1889,13 +1884,7 @@ static void b3CollideVoxelBoxes( b3LocalManifold* manifold, int capacity, const 
 		return;
 	}
 
-	b3Vec3 flipped = b3Neg( b3RotateVector( transformBtoA.q, swapped.normal ) );
-	if ( coveredA != 0 && b3IsNormalIntoCoveredFace( coveredA, flipped ) )
-	{
-		return;
-	}
-
-	manifold->normal = flipped;
+	manifold->normal = b3Neg( b3RotateVector( transformBtoA.q, swapped.normal ) );
 	manifold->pointCount = swapped.pointCount;
 	for ( int i = 0; i < swapped.pointCount; ++i )
 	{

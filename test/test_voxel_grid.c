@@ -1343,6 +1343,193 @@ static int VoxelGridShardOnMesh( void )
 	return 0;
 }
 
+
+// A static slab of cells, each one solid box of the given thickness, 16 x 16 cells of 0.5 m. Its top is at y = 0.
+static bool MakeSlab( Shard* slab, float thickness )
+{
+	slab->sizeX = 16;
+	slab->sizeY = 1;
+	slab->sizeZ = 16;
+
+	float box[6] = { 0.0f, 0.0f, 0.0f, SHARD_CELL, thickness, SHARD_CELL };
+	slab->module = b3CreateVoxelGridModule( box, 1, SHARD_CELL, SHARD_CELL_VOXELS );
+	if ( slab->module == NULL )
+	{
+		return false;
+	}
+
+	int paddedCount = 18 * 3 * 18;
+	int* padded = (int*)b3Alloc( paddedCount * sizeof( int ) );
+	for ( int i = 0; i < paddedCount; ++i )
+	{
+		padded[i] = -1;
+	}
+
+	for ( int k = 0; k < 16; ++k )
+	{
+		for ( int i = 0; i < 16; ++i )
+		{
+			padded[ShardPaddedIndex( slab, i, 0, k )] = 0;
+		}
+	}
+
+	b3VoxelGridDef def = { 0 };
+	def.cellCountX = 16;
+	def.cellCountY = 1;
+	def.cellCountZ = 16;
+	def.origin = ( b3Vec3 ){ -4.0f, -thickness, -4.0f };
+	def.cellMeters = SHARD_CELL;
+	def.cellVoxels = SHARD_CELL_VOXELS;
+	def.maxBoxesPerCell = 1;
+	def.modules = &slab->module;
+	def.moduleCount = 1;
+	def.paddedCells = padded;
+	slab->grid = b3CreateVoxelGrid( &def );
+	b3Free( padded, paddedCount * sizeof( int ) );
+	return slab->grid != NULL;
+}
+
+// A flat shard launched at 30 m/s at a 0.2 m slab moves more than the slab is thick in one step
+static int FastShard( bool continuous, float speed, float startY, float* lowestY )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.enableContinuous = continuous;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	Shard slab;
+	ENSURE( MakeSlab( &slab, 0.2f ) );
+	b3BodyDef slabBodyDef = b3DefaultBodyDef();
+	b3BodyId slabBodyId = b3CreateBody( worldId, &slabBodyDef );
+	b3ShapeDef slabShapeDef = b3DefaultShapeDef();
+	b3CreateVoxelGridShape( slabBodyId, &slabShapeDef, slab.grid );
+
+	// 4 x 0.5 x 4 m above the slab
+	Shard shard;
+	ENSURE( MakeShard( &shard, 8, 1, 8 ) );
+	b3BodyId bodyId = CreateShardBody( worldId, &shard, ( b3Vec3 ){ -2.0f, startY, -2.0f }, 0.6f, NULL );
+	b3Body_SetLinearVelocity( bodyId, ( b3Vec3 ){ 0.0f, -speed, 0.0f } );
+
+	*lowestY = FLT_MAX;
+	for ( int i = 0; i < 120; ++i )
+	{
+		b3World_Step( worldId, 1.0f / 60.0f, 4 );
+		*lowestY = b3MinFloat( *lowestY, (float)b3Body_GetPosition( bodyId ).y );
+	}
+
+	b3Pos p = b3Body_GetPosition( bodyId );
+	printf( "  fast shard (continuous %d, %.0f m/s): lowest y %.3f, final %.3f %.3f %.3f, awake %d\n", continuous, speed, *lowestY, p.x,
+			p.y, p.z, b3Body_IsAwake( bodyId ) );
+
+	DestroyShard( &shard );
+	b3DestroyWorld( worldId );
+	DestroyShard( &slab );
+	return 0;
+}
+
+static int VoxelGridFastShard( void )
+{
+	// At 60 m/s a step moves the shard a metre. Without continuous collision it goes through the slab.
+	float lowest;
+	ENSURE( FastShard( false, 60.0f, 0.4f, &lowest ) == 0 );
+	ENSURE( lowest < -1.0f );
+
+	// With it the shard lands on top and rests there, at 60 m/s and at 30 m/s
+	ENSURE( FastShard( true, 60.0f, 0.4f, &lowest ) == 0 );
+	ENSURE( lowest > -0.01f );
+	ENSURE( FastShard( true, 30.0f, 1.0f, &lowest ) == 0 );
+	ENSURE( lowest > -0.01f );
+	return 0;
+}
+
+// A tilted shard dropped on a shard rolls onto a face and rests flat: the boxes of two bodies that are not aligned still touch
+static int VoxelGridShardTilt( void )
+{
+	World world;
+	CreateWorld( &world, 4, 0.6f );
+
+	Shard shard;
+	ENSURE( MakeShard( &shard, 8, 4, 8 ) );
+	b3BodyId lowerId = CreateShardBody( world.worldId, &shard, ( b3Vec3 ){ 2.0f, SLAB_HEIGHT + 0.01f, 2.0f }, 0.6f, NULL );
+	b3BodyId upperId = CreateShardBody( world.worldId, &shard, ( b3Vec3 ){ 2.0f, SLAB_HEIGHT + 2.4f, 2.0f }, 0.6f, NULL );
+	b3Vec3 axis = b3Normalize( ( b3Vec3 ){ 1.0f, 0.0f, 0.6f } );
+	b3Body_SetTransform( upperId, ( b3Pos ){ 2.1, SLAB_HEIGHT + 2.4, 1.9 }, b3MakeQuatFromAxisAngle( axis, 0.12f ) );
+
+	for ( int i = 0; i < 900; ++i )
+	{
+		b3World_Step( world.worldId, 1.0f / 60.0f, 4 );
+	}
+
+	b3Pos lower = b3Body_GetPosition( lowerId );
+	b3Pos upper = b3Body_GetPosition( upperId );
+	b3Vec3 up = b3RotateVector( b3Body_GetRotation( upperId ), b3Vec3_axisY );
+	printf( "  shard tilt: lower y %.4f, upper %.4f %.4f %.4f, up %.5f %.5f %.5f, awake %d %d\n", lower.y, upper.x, upper.y, upper.z, up.x,
+			up.y, up.z, b3Body_IsAwake( lowerId ), b3Body_IsAwake( upperId ) );
+	ENSURE_SMALL( lower.y - SLAB_HEIGHT, 0.004f );
+	ENSURE( up.y > 0.9998f );
+	ENSURE_SMALL( upper.y - ( SLAB_HEIGHT + 2.0f ), 0.01f );
+	ENSURE( b3Body_IsAwake( lowerId ) == false );
+	ENSURE( b3Body_IsAwake( upperId ) == false );
+
+	DestroyShard( &shard );
+	DestroyWorld( &world );
+	return 0;
+}
+
+// Removing cells of a resting shard in place: its mass follows, it wakes and settles again
+static int VoxelGridShardEdit( void )
+{
+	World world;
+	CreateWorld( &world, 4, 0.6f );
+
+	Shard shard;
+	ENSURE( MakeShard( &shard, 8, 4, 8 ) );
+	b3ShapeId shapeId;
+	b3BodyId bodyId = CreateShardBody( world.worldId, &shard, ( b3Vec3 ){ 2.0f, SLAB_HEIGHT + 0.01f, 2.0f }, 0.6f, &shapeId );
+	float density = b3DefaultShapeDef().density;
+	float boxMass = density * SHARD_CELL * SHARD_CELL * SHARD_CELL;
+
+	for ( int i = 0; i < 240; ++i )
+	{
+		b3World_Step( world.worldId, 1.0f / 60.0f, 4 );
+	}
+	ENSURE( b3Body_IsAwake( bodyId ) == false );
+	float mass = b3Body_GetMass( bodyId );
+	b3Vec3 center = b3Body_GetLocalCenter( bodyId );
+
+	// A box at the top corner
+	int cells[1] = { ShardPaddedIndex( &shard, 0, 3, 0 ) };
+	int modules[1] = { -1 };
+	b3Shape_VoxelGridSetCells( shapeId, cells, modules, 1 );
+	float massAfterTop = b3Body_GetMass( bodyId );
+	b3Vec3 centerAfterTop = b3Body_GetLocalCenter( bodyId );
+	printf( "  shard edit: mass %.1f -> %.1f (a box is %.1f), center %.4f %.4f %.4f -> %.4f %.4f %.4f\n", mass, massAfterTop, boxMass,
+			center.x, center.y, center.z, centerAfterTop.x, centerAfterTop.y, centerAfterTop.z );
+	ENSURE_SMALL( massAfterTop - ( mass - boxMass ), 1.0e-3f * boxMass );
+	ENSURE( centerAfterTop.x > center.x && centerAfterTop.y < center.y && centerAfterTop.z > center.z );
+	ENSURE( b3Body_IsAwake( bodyId ) );
+
+	// And one at the bottom corner, under the weight
+	cells[0] = ShardPaddedIndex( &shard, 7, 0, 7 );
+	b3Shape_VoxelGridSetCells( shapeId, cells, modules, 1 );
+	ENSURE_SMALL( b3Body_GetMass( bodyId ) - ( mass - 2.0f * boxMass ), 1.0e-3f * boxMass );
+
+	for ( int i = 0; i < 360; ++i )
+	{
+		b3World_Step( world.worldId, 1.0f / 60.0f, 4 );
+	}
+
+	b3Pos p = b3Body_GetPosition( bodyId );
+	printf( "  shard edit: settled at %.4f %.4f %.4f, awake %d\n", p.x, p.y, p.z, b3Body_IsAwake( bodyId ) );
+	ENSURE_SMALL( p.x - 2.0f, 0.02f );
+	ENSURE_SMALL( p.z - 2.0f, 0.02f );
+	ENSURE_SMALL( p.y - SLAB_HEIGHT, 0.01f );
+	ENSURE( b3Body_IsAwake( bodyId ) == false );
+
+	DestroyShard( &shard );
+	DestroyWorld( &world );
+	return 0;
+}
+
 int VoxelGridTest( void )
 {
 	RUN_SUBTEST( VoxelGridModuleCover );
@@ -1366,5 +1553,8 @@ int VoxelGridTest( void )
 	RUN_SUBTEST( VoxelGridShardStack );
 	RUN_SUBTEST( VoxelGridShardPile );
 	RUN_SUBTEST( VoxelGridShardOnMesh );
+	RUN_SUBTEST( VoxelGridShardTilt );
+	RUN_SUBTEST( VoxelGridFastShard );
+	RUN_SUBTEST( VoxelGridShardEdit );
 	return 0;
 }
