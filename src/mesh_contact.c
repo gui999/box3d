@@ -1798,6 +1798,18 @@ static bool b3CollectVoxelPairCallback( int cell, int box, b3AABB bounds, void* 
 		return true;
 	}
 
+	// Faces that touch overlap on two axes. Boxes that only meet along an edge or at a corner, such as the neighbours of the
+	// box under a flat landing, are left to the boxes that cover them: they would only add ghost contacts to the solve.
+	const b3AABB* a = &pairContext->boxA->bounds;
+	float tolerance = 0.5f * B3_LINEAR_SLOP;
+	int overlapAxes = ( b3MinFloat( a->upperBound.x, bounds.upperBound.x ) - b3MaxFloat( a->lowerBound.x, bounds.lowerBound.x ) > tolerance ) +
+					  ( b3MinFloat( a->upperBound.y, bounds.upperBound.y ) - b3MaxFloat( a->lowerBound.y, bounds.lowerBound.y ) > tolerance ) +
+					  ( b3MinFloat( a->upperBound.z, bounds.upperBound.z ) - b3MaxFloat( a->lowerBound.z, bounds.lowerBound.z ) > tolerance );
+	if ( overlapAxes < 2 )
+	{
+		return true;
+	}
+
 	uint8_t covered = b3GetVoxelBoxCoveredFaces( pairContext->gridB, cell, box );
 	if ( covered == 0x3f )
 	{

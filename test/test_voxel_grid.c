@@ -1286,7 +1286,7 @@ static int VoxelGridShardPile( void )
 
 	// A grid shard is one shape and its contacts are few
 	ENSURE( grid.contactCount < 400 );
-	ENSURE( grid.worstStepMs < 0.5f * boxes.worstStepMs );
+	ENSURE( grid.worstStepMs < 0.25f * boxes.worstStepMs );
 	return 0;
 }
 
