@@ -766,7 +766,9 @@ b3CastOutput b3RayCastVoxelGrid( const b3VoxelGrid* grid, const b3RayCastInput* 
 					}
 				}
 
-				for ( ;; )
+				// A walk crosses at most one boundary per cell on each axis
+				int maxSteps = grid->size[0] + grid->size[1] + grid->size[2] + 3;
+				for ( int walked = 0; walked < maxSteps; ++walked )
 				{
 					int a = next[0] < next[1] ? ( next[0] < next[2] ? 0 : 2 ) : ( next[1] < next[2] ? 1 : 2 );
 					float exit = b3MinFloat( next[a], tmax );

@@ -526,6 +526,202 @@ static int VoxelGridExposedFaces( void )
 	return 0;
 }
 
+// The queries a character body makes through the plugin: casts and overlaps of a capsule and a box proxy against a static
+// grid shape in a world, ray casts, and a closest-point query on the grid shape. None of them may loop or read bad memory.
+typedef struct QueryCounts
+{
+	int hits;
+	int calls;
+} QueryCounts;
+
+static float CountCast( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fraction, uint64_t userMaterialId, int triangleIndex,
+						int childIndex, void* context )
+{
+	B3_UNUSED( shapeId, point, userMaterialId, triangleIndex, childIndex );
+	QueryCounts* counts = context;
+	counts->calls += 1;
+	counts->hits += 1;
+	B3_UNUSED( normal );
+	return fraction;
+}
+
+static bool CountOverlap( b3ShapeId shapeId, void* context )
+{
+	B3_UNUSED( shapeId );
+	QueryCounts* counts = context;
+	counts->hits += 1;
+	return true;
+}
+
+static uint32_t NextRandom( uint32_t* state )
+{
+	uint32_t x = *state;
+	x ^= x << 13;
+	x ^= x >> 17;
+	x ^= x << 5;
+	*state = x;
+	return x;
+}
+
+static float RandomRange( uint32_t* state, float low, float high )
+{
+	return low + ( high - low ) * ( (float)( NextRandom( state ) & 0xffffff ) / (float)0x1000000 );
+}
+
+static int VoxelGridCharacterQueries( void )
+{
+	// A floor, a wall, a turned wall, a railing and a crate as the game's test row has them: 5 x 1 x 4 cells of 2 m
+	float floorBox[6] = { 0.0f, 0.0f, 0.0f, 2.0f, 0.2f, 2.0f };
+	float wallBox[6] = { 0.0f, 0.0f, 0.8f, 2.0f, 2.0f, 1.2f };
+	float turnedBox[6] = { 0.8f, 0.0f, 0.0f, 1.2f, 2.0f, 2.0f };
+	float railingBoxes[12] = { 0.0f, 0.0f, 0.0f, 2.0f, 0.2f, 2.0f, 0.0f, 0.2f, 1.8f, 2.0f, 1.1f, 2.0f };
+	float crateBox[6] = { 0.4f, 0.0f, 0.4f, 1.6f, 1.2f, 1.6f };
+	b3VoxelGridModule* modules[5] = {
+		b3CreateVoxelGridModule( floorBox, 1, 2.0f, CELL_VOXELS ), b3CreateVoxelGridModule( wallBox, 1, 2.0f, CELL_VOXELS ),
+		b3CreateVoxelGridModule( turnedBox, 1, 2.0f, CELL_VOXELS ), b3CreateVoxelGridModule( railingBoxes, 2, 2.0f, CELL_VOXELS ),
+		b3CreateVoxelGridModule( crateBox, 1, 2.0f, CELL_VOXELS ),
+	};
+	for ( int m = 0; m < 5; ++m )
+	{
+		ENSURE( modules[m] != NULL );
+	}
+
+	const int sx = 5, sz = 4;
+	int padded[( 5 + 2 ) * 3 * ( 4 + 2 )];
+	for ( int i = 0; i < ( 5 + 2 ) * 3 * ( 4 + 2 ); ++i )
+	{
+		padded[i] = -1;
+	}
+
+	for ( int k = 0; k < sz; ++k )
+	{
+		for ( int i = 0; i < sx; ++i )
+		{
+			int module = 0;
+			if ( k == 3 )
+			{
+				module = 1;
+			}
+			else if ( i == 3 )
+			{
+				module = 2;
+			}
+			else if ( i == 4 && k == 1 )
+			{
+				module = 3;
+			}
+			else if ( i == 1 && k == 1 )
+			{
+				module = 4;
+			}
+			padded[( ( 0 + 1 ) * ( sz + 2 ) + ( k + 1 ) ) * ( sx + 2 ) + ( i + 1 )] = module;
+		}
+	}
+
+	b3VoxelGridDef def = { 0 };
+	def.cellCountX = sx;
+	def.cellCountY = 1;
+	def.cellCountZ = sz;
+	def.cellMeters = 2.0f;
+	def.cellVoxels = CELL_VOXELS;
+	def.maxBoxesPerCell = 256;
+	def.modules = modules;
+	def.moduleCount = 5;
+	def.paddedCells = padded;
+	b3VoxelGrid* grid = b3CreateVoxelGrid( &def );
+	ENSURE( grid != NULL );
+
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	b3BodyId bodyId = b3CreateBody( worldId, &bodyDef );
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	b3ShapeId shapeId = b3CreateVoxelGridShape( bodyId, &shapeDef, grid );
+
+	// The recovery pass of a body test asks for the closest point on every shape its query overlaps
+	b3Vec3 target = { 3.0f, 1.0f, 3.0f };
+	b3Vec3 closest = b3Shape_GetClosestPoint( shapeId, target );
+	ENSURE( b3IsValidVec3( closest ) );
+
+	b3Vec3 capsulePoints[2] = { { 0.0f, 0.35f, 0.0f }, { 0.0f, 1.45f, 0.0f } };
+	b3Vec3 boxPoints[8];
+	for ( int c = 0; c < 8; ++c )
+	{
+		boxPoints[c] = ( b3Vec3 ){ ( c & 1 ) ? 0.3f : -0.3f, ( c & 2 ) ? 0.3f : -0.3f, ( c & 4 ) ? 0.3f : -0.3f };
+	}
+
+	b3ShapeProxy proxies[2] = { { capsulePoints, 2, 0.35f }, { boxPoints, 8, 0.0f } };
+	b3QueryFilter filter = b3DefaultQueryFilter();
+
+	// The sunk crate slides and the moves of the Godot test, then a dense random set. Zero components, axis-aligned
+	// motions and starts just inside boxes are drawn on purpose.
+	uint32_t state = 0x1234abcdu;
+	int total = 0;
+	for ( int sample = 0; sample < 40000; ++sample )
+	{
+		b3Vec3 start = { RandomRange( &state, -1.0f, 11.0f ), RandomRange( &state, -0.5f, 3.0f ), RandomRange( &state, -1.0f, 9.0f ) };
+		b3Vec3 motion = { RandomRange( &state, -4.0f, 4.0f ), RandomRange( &state, -3.0f, 3.0f ), RandomRange( &state, -4.0f, 4.0f ) };
+		uint32_t pick = NextRandom( &state );
+		if ( sample < 6 )
+		{
+			// Seam slides
+			start = ( b3Vec3 ){ 0.5f + 0.5f * (float)( sample % 3 ), 0.4995f + 0.0f, 1.0f };
+			motion = ( b3Vec3 ){ 5.0f, 0.0f, 0.0f };
+		}
+		if ( pick & 1 )
+		{
+			start.x = 0.5f * floorf( start.x * 2.0f );
+		}
+		if ( pick & 2 )
+		{
+			start.y = 0.05f * floorf( start.y * 20.0f ) + ( ( pick & 4 ) ? 0.4995f - 0.5f : 0.0f );
+		}
+		if ( pick & 8 )
+		{
+			motion.x = 0.0f;
+		}
+		if ( pick & 16 )
+		{
+			motion.y = 0.0f;
+		}
+		if ( pick & 32 )
+		{
+			motion.z = 0.0f;
+		}
+		if ( ( pick & 0x3c0 ) == 0 )
+		{
+			motion = b3Vec3_zero;
+		}
+
+		for ( int p = 0; p < 2; ++p )
+		{
+			b3Vec3 points[8];
+			for ( int i = 0; i < proxies[p].count; ++i )
+			{
+				points[i] = b3Add( proxies[p].points[i], start );
+			}
+			b3ShapeProxy proxy = { points, proxies[p].count, proxies[p].radius };
+
+			QueryCounts counts = { 0, 0 };
+			b3World_CastShape( worldId, b3Vec3_zero, &proxy, motion, filter, CountCast, &counts );
+			b3World_OverlapShape( worldId, b3Vec3_zero, &proxy, filter, CountOverlap, &counts );
+			total += counts.hits;
+		}
+
+		b3World_CastRay( worldId, start, motion, filter, CountCast, &( QueryCounts ){ 0, 0 } );
+		b3Shape_GetClosestPoint( shapeId, start );
+	}
+	printf( "  character queries: %d hits\n", total );
+
+	b3DestroyWorld( worldId );
+	b3ReleaseVoxelGrid( grid );
+	for ( int m = 0; m < 5; ++m )
+	{
+		b3ReleaseVoxelGridModule( modules[m] );
+	}
+	return 0;
+}
+
 int VoxelGridTest( void )
 {
 	RUN_SUBTEST( VoxelGridModuleCover );
@@ -538,5 +734,6 @@ int VoxelGridTest( void )
 	RUN_SUBTEST( VoxelGridSlideAcrossSeamsHeavy );
 	RUN_SUBTEST( VoxelGridSetCellWakes );
 	RUN_SUBTEST( VoxelGridSetCellRestoresSupport );
+	RUN_SUBTEST( VoxelGridCharacterQueries );
 	return 0;
 }

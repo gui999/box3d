@@ -2019,6 +2019,12 @@ b3Vec3 b3Shape_GetClosestPoint( b3ShapeId shapeId, b3Vec3 target )
 	// Low level closest point query is a documented float carve-out far from the origin
 	b3Transform transform = b3ToRelativeTransform( b3GetBodyTransformQuick( world, body ), b3Pos_zero );
 
+	// Only convex shapes have a proxy; a mesh, height field, compound or voxel grid answers with the target itself
+	if ( shape->type != b3_capsuleShape && shape->type != b3_sphereShape && shape->type != b3_hullShape )
+	{
+		return target;
+	}
+
 	b3DistanceInput input;
 	input.proxyA = b3MakeShapeProxy( shape );
 	input.proxyB = (b3ShapeProxy){ &target, 1, 0.0f };
