@@ -92,3 +92,8 @@ bool b3CollideHullFacesAndSphere( b3LocalManifold* manifold, int capacity, const
 								  const b3Sphere* sphereB, b3Transform transformBtoA );
 bool b3CollideHullFacesAndCapsule( b3LocalManifold* manifold, int capacity, const b3HullData* hullA, int faceMask,
 								   const b3Capsule* capsuleB, b3Transform transformBtoA );
+
+// Terra Prime: a triangle against a voxel grid box, answered on the box faces in faceMask only. The manifold is in the frame of
+// the hull with the normal from the triangle to the hull.
+void b3CollideTriangleAndHullFaces( b3LocalManifold* manifold, int capacity, b3Vec3 v1, b3Vec3 v2, b3Vec3 v3, int triangleFlags,
+									const b3HullData* hullB, int faceMask, b3SATCache* cache, bool enableSpeculative );

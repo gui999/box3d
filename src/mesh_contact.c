@@ -861,23 +861,39 @@ static bool b3BuildClusterManifolds( b3World* world, b3Contact* contact, b3Local
 	return true;
 }
 
-bool b3ComputeMeshManifolds( b3World* world, int workerIndex, b3Contact* contact, const b3Shape* shapeA, const int* materialMap,
-							 b3WorldTransform xfA, const b3Shape* shapeB, b3WorldTransform xfB, bool isFast, b3Arena arena )
+// A mesh or height field A and one convex shape B, collided triangle by triangle. A voxel grid contact uses it once for every
+// box of the grid, each box being a hull in the frame of its cell.
+typedef struct b3MeshConvexInput
 {
-	B3_ASSERT( shapeA->type == b3_meshShape || shapeA->type == b3_heightShape );
-	B3_UNUSED( workerIndex );
-	B3_UNUSED( isFast );
-	B3_UNUSED( materialMap );
+	b3TaskContext* context;
+	const b3Shape* meshShape;
+	b3ShapeType typeB;
+	const b3HullData* hullB;
+	const b3Capsule* capsuleB;
+	const b3Sphere* sphereB;
 
-	b3TaskContext* context = b3Array_Get( world->taskContexts, workerIndex );
+	// From the mesh frame into the frame of B
+	b3Transform transformAtoB;
+	bool isFast;
+	bool enableSpeculative;
 
-	b3RefreshCache( contact, shapeA, xfA, &shapeB->aabb );
+	// The faces of hull B that solid covers, for a box of a voxel grid. A contact that would push through one is answered on
+	// the exposed faces instead.
+	uint8_t coveredB;
+} b3MeshConvexInput;
 
-	// Collide with triangles and build manifolds
-	b3MeshContact* meshContact = &contact->meshContact;
-	int triangleCount = meshContact->triangleCache.count;
+// Finds the manifolds of the triangles in the caches against B. The accepted manifolds point into manifoldBuffer and
+// pointBuffer, the caller's memory, because they outlive this call. Returns their count.
+static int b3CollideMeshTriangles( const b3MeshConvexInput* input, b3TriangleCache* triangleCaches, int triangleCount,
+								   b3LocalManifold** acceptedManifolds, b3LocalManifold* manifoldBuffer,
+								   b3LocalManifoldPoint* pointBuffer, int pointBufferCapacity, b3Arena arena )
+{
+	const b3Shape* shapeA = input->meshShape;
+	b3TaskContext* context = input->context;
+	bool isFast = input->isFast;
+	bool enableSpeculative = input->enableSpeculative;
+	uint8_t coveredB = input->coveredB;
 
-	b3LocalManifold** acceptedManifolds = b3Bump( &arena, triangleCount * sizeof( b3LocalManifold* ) );
 	int acceptedManifoldCount = 0;
 	b3LocalManifold** tentativeManifolds = b3Bump( &arena, triangleCount * sizeof( b3LocalManifold* ) );
 	int tentativeManifoldCount = 0;
@@ -890,30 +906,14 @@ bool b3ComputeMeshManifolds( b3World* world, int workerIndex, b3Contact* contact
 	foundVertices.count = 0;
 
 	// This transform converts from mesh frame into the shapeB frame
-	b3Transform transformAtoB = b3InvMulWorldTransforms( xfB, xfA );
+	b3Transform transformAtoB = input->transformAtoB;
 	b3Matrix3 relativeMatrix = b3MakeMatrixFromQuat( transformAtoB.q );
 	float linearSlop = B3_LINEAR_SLOP;
 
-	// This should push apart shapes after a time of impact event.
-	// In the past I've called this `polygon skin`, but PhysX and Unreal
-	// call it `rest offset` which seems appropriate in this case.
-	// It leads to a small visual gap but seems to improve the quality of mesh
-	// collision, especially for hull versus mesh.
-	float restOffset = B3_MESH_REST_OFFSET;
-	bool enableSpeculative = contact->flags & b3_enableSpeculativePoints;
-
-	// Make room for clip points
-	int pointBufferCapacity = B3_MAX_POINTS_PER_TRIANGLE * triangleCount;
-
-	b3LocalManifoldPoint* pointBuffer = b3Bump( &arena, pointBufferCapacity * sizeof( b3LocalManifoldPoint ) );
 	int totalPointCount = 0;
-
-	b3LocalManifold* manifoldBuffer = b3Bump( &arena, triangleCount * sizeof( b3LocalManifold ) );
 	int manifoldCount = 0;
 
-	b3TriangleCache* triangleCaches = meshContact->triangleCache.data;
-
-	const b3HullData* hullB = shapeB->type == b3_hullShape ? shapeB->hull : NULL;
+	const b3HullData* hullB = input->hullB;
 
 	for ( int index = 0; index < triangleCount && totalPointCount + 3 < pointBufferCapacity; ++index )
 	{
@@ -944,10 +944,10 @@ bool b3ComputeMeshManifolds( b3World* world, int workerIndex, b3Contact* contact
 		manifold->triangleFlags = triangle.flags;
 		manifold->feature = b3_featureNone;
 
-		switch ( shapeB->type )
+		switch ( input->typeB )
 		{
 			case b3_capsuleShape:
-				b3CollideTriangleAndCapsule( manifold, pointCapacity, vertices, &shapeB->capsule, &cache->simplexCache );
+				b3CollideTriangleAndCapsule( manifold, pointCapacity, vertices, input->capsuleB, &cache->simplexCache );
 				break;
 
 			case b3_hullShape:
@@ -962,15 +962,26 @@ bool b3ComputeMeshManifolds( b3World* world, int workerIndex, b3Contact* contact
 										  &cache->satCache, enableSpeculative );
 				context->satCallCount += 1;
 				context->satCacheHitCount += cache->satCache.hit;
+
+				if ( coveredB != 0 && manifold->pointCount > 0 &&
+					 b3IsNormalIntoCoveredFace( coveredB, b3Neg( manifold->normal ) ) )
+				{
+					// The box would be pushed through a face solid covers: answer on its exposed faces
+					manifold->pointCount = 0;
+					manifold->feature = b3_featureNone;
+					b3SATCache scratch = { 0 };
+					b3CollideTriangleAndHullFaces( manifold, pointCapacity, vertices[0], vertices[1], vertices[2], triangle.flags,
+												   hullB, ~coveredB & 0x3f, &scratch, enableSpeculative );
+				}
 				break;
 
 			case b3_sphereShape:
-				b3CollideTriangleAndSphere( manifold, pointCapacity, vertices, &shapeB->sphere );
+				b3CollideTriangleAndSphere( manifold, pointCapacity, vertices, input->sphereB );
 				break;
 
 			default:
 				B3_ASSERT( false );
-				return false;
+				return 0;
 		}
 
 		int manifoldPointCount = manifold->pointCount;
@@ -1054,7 +1065,7 @@ bool b3ComputeMeshManifolds( b3World* world, int workerIndex, b3Contact* contact
 	B3_ASSERT( tentativeManifoldCount <= triangleCount );
 	B3_ASSERT( tentativeTriangleCount <= triangleCount );
 
-	if ( shapeB->type == b3_sphereShape )
+	if ( input->typeB == b3_sphereShape )
 	{
 		// Sort triangles so the closest triangles are processed first
 		{
@@ -1172,6 +1183,52 @@ bool b3ComputeMeshManifolds( b3World* world, int workerIndex, b3Contact* contact
 	}
 
 	B3_ASSERT( acceptedManifoldCount <= triangleCount );
+	return acceptedManifoldCount;
+}
+
+bool b3ComputeMeshManifolds( b3World* world, int workerIndex, b3Contact* contact, const b3Shape* shapeA, const int* materialMap,
+							 b3WorldTransform xfA, const b3Shape* shapeB, b3WorldTransform xfB, bool isFast, b3Arena arena )
+{
+	B3_ASSERT( shapeA->type == b3_meshShape || shapeA->type == b3_heightShape );
+	B3_UNUSED( isFast );
+
+	b3TaskContext* context = b3Array_Get( world->taskContexts, workerIndex );
+
+	b3RefreshCache( contact, shapeA, xfA, &shapeB->aabb );
+
+	// Collide with triangles and build manifolds
+	b3MeshContact* meshContact = &contact->meshContact;
+	int triangleCount = meshContact->triangleCache.count;
+
+	// This should push apart shapes after a time of impact event.
+	// In the past I've called this `polygon skin`, but PhysX and Unreal
+	// call it `rest offset` which seems appropriate in this case.
+	// It leads to a small visual gap but seems to improve the quality of mesh
+	// collision, especially for hull versus mesh.
+	float restOffset = B3_MESH_REST_OFFSET;
+
+	b3MeshConvexInput input = { 0 };
+	input.context = context;
+	input.meshShape = shapeA;
+	input.typeB = shapeB->type;
+	input.hullB = shapeB->type == b3_hullShape ? shapeB->hull : NULL;
+	input.capsuleB = &shapeB->capsule;
+	input.sphereB = &shapeB->sphere;
+	// This transform converts from mesh frame into the shapeB frame
+	input.transformAtoB = b3InvMulWorldTransforms( xfB, xfA );
+	input.isFast = isFast;
+	input.enableSpeculative = contact->flags & b3_enableSpeculativePoints;
+	input.coveredB = 0;
+
+	b3LocalManifold** acceptedManifolds = b3Bump( &arena, triangleCount * sizeof( b3LocalManifold* ) );
+
+	// Make room for clip points
+	int pointBufferCapacity = B3_MAX_POINTS_PER_TRIANGLE * triangleCount;
+	b3LocalManifoldPoint* pointBuffer = b3Bump( &arena, pointBufferCapacity * sizeof( b3LocalManifoldPoint ) );
+	b3LocalManifold* manifoldBuffer = b3Bump( &arena, triangleCount * sizeof( b3LocalManifold ) );
+
+	int acceptedManifoldCount = b3CollideMeshTriangles( &input, meshContact->triangleCache.data, triangleCount, acceptedManifolds,
+														manifoldBuffer, pointBuffer, pointBufferCapacity, arena );
 
 	if ( b3BuildClusterManifolds( world, contact, acceptedManifolds, acceptedManifoldCount, xfA, xfB, restOffset, arena ) == false )
 	{
@@ -2062,5 +2119,286 @@ static bool b3ComputeVoxelGridPairManifolds( b3World* world, int workerIndex, b3
 	b3Vec3 tangentVelocityA = b3RotateVector( xfA.q, materialA->tangentVelocity );
 	b3Vec3 tangentVelocityB = b3RotateVector( xfB.q, materialB->tangentVelocity );
 	contact->tangentVelocity = b3Sub( tangentVelocityA, tangentVelocityB );
+	return true;
+}
+
+// Mesh or height field against voxel grid
+//
+// The mesh is A and the voxel grid B, the order the contact table gives them. Each box of the grid that can reach the mesh is a
+// convex shape B in the frame of its cell: the triangles near it are collided with it through the same code as any convex
+// shape against a mesh, ghost collision handling included. A contact that would push a box through a face that solid covers is
+// answered on its exposed faces. The manifolds of all the boxes are then clustered together, so a shard resting on terrain is
+// a few manifolds of at most four points. A pair of triangle and box is keyed by a hash of both indices, ascending in the
+// contact cache.
+
+// The triangles one box can see, and the pairs of triangle and box in one contact. Past these the rest is left out.
+#define B3_MAX_BOX_TRIANGLES 128
+#define B3_MAX_BOX_POINTS_PER_TRIANGLE 8
+
+static int b3FindVoxelPairCache( const b3TriangleCache* sorted, int count, int hash )
+{
+	int low = 0, high = count - 1;
+	while ( low <= high )
+	{
+		int middle = ( low + high ) / 2;
+		int value = sorted[middle].triangleIndex;
+		if ( value == hash )
+		{
+			return middle;
+		}
+
+		if ( value < hash )
+		{
+			low = middle + 1;
+		}
+		else
+		{
+			high = middle - 1;
+		}
+	}
+
+	return B3_NULL_INDEX;
+}
+
+bool b3ComputeMeshVoxelGridManifolds( b3World* world, int workerIndex, b3Contact* contact, const b3Shape* shapeA,
+											 b3WorldTransform xfA, const b3Shape* shapeB, b3WorldTransform xfB, bool isFast,
+											 b3Arena arena )
+{
+	B3_ASSERT( shapeA->type == b3_meshShape || shapeA->type == b3_heightShape );
+	B3_ASSERT( shapeB->type == b3_voxelGridShape );
+
+	const b3VoxelGrid* grid = shapeB->voxelGrid;
+	b3TaskContext* context = b3Array_Get( world->taskContexts, workerIndex );
+	b3MeshContact* meshContact = &contact->meshContact;
+
+	// The mesh frame into the body frame of the grid, and back
+	b3Transform transformAtoB = b3InvMulWorldTransforms( xfB, xfA );
+	b3Transform transformBtoA = b3InvMulWorldTransforms( xfA, xfB );
+
+	// Keep the old cache, the new one is built in the contact array
+	int oldCount = meshContact->triangleCache.count;
+	b3TriangleCache* oldCache = b3Bump( &arena, oldCount * sizeof( b3TriangleCache ) );
+	if ( oldCount > 0 )
+	{
+		memcpy( oldCache, meshContact->triangleCache.data, oldCount * sizeof( b3TriangleCache ) );
+	}
+	b3Array_Resize( meshContact->triangleCache, 0 );
+
+	// The boxes of the grid in the region where the two can touch, with their bounds in the mesh frame
+	float margin = 2.0f * B3_SPECULATIVE_DISTANCE;
+	b3AABB region = { b3Max( shapeA->aabb.lowerBound, shapeB->aabb.lowerBound ),
+					  b3Min( shapeA->aabb.upperBound, shapeB->aabb.upperBound ) };
+	bool overlap = region.lowerBound.x <= region.upperBound.x && region.lowerBound.y <= region.upperBound.y &&
+				   region.lowerBound.z <= region.upperBound.z;
+
+	b3VoxelSideBox* boxes = NULL;
+	b3VoxelSideContext side = { grid, transformBtoA, NULL, 0 };
+	if ( overlap )
+	{
+		region.lowerBound = b3Sub( region.lowerBound, ( b3Vec3 ){ margin, margin, margin } );
+		region.upperBound = b3Add( region.upperBound, ( b3Vec3 ){ margin, margin, margin } );
+
+		b3Transform gridTransform = b3ToRelativeTransform( xfB, b3Pos_zero );
+		b3AABB gridRegion = b3AABB_Transform( b3InvertTransform( gridTransform ), region );
+
+		b3QueryVoxelGrid( grid, gridRegion, b3CollectVoxelSideCallback, &side );
+		boxes = b3Bump( &arena, side.count * sizeof( b3VoxelSideBox ) );
+		side.boxes = boxes;
+		side.count = 0;
+		b3QueryVoxelGrid( grid, gridRegion, b3CollectVoxelSideCallback, &side );
+	}
+
+	// Buffers for the boxes, reused from one box to the next
+	b3MeshConvexInput input = { 0 };
+	input.context = context;
+	input.meshShape = shapeA;
+	input.typeB = b3_hullShape;
+	input.isFast = isFast;
+	input.enableSpeculative = contact->flags & b3_enableSpeculativePoints;
+
+	int* triangleIndices = b3Bump( &arena, B3_MAX_BOX_TRIANGLES * sizeof( int ) );
+	b3TriangleCache* work = b3Bump( &arena, B3_MAX_BOX_TRIANGLES * sizeof( b3TriangleCache ) );
+	int pointBufferCapacity = B3_MAX_BOX_POINTS_PER_TRIANGLE * B3_MAX_BOX_TRIANGLES;
+	b3LocalManifoldPoint* pointBuffer = b3Bump( &arena, pointBufferCapacity * sizeof( b3LocalManifoldPoint ) );
+	b3LocalManifold* manifoldBuffer = b3Bump( &arena, B3_MAX_BOX_TRIANGLES * sizeof( b3LocalManifold ) );
+	b3LocalManifold** boxAccepted = b3Bump( &arena, B3_MAX_BOX_TRIANGLES * sizeof( b3LocalManifold* ) );
+
+	b3LocalManifold** acceptedManifolds = b3Bump( &arena, B3_MAX_VOXEL_PAIRS * sizeof( b3LocalManifold* ) );
+	int acceptedManifoldCount = 0;
+	int pairCount = 0;
+
+	// Materials are averaged over the accepted points, as for any mesh contact
+	const b3SurfaceMaterial* materialsA = b3GetShapeMaterials( shapeA );
+	const b3SurfaceMaterial* materialB = b3GetShapeMaterials( shapeB );
+	const uint8_t* materialIndices = NULL;
+	if ( shapeA->materialCount > 0 )
+	{
+		materialIndices = shapeA->type == b3_meshShape ? b3GetMeshMaterialIndices( shapeA->mesh.data )
+													   : b3GetHeightFieldMaterialIndices( shapeA->heightField );
+	}
+	float friction = 0.0f, restitution = 0.0f, sampleCount = 0.0f;
+	b3Vec3 tangentVelocitySum = b3Vec3_zero;
+
+	bool truncated = false;
+	for ( int boxIndex = 0; boxIndex < side.count && truncated == false; ++boxIndex )
+	{
+		const b3VoxelSideBox* box = boxes + boxIndex;
+		int cell = b3VoxelGridKeyCell( grid, box->key ), boxInCell = b3VoxelGridKeyBox( grid, box->key );
+		const b3VoxelGridModule* module = b3GetVoxelGridCellModule( grid, cell );
+		B3_ASSERT( module != NULL && boxInCell < module->boxCount );
+
+		// The triangles near the box
+		b3AABB query = box->bounds;
+		query.lowerBound = b3Sub( query.lowerBound, ( b3Vec3 ){ margin, margin, margin } );
+		query.upperBound = b3Add( query.upperBound, ( b3Vec3 ){ margin, margin, margin } );
+
+		int triangleCount;
+		if ( shapeA->type == b3_meshShape )
+		{
+			triangleCount = b3QueryMeshTriangles( triangleIndices, B3_MAX_BOX_TRIANGLES, &shapeA->mesh, query );
+		}
+		else
+		{
+			triangleCount = b3QueryHeightFieldTriangles( triangleIndices, B3_MAX_BOX_TRIANGLES, shapeA->heightField, query );
+		}
+
+		if ( triangleCount == 0 )
+		{
+			continue;
+		}
+
+		if ( triangleCount == B3_MAX_BOX_TRIANGLES )
+		{
+			static bool s_once = false;
+			if ( s_once == false )
+			{
+				b3Log( "WARNING: complex mesh detected, triangle buffer capacity of %d reached for a voxel box", B3_MAX_BOX_TRIANGLES );
+				s_once = true;
+			}
+		}
+
+		if ( pairCount + triangleCount > B3_MAX_VOXEL_PAIRS || acceptedManifoldCount + triangleCount > B3_MAX_VOXEL_PAIRS )
+		{
+			// Too many pairs for one contact
+			truncated = true;
+			break;
+		}
+
+		b3Vec3 corner = b3VoxelGridCellCorner( grid, cell );
+		int boxKey = box->key;
+		for ( int i = 0; i < triangleCount; ++i )
+		{
+			int hash = b3VoxelPairHash( triangleIndices[i], boxKey );
+			work[i].triangleIndex = triangleIndices[i];
+			int found = b3FindVoxelPairCache( oldCache, oldCount, hash );
+			work[i].cache = found != B3_NULL_INDEX ? oldCache[found].cache : (b3ContactCache){ 0 };
+		}
+
+		// The hull of the box is in the frame of its cell
+		input.hullB = &module->hulls[boxInCell].base;
+		input.transformAtoB = transformAtoB;
+		input.transformAtoB.p = b3Sub( transformAtoB.p, corner );
+		input.coveredB = box->covered;
+
+		int count = b3CollideMeshTriangles( &input, work, triangleCount, boxAccepted, manifoldBuffer, pointBuffer, pointBufferCapacity,
+											arena );
+
+		for ( int i = 0; i < triangleCount; ++i )
+		{
+			b3TriangleCache entry = { b3VoxelPairHash( work[i].triangleIndex, boxKey ), work[i].cache };
+			b3Array_Push( meshContact->triangleCache, entry );
+		}
+		pairCount += triangleCount;
+
+		for ( int i = 0; i < count; ++i )
+		{
+			const b3LocalManifold* source = boxAccepted[i];
+			int triangleIndex = source->triangleIndex;
+
+			// Copy out, in the body frame of the grid, with the pair as the id of the manifold
+			b3LocalManifold* accepted = b3Bump( &arena, sizeof( b3LocalManifold ) );
+			*accepted = *source;
+			accepted->points = b3Bump( &arena, source->pointCount * sizeof( b3LocalManifoldPoint ) );
+			for ( int j = 0; j < source->pointCount; ++j )
+			{
+				accepted->points[j] = source->points[j];
+				accepted->points[j].point = b3Add( source->points[j].point, corner );
+			}
+			accepted->triangleIndex = b3VoxelPairHash( triangleIndex, boxKey );
+			acceptedManifolds[acceptedManifoldCount++] = accepted;
+
+			int materialIndex = 0;
+			if ( materialIndices != NULL )
+			{
+				materialIndex = shapeA->type == b3_meshShape ? materialIndices[triangleIndex] : materialIndices[triangleIndex >> 1];
+				materialIndex = b3ClampInt( materialIndex, 0, shapeA->materialCount - 1 );
+			}
+
+			b3SurfaceMaterial material = materialsA[materialIndex];
+			for ( int j = 0; j < source->pointCount; ++j )
+			{
+				friction += world->frictionCallback( material.friction, material.userMaterialId, materialB->friction,
+													 materialB->userMaterialId );
+				restitution += world->restitutionCallback( material.restitution, material.userMaterialId, materialB->restitution,
+														   materialB->userMaterialId );
+				tangentVelocitySum = b3Add( tangentVelocitySum, material.tangentVelocity );
+				sampleCount += 1.0f;
+			}
+		}
+	}
+
+	if ( truncated )
+	{
+		static bool s_once = false;
+		if ( s_once == false )
+		{
+			b3Log( "WARNING: dense voxel grid on a mesh, pair capacity of %d reached", B3_MAX_VOXEL_PAIRS );
+			s_once = true;
+		}
+	}
+
+	// The cache is ascending by hash
+	{
+		b3TriangleCache* data = meshContact->triangleCache.data;
+		int n = meshContact->triangleCache.count;
+#define LESS( i, j ) data[(int)i].triangleIndex < data[(int)j].triangleIndex
+#define SWAP( i, j )                                                                                                             \
+	do                                                                                                                           \
+	{                                                                                                                            \
+		b3TriangleCache tmp = data[(int)i];                                                                                      \
+		data[(int)i] = data[(int)j];                                                                                             \
+		data[(int)j] = tmp;                                                                                                      \
+	}                                                                                                                            \
+	while ( 0 )
+		QSORT( n, LESS, SWAP );
+#undef LESS
+#undef SWAP
+	}
+
+	// A grid has no rest offset: it rests on a mesh as it rests on a plain box
+	if ( b3BuildClusterManifolds( world, contact, acceptedManifolds, acceptedManifoldCount, xfA, xfB, 0.0f, arena ) == false )
+	{
+		return false;
+	}
+
+	if ( sampleCount > 0.0f )
+	{
+		float invCount = 1.0f / sampleCount;
+		contact->friction = invCount * friction;
+		contact->restitution = invCount * restitution;
+	}
+	else
+	{
+		contact->friction = world->frictionCallback( materialsA[0].friction, materialsA[0].userMaterialId, materialB->friction,
+													 materialB->userMaterialId );
+		contact->restitution = world->restitutionCallback( materialsA[0].restitution, materialsA[0].userMaterialId,
+														   materialB->restitution, materialB->userMaterialId );
+	}
+
+	b3Vec3 tangentVelocityA = sampleCount > 0.0f ? b3MulSV( 1.0f / sampleCount, tangentVelocitySum ) : materialsA[0].tangentVelocity;
+	tangentVelocityA = b3RotateVector( xfA.q, tangentVelocityA );
+	b3Vec3 tangentVelocityB = b3RotateVector( xfB.q, materialB->tangentVelocity );
+	contact->tangentVelocity = b3Sub( tangentVelocityA, tangentVelocityB );
+	contact->rollingResistance = 0.0f;
 	return true;
 }

@@ -1328,3 +1328,78 @@ void b3CollideTriangleAndHull( b3LocalManifold* manifold, int capacity, b3Vec3 v
 		*cache = (b3SATCache){ 0 };
 	}
 }
+
+// Terra Prime: a triangle against a box of a voxel grid, answered on the faces of the box in faceMask only (one bit per face).
+// Used when the regular contact would push the box through a face that solid covers. The face the triangle penetrates least
+// is the reference. The manifold is in the frame of the hull, with the normal pointing from the triangle to the hull.
+void b3CollideTriangleAndHullFaces( b3LocalManifold* manifold, int capacity, b3Vec3 v1, b3Vec3 v2, b3Vec3 v3, int triangleFlags,
+									const b3HullData* hullB, int faceMask, b3SATCache* cache, bool enableSpeculative )
+{
+	manifold->pointCount = 0;
+	manifold->feature = b3_featureNone;
+
+	if ( capacity < 4 )
+	{
+		return;
+	}
+
+	b3Vec3 trianglePoints[] = { v1, v2, v3 };
+	b3TriangleData triangle = {
+		.v1 = v1,
+		.v2 = v2,
+		.v3 = v3,
+		.e1 = b3Sub( v2, v1 ),
+		.e2 = b3Sub( v3, v2 ),
+		.e3 = b3Sub( v1, v3 ),
+		.plane = b3MakePlaneFromPoints( v1, v2, v3 ),
+		.flags = triangleFlags,
+	};
+
+	const b3Plane* hullPlanes = b3GetHullPlanes( hullB );
+	int bestFace = B3_NULL_INDEX;
+	int bestVertex = 0;
+	float bestSeparation = -FLT_MAX;
+	for ( int face = 0; face < hullB->faceCount; ++face )
+	{
+		if ( ( faceMask & ( 1 << face ) ) == 0 )
+		{
+			continue;
+		}
+
+		// The deepest vertex of the triangle below the face plane
+		float minSeparation = FLT_MAX;
+		int vertex = 0;
+		for ( int i = 0; i < 3; ++i )
+		{
+			float separation = b3PlaneSeparation( hullPlanes[face], trianglePoints[i] );
+			if ( separation < minSeparation )
+			{
+				minSeparation = separation;
+				vertex = i;
+			}
+		}
+
+		if ( minSeparation > bestSeparation )
+		{
+			bestSeparation = minSeparation;
+			bestFace = face;
+			bestVertex = vertex;
+		}
+	}
+
+	float speculativeDistance = enableSpeculative ? B3_SPECULATIVE_DISTANCE : 0.0f;
+	if ( bestFace == B3_NULL_INDEX || bestSeparation > speculativeDistance )
+	{
+		return;
+	}
+
+	b3SeparatingAxis query = {
+		.normal = b3Neg( hullPlanes[bestFace].normal ),
+		.separation = bestSeparation,
+		.indexA = bestVertex,
+		.indexB = bestFace,
+		.type = b3_faceAxisB,
+	};
+
+	b3CollideHullFace( manifold, capacity, &triangle, hullB, query, cache, enableSpeculative );
+}

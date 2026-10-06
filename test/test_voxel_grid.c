@@ -1290,6 +1290,59 @@ static int VoxelGridShardPile( void )
 	return 0;
 }
 
+
+// A shard dropped on a static mesh floor (a triangulated plane, optionally tilted) settles and falls asleep
+static int ShardOnMesh( float tiltRadians, float* heightAbove )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	b3MeshData* mesh = b3CreateGridMesh( 16, 16, 1.0f, 0, true );
+	b3BodyDef floorDef = b3DefaultBodyDef();
+	floorDef.rotation = b3MakeQuatFromAxisAngle( b3Vec3_axisZ, tiltRadians );
+	b3BodyId floorId = b3CreateBody( worldId, &floorDef );
+	b3ShapeDef floorShape = b3DefaultShapeDef();
+	floorShape.baseMaterial.friction = 0.6f;
+	b3CreateMeshShape( floorId, &floorShape, mesh, b3Vec3_one );
+
+	Shard shard;
+	ENSURE( MakeShard( &shard, 8, 4, 8 ) );
+	b3BodyId bodyId = CreateShardBody( worldId, &shard, ( b3Vec3 ){ -2.0f, 0.3f + 2.0f * sinf( tiltRadians ), -2.0f }, 0.6f, NULL );
+
+	for ( int i = 0; i < 480; ++i )
+	{
+		b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	}
+
+	b3Pos p = b3Body_GetPosition( bodyId );
+	b3Quat q = b3Body_GetRotation( bodyId );
+	b3Vec3 up = b3RotateVector( q, b3Vec3_axisY );
+	printf( "  shard on mesh (tilt %.2f): position %.4f %.4f %.4f, up %.4f %.4f %.4f, awake %d\n", tiltRadians, p.x, p.y, p.z, up.x,
+			up.y, up.z, b3Body_IsAwake( bodyId ) );
+	*heightAbove = p.y;
+
+	b3Vec3 expectedUp = b3RotateVector( b3MakeQuatFromAxisAngle( b3Vec3_axisZ, tiltRadians ), b3Vec3_axisY );
+	ENSURE( b3Dot( up, expectedUp ) > 0.999f );
+	ENSURE( b3Body_IsAwake( bodyId ) == false );
+	ENSURE( b3Length( b3Body_GetLinearVelocity( bodyId ) ) < 0.01f );
+
+	DestroyShard( &shard );
+	b3DestroyWorld( worldId );
+	b3DestroyMesh( mesh );
+	return 0;
+}
+
+static int VoxelGridShardOnMesh( void )
+{
+	float height;
+	ENSURE( ShardOnMesh( 0.0f, &height ) == 0 );
+	ENSURE_SMALL( height, 0.004f );
+
+	// On a slope the friction holds it: it stays within a box width of where it landed
+	ENSURE( ShardOnMesh( 0.2f, &height ) == 0 );
+	return 0;
+}
+
 int VoxelGridTest( void )
 {
 	RUN_SUBTEST( VoxelGridModuleCover );
@@ -1312,5 +1365,6 @@ int VoxelGridTest( void )
 	RUN_SUBTEST( VoxelGridShardOnGrid );
 	RUN_SUBTEST( VoxelGridShardStack );
 	RUN_SUBTEST( VoxelGridShardPile );
+	RUN_SUBTEST( VoxelGridShardOnMesh );
 	return 0;
 }

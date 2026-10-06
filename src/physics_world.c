@@ -4051,7 +4051,16 @@ void b3ValidateContacts( b3World* world )
 				B3_ASSERT( contact->meshContact.triangleCache.capacity >= cacheCount );
 
 				b3Shape* shapeA = b3Array_Get( world->shapes, contact->shapeIdA );
-				if ( shapeA->type == b3_meshShape )
+				b3Shape* contactShapeB = b3Array_Get( world->shapes, contact->shapeIdB );
+				if ( contactShapeB->type == b3_voxelGridShape && shapeA->type != b3_voxelGridShape )
+				{
+					// A voxel grid on a mesh or height field: the cache holds hashes of pairs, ascending
+					for ( int i = 0; i < cacheCount; ++i )
+					{
+						B3_ASSERT( 0 <= contact->meshContact.triangleCache.data[i].triangleIndex );
+					}
+				}
+				else if ( shapeA->type == b3_meshShape )
 				{
 					int triangleCount = shapeA->mesh.data->triangleCount;
 					for ( int i = 0; i < cacheCount; ++i )
