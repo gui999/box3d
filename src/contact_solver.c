@@ -201,6 +201,7 @@ void b3PrepareContacts_Mesh( b3SolverBlock block, b3StepContext* context )
 					cp->baseSeparation = s - b3Dot( b3Sub( cp->rB, cp->rA ), normal );
 					cp->normalImpulse = warmStartScale * mp->normalImpulse;
 					cp->totalNormalImpulse = 0.0f;
+					cp->appliedNormalImpulse = 0.0f;
 
 					b3Vec3 rA = cp->rA;
 					b3Vec3 rB = cp->rB;
@@ -468,6 +469,11 @@ void b3SolveContacts_Mesh( b3SolverBlock block, b3StepContext* context, bool use
 				deltaImpulse = newImpulse - cp->normalImpulse;
 				cp->normalImpulse = newImpulse;
 				cp->totalNormalImpulse += newImpulse;
+				if ( useBias == false )
+				{
+					// The relax iteration leaves the impulse the sub-step really applied
+					cp->appliedNormalImpulse += newImpulse;
+				}
 
 				totalNormalImpulse += newImpulse;
 				totalTwistLimit += cp->leverArm * cp->normalImpulse;
@@ -662,6 +668,7 @@ void b3ApplyRestitution_Mesh( b3SolverBlock block, b3StepContext* context )
 				impulse = newImpulse - cp->normalImpulse;
 				cp->normalImpulse = newImpulse;
 				cp->totalNormalImpulse += impulse;
+				cp->appliedNormalImpulse += impulse;
 
 				// apply contact impulse
 				b3Vec3 P = b3MulSV( impulse, normal );
@@ -766,6 +773,7 @@ void b3StoreImpulses_Mesh( b3SolverBlock block, b3StepContext* context, int work
 					b3ManifoldPoint* mp = manifold->points + pointIndex;
 					mp->normalImpulse = cp->normalImpulse;
 					mp->totalNormalImpulse = cp->totalNormalImpulse;
+					mp->appliedNormalImpulse = cp->appliedNormalImpulse;
 					mp->normalVelocity = cp->relativeVelocity;
 
 					if ( checkHitEvents && flagged == false && mp->normalVelocity < negHitThreshold &&
@@ -952,6 +960,7 @@ typedef struct b3ContactConstraintPointWide
 	b3FloatW baseSeparations;
 	b3FloatW normalImpulses;
 	b3FloatW totalNormalImpulses;
+	b3FloatW appliedNormalImpulses;
 	b3FloatW normalMasses;
 	b3FloatW leverArms;
 	b3FloatW relativeVelocities;
@@ -1440,6 +1449,7 @@ void b3PrepareContacts_Convex( b3SolverBlock block, b3StepContext* context )
 
 					( (float*)&cp->normalImpulses )[lane] = warmStartScale * mp->normalImpulse;
 					( (float*)&cp->totalNormalImpulses )[lane] = 0.0f;
+					( (float*)&cp->appliedNormalImpulses )[lane] = 0.0f;
 
 					b3Vec3 rnA = b3Cross( rA, normal );
 					b3Vec3 rnB = b3Cross( rB, normal );
@@ -1527,6 +1537,7 @@ void b3PrepareContacts_Convex( b3SolverBlock block, b3StepContext* context )
 					( (float*)&cp->baseSeparations )[lane] = 0.0f;
 					( (float*)&cp->normalImpulses )[lane] = 0.0f;
 					( (float*)&cp->totalNormalImpulses )[lane] = 0.0f;
+					( (float*)&cp->appliedNormalImpulses )[lane] = 0.0f;
 					( (float*)&cp->normalMasses )[lane] = 0.0f;
 					( (float*)&cp->relativeVelocities )[lane] = 0.0f;
 					( (float*)&cp->leverArms )[lane] = 0.0f;
@@ -1697,6 +1708,11 @@ void b3SolveContacts_Convex( b3SolverBlock block, b3StepContext* context, bool u
 			b3FloatW deltaImpulse = b3SubW( newImpulse, cp->normalImpulses );
 			cp->normalImpulses = newImpulse;
 			cp->totalNormalImpulses = b3AddW( cp->totalNormalImpulses, newImpulse );
+			if ( useBias == false )
+			{
+				// The relax iteration leaves the impulse the sub-step really applied
+				cp->appliedNormalImpulses = b3AddW( cp->appliedNormalImpulses, newImpulse );
+			}
 
 			totalNormalImpulse = b3AddW( totalNormalImpulse, newImpulse );
 			totalTwistLimit = b3AddW( totalTwistLimit, b3MulW( cp->leverArms, newImpulse ) );
@@ -1884,6 +1900,7 @@ void b3ApplyRestitution_Convex( b3SolverBlock block, b3StepContext* context )
 			b3FloatW deltaImpulse = b3SubW( newImpulse, cp->normalImpulses );
 			cp->normalImpulses = newImpulse;
 			cp->totalNormalImpulses = b3AddW( cp->totalNormalImpulses, deltaImpulse );
+			cp->appliedNormalImpulses = b3AddW( cp->appliedNormalImpulses, deltaImpulse );
 
 			// Apply contact impulse
 			b3Vec3W P = b3MulSVW( deltaImpulse, c->normal );
@@ -1987,6 +2004,7 @@ void b3StoreImpulses_Convex( b3SolverBlock block, b3StepContext* context, int wo
 					b3ManifoldPoint* mp = m->points + pointIndex;
 					mp->normalImpulse = normalImpulse[lane];
 					mp->totalNormalImpulse = totalNormalImpulse[lane];
+					mp->appliedNormalImpulse = ( (const float*)&cp->appliedNormalImpulses )[lane];
 					mp->normalVelocity = normalVelocity[lane];
 				}
 

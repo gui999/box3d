@@ -589,6 +589,7 @@ static bool b3ComputeConvexManifold( b3World* world, int workerIndex, b3Contact*
 	{
 		b3ManifoldPoint* pt2 = manifold->points + i;
 		pt2->totalNormalImpulse = 0.0f;
+		pt2->appliedNormalImpulse = 0.0f;
 		pt2->persisted = false;
 
 		for ( int j = 0; j < oldCount; ++j )

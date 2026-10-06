@@ -401,6 +401,118 @@ static int VoxelGridSlideAcrossSeamsHeavy( void )
 	return SlideAcrossSeams( 400.0f, 12.0f, 40, 6.2f, 0.05f );
 }
 
+// The normal impulse the contacts of a body report for one step: summed over every manifold point of every pair.
+static float StepAndSumNormalImpulse( b3WorldId worldId, b3BodyId bodyId, float dt, int* pointCount )
+{
+	b3World_Step( worldId, dt, 4 );
+	b3ContactData pairs[16];
+	int pairCount = b3Body_GetContactData( bodyId, pairs, 16 );
+	float sum = 0.0f;
+	*pointCount = 0;
+	for ( int i = 0; i < pairCount; ++i )
+	{
+		for ( int m = 0; m < pairs[i].manifoldCount; ++m )
+		{
+			for ( int p = 0; p < pairs[i].manifolds[m].pointCount; ++p )
+			{
+				sum += pairs[i].manifolds[m].points[p].appliedNormalImpulse;
+				*pointCount += 1;
+			}
+		}
+	}
+	return sum;
+}
+
+static int RestingImpulse( bool onGrid )
+{
+	World world;
+	CreateWorld( &world, 4, 0.6f );
+	float surface = SLAB_HEIGHT;
+	if ( onGrid == false )
+	{
+		// The same top plane made of one plain box hull
+		b3BodyDef bodyDef = b3DefaultBodyDef();
+		bodyDef.position = ( b3Vec3 ){ 20.0f, 0.2f, 0.0f };
+		b3BodyId plainId = b3CreateBody( world.worldId, &bodyDef );
+		b3BoxHull slab = b3MakeBoxHull( 4.0f, 0.2f, 4.0f );
+		b3ShapeDef shapeDef = b3DefaultShapeDef();
+		shapeDef.baseMaterial.friction = 0.6f;
+		b3CreateHullShape( plainId, &shapeDef, &slab.base );
+	}
+
+	float half = 0.5f;
+	b3Vec3 start = onGrid ? ( b3Vec3 ){ 4.0f, surface + half + 0.02f, 4.0f } : ( b3Vec3 ){ 20.0f, surface + half + 0.02f, 0.0f };
+	b3BodyId boxId = CreateBox( &world, start, half, 0.6f );
+	float mass = b3Body_GetMass( boxId );
+
+	const float dt = 1.0f / 60.0f;
+	int points = 0;
+	float sum = 0.0f;
+	for ( int i = 0; i < 30; ++i )
+	{
+		sum = StepAndSumNormalImpulse( world.worldId, boxId, dt, &points );
+	}
+	float expected = mass * 10.0f * dt;
+	printf( "  resting impulse (%s): %d points, sum %.3f, expected %.3f, ratio %.3f\n", onGrid ? "grid" : "box", points, sum,
+			expected, sum / expected );
+	ENSURE( points > 0 );
+	ENSURE( fabsf( sum - expected ) < 0.05f * expected );
+
+	DestroyWorld( &world );
+	return 0;
+}
+
+// A heavy box dropped on the floor: over the whole landing the contacts apply the momentum it arrives with plus its weight
+// for the time it took, however deep the contact pushes in and out.
+static int VoxelGridLandingImpulse( void )
+{
+	World world;
+	CreateWorld( &world, 4, 0.6f );
+	float half = 0.5f;
+	b3BodyId boxId = CreateBox( &world, ( b3Vec3 ){ 4.0f, SLAB_HEIGHT + half + 0.1f, 4.0f }, half, 0.6f );
+	b3Body_SetLinearVelocity( boxId, ( b3Vec3 ){ 0.0f, -8.0f, 0.0f } );
+	float mass = b3Body_GetMass( boxId );
+
+	const float dt = 1.0f / 60.0f;
+	const int tickCount = 20;
+	float applied = 0.0f, total = 0.0f;
+	for ( int i = 0; i < tickCount; ++i )
+	{
+		b3World_Step( world.worldId, dt, 4 );
+		b3ContactData pairs[16];
+		int pairCount = b3Body_GetContactData( boxId, pairs, 16 );
+		for ( int j = 0; j < pairCount; ++j )
+		{
+			for ( int m = 0; m < pairs[j].manifoldCount; ++m )
+			{
+				for ( int p = 0; p < pairs[j].manifolds[m].pointCount; ++p )
+				{
+					applied += pairs[j].manifolds[m].points[p].appliedNormalImpulse;
+					total += pairs[j].manifolds[m].points[p].totalNormalImpulse;
+				}
+			}
+		}
+	}
+
+	// The body ends at rest: all its downward momentum and the weight over the ticks went into the floor
+	float expected = mass * ( 8.0f + 10.0f * dt * (float)tickCount );
+	printf( "  landing impulse: applied %.0f, legacy total %.0f, expected %.0f\n", applied, total, expected );
+	ENSURE( fabsf( applied - expected ) < 0.05f * expected );
+
+	DestroyWorld( &world );
+	return 0;
+}
+
+static int VoxelGridRestingImpulseGrid( void )
+{
+	return RestingImpulse( true );
+}
+
+static int VoxelGridRestingImpulseBox( void )
+{
+	return RestingImpulse( false );
+}
+
 static int VoxelGridSetCellWakes( void )
 {
 	World world;
@@ -732,6 +844,9 @@ int VoxelGridTest( void )
 	RUN_SUBTEST( VoxelGridRestAndSleep );
 	RUN_SUBTEST( VoxelGridSlideAcrossSeams );
 	RUN_SUBTEST( VoxelGridSlideAcrossSeamsHeavy );
+	RUN_SUBTEST( VoxelGridRestingImpulseGrid );
+	RUN_SUBTEST( VoxelGridRestingImpulseBox );
+	RUN_SUBTEST( VoxelGridLandingImpulse );
 	RUN_SUBTEST( VoxelGridSetCellWakes );
 	RUN_SUBTEST( VoxelGridSetCellRestoresSupport );
 	RUN_SUBTEST( VoxelGridCharacterQueries );

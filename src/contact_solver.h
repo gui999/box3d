@@ -13,6 +13,8 @@ typedef struct b3ManifoldConstraintPoint
 	float relativeVelocity;
 	float normalImpulse;
 	float totalNormalImpulse;
+	// Net impulse applied over the step: each sub-step's accumulated impulse after relax, plus restitution
+	float appliedNormalImpulse;
 	float normalMass;
 	float leverArm;
 } b3ManifoldConstraintPoint;

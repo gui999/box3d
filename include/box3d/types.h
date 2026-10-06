@@ -2606,6 +2606,12 @@ typedef struct b3ManifoldPoint
 	/// to identify speculative contact points that had an interaction in the time step.
 	float totalNormalImpulse;
 
+	/// The net normal impulse applied over the whole time step in N*s: the sum over the sub-steps of the accumulated
+	/// impulse left after the relax iteration, plus the restitution impulse. Unlike totalNormalImpulse it counts neither
+	/// the solve and the relax twice nor the push-out impulse that the relax takes back, so for a body at rest it is the
+	/// contact force times the time step.
+	float appliedNormalImpulse;
+
 	/// Relative normal velocity pre-solve. Used for hit events. If the normal impulse is
 	/// zero then there was no hit. Negative means shapes are approaching.
 	float normalVelocity;
