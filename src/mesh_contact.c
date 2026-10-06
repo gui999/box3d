@@ -1442,8 +1442,8 @@ bool b3ComputeVoxelGridManifolds( b3World* world, int workerIndex, b3Contact* co
 		acceptedManifolds[acceptedManifoldCount++] = accepted;
 	}
 
-	if ( b3BuildClusterManifolds( world, contact, acceptedManifolds, acceptedManifoldCount, xfA, xfB, B3_MESH_REST_OFFSET, arena ) ==
-		 false )
+	// No rest offset: a grid is boxes, so bodies rest on it exactly as they rest on a plain box
+	if ( b3BuildClusterManifolds( world, contact, acceptedManifolds, acceptedManifoldCount, xfA, xfB, 0.0f, arena ) == false )
 	{
 		return false;
 	}

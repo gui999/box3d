@@ -341,7 +341,8 @@ static int VoxelGridRestAndSleep( void )
 	printf( "  rest: position %.4f %.4f %.4f, awake %d\n", p.x, p.y, p.z, b3Body_IsAwake( boxId ) );
 	ENSURE_SMALL( p.x - 4.0f, 0.01f );
 	ENSURE_SMALL( p.z - 4.0f, 0.01f );
-	ENSURE_SMALL( p.y - ( SLAB_HEIGHT + half ), 0.02f );
+	// No rest offset: the box rests on the grid as it rests on a plain box
+	ENSURE_SMALL( p.y - ( SLAB_HEIGHT + half ), 0.002f );
 	ENSURE( b3Body_IsAwake( boxId ) == false );
 
 	DestroyWorld( &world );
