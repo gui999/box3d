@@ -1475,6 +1475,54 @@ static int VoxelGridShardTilt( void )
 	return 0;
 }
 
+// Queries against a grid that moves: its body is turned a quarter circle about Y and moved, so the shard covers
+// x 5..9, z -1..3, y 1..3 in the world
+static int VoxelGridMovingQueries( void )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	Shard shard;
+	ENSURE( MakeShard( &shard, 8, 4, 8 ) );
+	b3ShapeId shapeId;
+	b3BodyId bodyId = CreateShardBody( worldId, &shard, ( b3Vec3 ){ 5.0f, 1.0f, 3.0f }, 0.6f, &shapeId );
+	b3Body_SetTransform( bodyId, ( b3Pos ){ 5.0, 1.0, 3.0 }, b3MakeQuatFromAxisAngle( b3Vec3_axisY, 0.5f * B3_PI ) );
+	b3QueryFilter filter = b3DefaultQueryFilter();
+
+	// A ray down onto the top, and one that would hit the shard if its turn were ignored
+	b3RayResult hit = b3World_CastRayClosest( worldId, ( b3Pos ){ 7.0, 10.0, 1.0 }, ( b3Vec3 ){ 0.0f, -20.0f, 0.0f }, filter );
+	ENSURE( hit.hit );
+	ENSURE_SMALL( hit.point.y - 3.0, 1.0e-4 );
+	ENSURE_SMALL( hit.normal.y - 1.0f, 1.0e-4f );
+	hit = b3World_CastRayClosest( worldId, ( b3Pos ){ 2.0, 10.0, 2.0 }, ( b3Vec3 ){ 0.0f, -20.0f, 0.0f }, filter );
+	ENSURE( hit.hit == false );
+
+	// A ray from the side into the turned face: local +X is world -Z, so the face at local x = 0 is the world z = 3 side
+	hit = b3World_CastRayClosest( worldId, ( b3Pos ){ 7.0, 2.0, 8.0 }, ( b3Vec3 ){ 0.0f, 0.0f, -10.0f }, filter );
+	ENSURE( hit.hit );
+	ENSURE_SMALL( hit.point.z - 3.0, 1.0e-4 );
+	ENSURE_SMALL( hit.normal.z - 1.0f, 1.0e-4f );
+
+	// A sphere overlaps inside, not where an unturned shard would be
+	b3Vec3 center = { 0.0f, 0.0f, 0.0f };
+	b3ShapeProxy proxy = { &center, 1, 0.3f };
+	QueryCounts counts = { 0 };
+	b3World_OverlapShape( worldId, ( b3Pos ){ 7.0, 2.0, 1.0 }, &proxy, filter, CountOverlap, &counts );
+	ENSURE( counts.hits == 1 );
+	counts.hits = 0;
+	b3World_OverlapShape( worldId, ( b3Pos ){ 2.0, 2.0, 2.0 }, &proxy, filter, CountOverlap, &counts );
+	ENSURE( counts.hits == 0 );
+
+	// A sphere cast across the top lands on it
+	counts = ( QueryCounts ){ 0 };
+	b3World_CastShape( worldId, ( b3Pos ){ 7.0, 6.0, 1.0 }, &proxy, ( b3Vec3 ){ 0.0f, -6.0f, 0.0f }, filter, CountCast, &counts );
+	ENSURE( counts.hits == 1 );
+
+	DestroyShard( &shard );
+	b3DestroyWorld( worldId );
+	return 0;
+}
+
 // Removing cells of a resting shard in place: its mass follows, it wakes and settles again
 static int VoxelGridShardEdit( void )
 {
@@ -1555,6 +1603,7 @@ int VoxelGridTest( void )
 	RUN_SUBTEST( VoxelGridShardOnMesh );
 	RUN_SUBTEST( VoxelGridShardTilt );
 	RUN_SUBTEST( VoxelGridFastShard );
+	RUN_SUBTEST( VoxelGridMovingQueries );
 	RUN_SUBTEST( VoxelGridShardEdit );
 	return 0;
 }
