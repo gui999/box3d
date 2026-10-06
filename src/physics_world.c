@@ -4071,13 +4071,22 @@ void b3ValidateContacts( b3World* world )
 				}
 				else if ( shapeA->type == b3_voxelGridShape )
 				{
-					// The cache holds voxel keys, cell and box
+					// Against a convex shape the cache holds voxel keys, cell and box. Against another grid it holds the hash
+					// of a pair of keys, in ascending order.
+					b3Shape* shapeB = b3Array_Get( world->shapes, contact->shapeIdB );
 					const b3VoxelGrid* grid = shapeA->voxelGrid;
 					int cellCount = grid->size[0] * grid->size[1] * grid->size[2];
 					for ( int i = 0; i < cacheCount; ++i )
 					{
 						int key = contact->meshContact.triangleCache.data[i].triangleIndex;
-						B3_ASSERT( 0 <= b3VoxelGridKeyCell( grid, key ) && b3VoxelGridKeyCell( grid, key ) < cellCount );
+						if ( shapeB->type == b3_voxelGridShape )
+						{
+							B3_ASSERT( 0 <= key );
+						}
+						else
+						{
+							B3_ASSERT( 0 <= b3VoxelGridKeyCell( grid, key ) && b3VoxelGridKeyCell( grid, key ) < cellCount );
+						}
 					}
 				}
 				else

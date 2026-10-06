@@ -1703,15 +1703,21 @@ void b3Shape_VoxelGridSetCells( b3ShapeId shapeId, const int* paddedCells, const
 		b3Contact* contact = b3Array_Get( world->contacts, contactKey >> 1 );
 		contactKey = contact->edges[contactKey & 1].nextKey;
 
-		if ( contact->shapeIdA != shapeIndex || ( contact->flags & b3_simMeshContact ) == 0 )
+		bool isA = contact->shapeIdA == shapeIndex;
+		if ( ( isA == false && contact->shapeIdB != shapeIndex ) || ( contact->flags & b3_simMeshContact ) == 0 )
 		{
 			continue;
 		}
 
-		if ( b3AABB_Overlaps( contact->meshContact.queryBounds, affected ) == false )
+		const b3Shape* otherShape = b3Array_Get( world->shapes, isA ? contact->shapeIdB : contact->shapeIdA );
+		bool findsBoxesOnce = isA && otherShape->type != b3_voxelGridShape;
+		if ( findsBoxesOnce && b3AABB_Overlaps( contact->meshContact.queryBounds, affected ) == false )
 		{
 			continue;
 		}
+
+		// A contact against another grid or a mesh finds its boxes again on every update, so only its cached hints and its
+		// recycled manifolds go stale. A contact against a convex shape keeps a list of boxes in the query bounds.
 
 		// Forget the cached boxes and force a re-query. Dropping the cache also drops the old keys SAT hints.
 		b3Array_Resize( contact->meshContact.triangleCache, 0 );

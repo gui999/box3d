@@ -478,6 +478,78 @@ static int b3CullPoints( b3Point2D* points, int count )
 	return 4;
 }
 
+// A cluster of many points, such as the box pairs of two flat voxel grid surfaces, costs the exact reduction a number of
+// distance evaluations that grows with the square of the count. Above this count the points are first cut to the extremes
+// along eight directions of the cluster plane and the deepest point, which keeps the outline and the depth.
+#define B3_CLUSTER_PREFILTER_COUNT 48
+
+static int b3PrefilterClusterPoints( b3LocalManifoldPoint* points, int count, b3Vec3 u, b3Vec3 v )
+{
+	// Four axes and their opposites: x, y, x + y, x - y
+	int highest[4], lowest[4];
+	float highValue[4], lowValue[4];
+	for ( int k = 0; k < 4; ++k )
+	{
+		highest[k] = lowest[k] = 0;
+		highValue[k] = -FLT_MAX;
+		lowValue[k] = FLT_MAX;
+	}
+
+	int deepest = 0;
+	b3Vec3 origin = points[0].point;
+	for ( int i = 0; i < count; ++i )
+	{
+		b3Vec3 d = b3Sub( points[i].point, origin );
+		float x = b3Dot( d, u ), y = b3Dot( d, v );
+		float values[4] = { x, y, x + y, x - y };
+		for ( int k = 0; k < 4; ++k )
+		{
+			if ( values[k] > highValue[k] )
+			{
+				highValue[k] = values[k];
+				highest[k] = i;
+			}
+
+			if ( values[k] < lowValue[k] )
+			{
+				lowValue[k] = values[k];
+				lowest[k] = i;
+			}
+		}
+
+		if ( points[i].separation < points[deepest].separation )
+		{
+			deepest = i;
+		}
+	}
+
+	int candidates[9];
+	int candidateCount = 0;
+	int all[9] = { highest[0], lowest[0], highest[1], lowest[1], highest[2], lowest[2], highest[3], lowest[3], deepest };
+	for ( int n = 0; n < 9; ++n )
+	{
+		bool found = false;
+		for ( int m = 0; m < candidateCount; ++m )
+		{
+			found = found || candidates[m] == all[n];
+		}
+
+		if ( found == false )
+		{
+			candidates[candidateCount++] = all[n];
+		}
+	}
+
+	b3LocalManifoldPoint kept[9];
+	for ( int n = 0; n < candidateCount; ++n )
+	{
+		kept[n] = points[candidates[n]];
+	}
+
+	memcpy( points, kept, candidateCount * sizeof( b3LocalManifoldPoint ) );
+	return candidateCount;
+}
+
 static int b3ReduceCluster( b3LocalManifoldPoint* points, int count1, b3Vec3 normal, b3Arena arena )
 {
 	int targetCount = 1;
@@ -486,9 +558,14 @@ static int b3ReduceCluster( b3LocalManifoldPoint* points, int count1, b3Vec3 nor
 		return count1;
 	}
 
-	b3Point2D* pts = b3Bump( &arena, count1 * sizeof( b3Point2D ) );
 	b3Vec3 u = b3Perp( normal );
 	b3Vec3 v = b3Cross( normal, u );
+	if ( count1 > B3_CLUSTER_PREFILTER_COUNT )
+	{
+		count1 = b3PrefilterClusterPoints( points, count1, u, v );
+	}
+
+	b3Point2D* pts = b3Bump( &arena, count1 * sizeof( b3Point2D ) );
 	b3Vec3 origin = points[0].point;
 
 	for ( int i = 0; i < count1; ++i )
@@ -1372,10 +1449,19 @@ static void b3RefreshVoxelCache( b3Contact* contact, const b3VoxelGrid* grid, b3
 	}
 }
 
+static bool b3ComputeVoxelGridPairManifolds( b3World* world, int workerIndex, b3Contact* contact, const b3Shape* shapeA,
+											 b3WorldTransform xfA, const b3Shape* shapeB, b3WorldTransform xfB, bool isFast,
+											 b3Arena arena );
+
 bool b3ComputeVoxelGridManifolds( b3World* world, int workerIndex, b3Contact* contact, const b3Shape* shapeA, b3WorldTransform xfA,
 								  const b3Shape* shapeB, b3WorldTransform xfB, bool isFast, b3Arena arena )
 {
 	B3_ASSERT( shapeA->type == b3_voxelGridShape );
+
+	if ( shapeB->type == b3_voxelGridShape )
+	{
+		return b3ComputeVoxelGridPairManifolds( world, workerIndex, contact, shapeA, xfA, shapeB, xfB, isFast, arena );
+	}
 
 	const b3VoxelGrid* grid = shapeA->voxelGrid;
 	b3TaskContext* context = b3Array_Get( world->taskContexts, workerIndex );
@@ -1547,6 +1633,431 @@ bool b3ComputeVoxelGridManifolds( b3World* world, int workerIndex, b3Contact* co
 	}
 
 	contact->rollingResistance = materialB->rollingResistance * radiusB;
+
+	b3Vec3 tangentVelocityA = b3RotateVector( xfA.q, materialA->tangentVelocity );
+	b3Vec3 tangentVelocityB = b3RotateVector( xfB.q, materialB->tangentVelocity );
+	contact->tangentVelocity = b3Sub( tangentVelocityA, tangentVelocityB );
+	return true;
+}
+
+// Voxel grid against voxel grid
+//
+// Both grids are sets of boxes. The boxes of grid A that grid B can reach are listed, and each one asks grid B for the boxes
+// within speculative distance of it. A pair of boxes is collided as two hulls. A box covered on every face is left out, and a
+// contact that would push through a covered face of either box is answered on the exposed faces of that box (the other box is
+// then clipped to them) or dropped when the answer is covered on the other side. The accepted manifolds go through the same
+// clustering as every other grid contact, so one flat landing of two shards is a manifold of at most four points however many
+// box pairs touch. Pairs are keyed by a hash of both box keys, kept sorted in the contact cache so the separating axes carry
+// over.
+
+// The bound on box pairs in one contact. Over it the pairs closest to touching are kept.
+#define B3_MAX_VOXEL_PAIRS 4096
+
+typedef struct b3VoxelSideBox
+{
+	int key;
+	uint8_t covered;
+
+	// In the frame of grid B
+	b3AABB bounds;
+} b3VoxelSideBox;
+
+typedef struct b3VoxelSideContext
+{
+	const b3VoxelGrid* grid;
+	b3Transform toOtherFrame;
+	b3VoxelSideBox* boxes;
+	int count;
+} b3VoxelSideContext;
+
+// With no buffer this counts the boxes, an upper bound of what a second pass lists
+static bool b3CollectVoxelSideCallback( int cell, int box, b3AABB bounds, void* context )
+{
+	b3VoxelSideContext* side = context;
+	if ( side->boxes == NULL )
+	{
+		side->count += 1;
+		return true;
+	}
+
+	// A box covered on every face is inside solid and can never be touched
+	uint8_t covered = b3GetVoxelBoxCoveredFaces( side->grid, cell, box );
+	if ( covered == 0x3f )
+	{
+		return true;
+	}
+
+	b3VoxelSideBox* entry = side->boxes + side->count;
+	side->count += 1;
+	entry->key = b3VoxelGridKey( side->grid, cell, box );
+	entry->covered = covered;
+	entry->bounds = b3AABB_Transform( side->toOtherFrame, bounds );
+	return true;
+}
+
+typedef struct b3VoxelPair
+{
+	int keyA;
+	int keyB;
+	int hash;
+	float gap;
+	uint8_t coveredA;
+	uint8_t coveredB;
+} b3VoxelPair;
+
+typedef struct b3VoxelPairContext
+{
+	const b3VoxelGrid* gridB;
+	const b3VoxelSideBox* boxA;
+
+	// Null while counting
+	b3VoxelPair* pairs;
+	int capacity;
+	int count;
+	int worst;
+	bool overflowed;
+} b3VoxelPairContext;
+
+static void b3FindWorstVoxelPair( b3VoxelPairContext* pairContext )
+{
+	pairContext->worst = 0;
+	for ( int i = 1; i < pairContext->count; ++i )
+	{
+		if ( pairContext->pairs[i].gap > pairContext->pairs[pairContext->worst].gap )
+		{
+			pairContext->worst = i;
+		}
+	}
+}
+
+static bool b3CollectVoxelPairCallback( int cell, int box, b3AABB bounds, void* context )
+{
+	b3VoxelPairContext* pairContext = context;
+
+	float gap = b3BoxGap( pairContext->boxA->bounds, bounds );
+	if ( gap > B3_SPECULATIVE_DISTANCE )
+	{
+		return true;
+	}
+
+	uint8_t covered = b3GetVoxelBoxCoveredFaces( pairContext->gridB, cell, box );
+	if ( covered == 0x3f )
+	{
+		return true;
+	}
+
+	if ( pairContext->pairs == NULL )
+	{
+		pairContext->count = b3MinInt( pairContext->count + 1, pairContext->capacity );
+		return true;
+	}
+
+	b3VoxelPair pair = { pairContext->boxA->key, b3VoxelGridKey( pairContext->gridB, cell, box ), 0, gap, pairContext->boxA->covered,
+						 covered };
+	if ( pairContext->count < pairContext->capacity )
+	{
+		pairContext->pairs[pairContext->count] = pair;
+		pairContext->count += 1;
+		if ( pairContext->count == pairContext->capacity )
+		{
+			b3FindWorstVoxelPair( pairContext );
+		}
+	}
+	else
+	{
+		// Full: the pair closest to touching replaces the farthest one kept
+		pairContext->overflowed = true;
+		if ( gap < pairContext->pairs[pairContext->worst].gap )
+		{
+			pairContext->pairs[pairContext->worst] = pair;
+			b3FindWorstVoxelPair( pairContext );
+		}
+	}
+
+	return true;
+}
+
+static inline int b3VoxelPairHash( int keyA, int keyB )
+{
+	uint32_t h = (uint32_t)keyA * 0x9E3779B1u;
+	h ^= (uint32_t)keyB + 0x7F4A7C15u + ( h << 6 ) + ( h >> 2 );
+	h *= 0x85EBCA6Bu;
+	h ^= h >> 15;
+	return (int)( h & 0x7fffffffu );
+}
+
+// Collide two boxes of voxel grids. The manifold is in the frame of box A with the normal from A to B.
+static void b3CollideVoxelBoxes( b3LocalManifold* manifold, int capacity, const b3HullData* hullA, uint8_t coveredA,
+								 const b3HullData* hullB, uint8_t coveredB, b3Transform transformBtoA, b3SATCache* cache )
+{
+	b3CollideHulls( manifold, capacity, hullA, hullB, transformBtoA, cache );
+	if ( manifold->pointCount == 0 || ( coveredA == 0 && coveredB == 0 ) )
+	{
+		return;
+	}
+
+	// The outward direction of box B toward A is checked in the frame of B
+	b3Vec3 normal = manifold->normal;
+	bool intoA = coveredA != 0 && b3IsNormalIntoCoveredFace( coveredA, normal );
+	bool intoB = coveredB != 0 && b3IsNormalIntoCoveredFace( coveredB, b3InvRotateVector( transformBtoA.q, b3Neg( normal ) ) );
+	if ( intoA == false && intoB == false )
+	{
+		return;
+	}
+
+	b3SATCache scratch = { 0 };
+	if ( intoA )
+	{
+		manifold->pointCount = 0;
+		b3CollideHullFaces( manifold, capacity, hullA, ~coveredA & 0x3f, hullB, transformBtoA, &scratch );
+		if ( manifold->pointCount > 0 && coveredB != 0 &&
+			 b3IsNormalIntoCoveredFace( coveredB, b3InvRotateVector( transformBtoA.q, b3Neg( manifold->normal ) ) ) )
+		{
+			// The other box leaves this contact to its neighbour
+			manifold->pointCount = 0;
+		}
+		return;
+	}
+
+	// Only the covered face of B is in the way: answer on the exposed faces of B, clipping A to them
+	b3LocalManifoldPoint points[B3_MAX_POINTS_PER_TRIANGLE];
+	b3LocalManifold swapped = { 0 };
+	swapped.points = points;
+	b3Transform transformAtoB = b3InvertTransform( transformBtoA );
+	b3CollideHullFaces( &swapped, B3_MAX_POINTS_PER_TRIANGLE, hullB, ~coveredB & 0x3f, hullA, transformAtoB, &scratch );
+
+	manifold->pointCount = 0;
+	if ( swapped.pointCount == 0 )
+	{
+		return;
+	}
+
+	b3Vec3 flipped = b3Neg( b3RotateVector( transformBtoA.q, swapped.normal ) );
+	if ( coveredA != 0 && b3IsNormalIntoCoveredFace( coveredA, flipped ) )
+	{
+		return;
+	}
+
+	manifold->normal = flipped;
+	manifold->pointCount = swapped.pointCount;
+	for ( int i = 0; i < swapped.pointCount; ++i )
+	{
+		manifold->points[i] = swapped.points[i];
+		manifold->points[i].point = b3TransformPoint( transformBtoA, swapped.points[i].point );
+		manifold->points[i].pair = b3FlipPair( swapped.points[i].pair );
+	}
+}
+
+static bool b3ComputeVoxelGridPairManifolds( b3World* world, int workerIndex, b3Contact* contact, const b3Shape* shapeA,
+											 b3WorldTransform xfA, const b3Shape* shapeB, b3WorldTransform xfB, bool isFast,
+											 b3Arena arena )
+{
+	B3_ASSERT( shapeA->type == b3_voxelGridShape && shapeB->type == b3_voxelGridShape );
+
+	const b3VoxelGrid* gridA = shapeA->voxelGrid;
+	const b3VoxelGrid* gridB = shapeB->voxelGrid;
+	b3TaskContext* context = b3Array_Get( world->taskContexts, workerIndex );
+	b3MeshContact* meshContact = &contact->meshContact;
+
+	// Grid B in the frame of grid A, and grid A in the frame of grid B
+	b3Transform transformBtoA = b3InvMulWorldTransforms( xfA, xfB );
+	b3Transform transformAtoB = b3InvMulWorldTransforms( xfB, xfA );
+
+	// The region where the two can touch, in the frame of each grid
+	float margin = 2.0f * B3_SPECULATIVE_DISTANCE;
+	b3AABB region = { b3Max( shapeA->aabb.lowerBound, shapeB->aabb.lowerBound ),
+					  b3Min( shapeA->aabb.upperBound, shapeB->aabb.upperBound ) };
+	bool overlap = region.lowerBound.x <= region.upperBound.x && region.lowerBound.y <= region.upperBound.y &&
+				   region.lowerBound.z <= region.upperBound.z;
+
+	// The boxes of grid A in the region, with their bounds in the frame of grid B
+	b3VoxelSideBox* boxesA = NULL;
+	b3VoxelSideContext sideA = { gridA, transformAtoB, NULL, 0 };
+	if ( overlap )
+	{
+		region.lowerBound = b3Sub( region.lowerBound, ( b3Vec3 ){ margin, margin, margin } );
+		region.upperBound = b3Add( region.upperBound, ( b3Vec3 ){ margin, margin, margin } );
+
+		b3Transform gridTransformA = b3ToRelativeTransform( xfA, b3Pos_zero );
+		b3AABB regionA = b3AABB_Transform( b3InvertTransform( gridTransformA ), region );
+
+		b3QueryVoxelGrid( gridA, regionA, b3CollectVoxelSideCallback, &sideA );
+		boxesA = b3Bump( &arena, sideA.count * sizeof( b3VoxelSideBox ) );
+		sideA.boxes = boxesA;
+		sideA.count = 0;
+		b3QueryVoxelGrid( gridA, regionA, b3CollectVoxelSideCallback, &sideA );
+	}
+
+	// The pairs within speculative distance, counted first so that the memory is what the pairs need
+	b3VoxelPair* pairs = NULL;
+	int pairCount = 0;
+	bool overflowed = false;
+	if ( sideA.count > 0 )
+	{
+		b3VoxelPairContext pairContext = { gridB, NULL, NULL, B3_MAX_VOXEL_PAIRS, 0, 0, false };
+		for ( int a = 0; a < sideA.count; ++a )
+		{
+			pairContext.boxA = boxesA + a;
+			b3AABB query = pairContext.boxA->bounds;
+			query.lowerBound = b3Sub( query.lowerBound, ( b3Vec3 ){ margin, margin, margin } );
+			query.upperBound = b3Add( query.upperBound, ( b3Vec3 ){ margin, margin, margin } );
+			b3QueryVoxelGrid( gridB, query, b3CollectVoxelPairCallback, &pairContext );
+		}
+
+		if ( pairContext.count > 0 )
+		{
+			pairs = b3Bump( &arena, pairContext.count * sizeof( b3VoxelPair ) );
+			pairContext.pairs = pairs;
+			pairContext.capacity = pairContext.count;
+			pairContext.count = 0;
+			for ( int a = 0; a < sideA.count; ++a )
+			{
+				pairContext.boxA = boxesA + a;
+				b3AABB query = pairContext.boxA->bounds;
+				query.lowerBound = b3Sub( query.lowerBound, ( b3Vec3 ){ margin, margin, margin } );
+				query.upperBound = b3Add( query.upperBound, ( b3Vec3 ){ margin, margin, margin } );
+				b3QueryVoxelGrid( gridB, query, b3CollectVoxelPairCallback, &pairContext );
+			}
+
+			pairCount = pairContext.count;
+			overflowed = pairContext.overflowed;
+		}
+	}
+
+	if ( overflowed )
+	{
+		static bool s_once = false;
+		if ( s_once == false )
+		{
+			b3Log( "WARNING: dense voxel grid contact, box pair capacity of %d reached", B3_MAX_VOXEL_PAIRS );
+			s_once = true;
+		}
+	}
+
+	// Sort by hash to match the previous cache by merging
+	for ( int i = 0; i < pairCount; ++i )
+	{
+		pairs[i].hash = b3VoxelPairHash( pairs[i].keyA, pairs[i].keyB );
+	}
+
+	{
+#define LESS( i, j ) pairs[(int)i].hash < pairs[(int)j].hash
+#define SWAP( i, j )                                                                                                             \
+	do                                                                                                                           \
+	{                                                                                                                            \
+		b3VoxelPair tmp = pairs[(int)i];                                                                                         \
+		pairs[(int)i] = pairs[(int)j];                                                                                           \
+		pairs[(int)j] = tmp;                                                                                                     \
+	}                                                                                                                            \
+	while ( 0 )
+		QSORT( pairCount, LESS, SWAP );
+#undef LESS
+#undef SWAP
+	}
+
+	b3ContactCache* caches = b3Bump( &arena, pairCount * sizeof( b3ContactCache ) );
+	{
+		int index2 = 0;
+		for ( int index1 = 0; index1 < pairCount; ++index1 )
+		{
+			caches[index1] = (b3ContactCache){ 0 };
+			while ( index2 < meshContact->triangleCache.count &&
+					meshContact->triangleCache.data[index2].triangleIndex < pairs[index1].hash )
+			{
+				index2 += 1;
+			}
+
+			if ( index2 < meshContact->triangleCache.count && meshContact->triangleCache.data[index2].triangleIndex == pairs[index1].hash )
+			{
+				caches[index1] = meshContact->triangleCache.data[index2].cache;
+			}
+		}
+	}
+
+	b3LocalManifold** acceptedManifolds = b3Bump( &arena, pairCount * sizeof( b3LocalManifold* ) );
+	int acceptedManifoldCount = 0;
+	b3LocalManifold* manifoldBuffer = b3Bump( &arena, pairCount * sizeof( b3LocalManifold ) );
+	b3LocalManifoldPoint* pointBuffer = b3Bump( &arena, pairCount * B3_MAX_MANIFOLD_POINTS * sizeof( b3LocalManifoldPoint ) );
+
+	for ( int index = 0; index < pairCount; ++index )
+	{
+		const b3VoxelPair* pair = pairs + index;
+		int cellA = b3VoxelGridKeyCell( gridA, pair->keyA ), boxIndexA = b3VoxelGridKeyBox( gridA, pair->keyA );
+		int cellB = b3VoxelGridKeyCell( gridB, pair->keyB ), boxIndexB = b3VoxelGridKeyBox( gridB, pair->keyB );
+		const b3VoxelGridModule* moduleA = b3GetVoxelGridCellModule( gridA, cellA );
+		const b3VoxelGridModule* moduleB = b3GetVoxelGridCellModule( gridB, cellB );
+		B3_ASSERT( moduleA != NULL && moduleB != NULL && boxIndexA < moduleA->boxCount && boxIndexB < moduleB->boxCount );
+
+		b3Vec3 cornerA = b3VoxelGridCellCorner( gridA, cellA );
+		b3Vec3 cornerB = b3VoxelGridCellCorner( gridB, cellB );
+
+		// The frame of box B in the frame of box A
+		b3Transform transformCellBtoCellA;
+		transformCellBtoCellA.q = transformBtoA.q;
+		transformCellBtoCellA.p = b3Sub( b3Add( b3RotateVector( transformBtoA.q, cornerB ), transformBtoA.p ), cornerA );
+
+		b3ContactCache* cache = caches + index;
+		if ( isFast && cache->satCache.type == b3_edgePairAxis )
+		{
+			cache->satCache = (b3SATCache){ 0 };
+		}
+
+		b3LocalManifoldPoint points[B3_MAX_POINTS_PER_TRIANGLE];
+		b3LocalManifold manifold = { 0 };
+		manifold.points = points;
+		manifold.feature = b3_featureNone;
+
+		b3CollideVoxelBoxes( &manifold, B3_MAX_POINTS_PER_TRIANGLE, &moduleA->hulls[boxIndexA].base, pair->coveredA,
+							 &moduleB->hulls[boxIndexB].base, pair->coveredB, transformCellBtoCellA, &cache->satCache );
+		context->satCallCount += 1;
+		context->satCacheHitCount += cache->satCache.hit;
+
+		if ( manifold.pointCount == 0 )
+		{
+			continue;
+		}
+
+		// Keep the points in frame B, the body frame of grid B
+		b3LocalManifold* accepted = manifoldBuffer + acceptedManifoldCount;
+		int pointCount = b3MinInt( manifold.pointCount, B3_MAX_MANIFOLD_POINTS );
+		B3_ASSERT( manifold.pointCount <= B3_MAX_MANIFOLD_POINTS );
+		*accepted = (b3LocalManifold){ 0 };
+		accepted->points = pointBuffer + acceptedManifoldCount * B3_MAX_MANIFOLD_POINTS;
+		accepted->pointCount = pointCount;
+		accepted->normal = b3RotateVector( transformAtoB.q, manifold.normal );
+		accepted->triangleNormal = accepted->normal;
+		accepted->triangleIndex = pair->hash;
+		accepted->feature = b3_featureHullFace;
+		for ( int i = 0; i < pointCount; ++i )
+		{
+			accepted->points[i] = manifold.points[i];
+			accepted->points[i].point = b3TransformPoint( transformAtoB, b3Add( manifold.points[i].point, cornerA ) );
+		}
+
+		acceptedManifolds[acceptedManifoldCount++] = accepted;
+	}
+
+	// Save the cache, still ascending by hash
+	b3Array_Resize( meshContact->triangleCache, pairCount );
+	for ( int i = 0; i < pairCount; ++i )
+	{
+		meshContact->triangleCache.data[i] = (b3TriangleCache){ pairs[i].hash, caches[i] };
+	}
+
+	if ( b3BuildClusterManifolds( world, contact, acceptedManifolds, acceptedManifoldCount, xfA, xfB, 0.0f, arena ) == false )
+	{
+		return false;
+	}
+
+	// One material for each whole grid
+	const b3SurfaceMaterial* materialA = b3GetShapeMaterials( shapeA );
+	const b3SurfaceMaterial* materialB = b3GetShapeMaterials( shapeB );
+
+	contact->friction =
+		world->frictionCallback( materialA->friction, materialA->userMaterialId, materialB->friction, materialB->userMaterialId );
+	contact->restitution = world->restitutionCallback( materialA->restitution, materialA->userMaterialId, materialB->restitution,
+													   materialB->userMaterialId );
+	contact->rollingResistance = 0.0f;
 
 	b3Vec3 tangentVelocityA = b3RotateVector( xfA.q, materialA->tangentVelocity );
 	b3Vec3 tangentVelocityB = b3RotateVector( xfB.q, materialB->tangentVelocity );

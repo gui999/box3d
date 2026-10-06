@@ -14,6 +14,7 @@
 #include <float.h>
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 
 #define CELL_METERS 2.0f
 #define CELL_VOXELS 20
@@ -1078,6 +1079,217 @@ static int VoxelGridShardOnHull( void )
 	return 0;
 }
 
+
+// A shard dropped on a static grid floor settles on it, stays put and falls asleep
+static int VoxelGridShardOnGrid( void )
+{
+	World world;
+	CreateWorld( &world, 4, 0.6f );
+
+	Shard shard;
+	ENSURE( MakeShard( &shard, 8, 4, 8 ) );
+	b3BodyId bodyId = CreateShardBody( world.worldId, &shard, ( b3Vec3 ){ 2.0f, SLAB_HEIGHT + 0.3f, 2.0f }, 0.6f, NULL );
+
+	for ( int i = 0; i < 360; ++i )
+	{
+		b3World_Step( world.worldId, 1.0f / 60.0f, 4 );
+	}
+
+	b3Pos p = b3Body_GetPosition( bodyId );
+	b3Quat q = b3Body_GetRotation( bodyId );
+	printf( "  shard on grid: position %.4f %.4f %.4f, tilt %.5f, awake %d\n", p.x, p.y, p.z, fabsf( q.v.x ) + fabsf( q.v.y ) + fabsf( q.v.z ),
+			b3Body_IsAwake( bodyId ) );
+	ENSURE_SMALL( p.x - 2.0f, 0.01f );
+	ENSURE_SMALL( p.z - 2.0f, 0.01f );
+	ENSURE_SMALL( p.y - SLAB_HEIGHT, 0.003f );
+	ENSURE( b3Body_IsAwake( bodyId ) == false );
+
+	DestroyShard( &shard );
+	DestroyWorld( &world );
+	return 0;
+}
+
+// A shard on a shard on a floor, the upper one offset by half a box so the boxes do not line up
+static int VoxelGridShardStack( void )
+{
+	World world;
+	CreateWorld( &world, 4, 0.6f );
+
+	Shard shard;
+	ENSURE( MakeShard( &shard, 8, 4, 8 ) );
+	b3BodyId lowerId = CreateShardBody( world.worldId, &shard, ( b3Vec3 ){ 2.0f, SLAB_HEIGHT + 0.01f, 2.0f }, 0.6f, NULL );
+	b3BodyId upperId = CreateShardBody( world.worldId, &shard, ( b3Vec3 ){ 2.25f, SLAB_HEIGHT + 2.0f + 0.02f, 2.25f }, 0.6f, NULL );
+
+	for ( int i = 0; i < 480; ++i )
+	{
+		b3World_Step( world.worldId, 1.0f / 60.0f, 4 );
+	}
+
+	b3Pos lower = b3Body_GetPosition( lowerId );
+	b3Pos upper = b3Body_GetPosition( upperId );
+	printf( "  shard stack: lower %.4f %.4f %.4f, upper %.4f %.4f %.4f, awake %d %d\n", lower.x, lower.y, lower.z, upper.x, upper.y,
+			upper.z, b3Body_IsAwake( lowerId ), b3Body_IsAwake( upperId ) );
+	ENSURE_SMALL( lower.x - 2.0f, 0.01f );
+	ENSURE_SMALL( lower.z - 2.0f, 0.01f );
+	ENSURE_SMALL( lower.y - SLAB_HEIGHT, 0.004f );
+	ENSURE_SMALL( upper.x - 2.25f, 0.01f );
+	ENSURE_SMALL( upper.z - 2.25f, 0.01f );
+	ENSURE_SMALL( upper.y - ( SLAB_HEIGHT + 2.0f ), 0.006f );
+	ENSURE( b3Body_IsAwake( lowerId ) == false );
+	ENSURE( b3Body_IsAwake( upperId ) == false );
+
+	DestroyShard( &shard );
+	DestroyWorld( &world );
+	return 0;
+}
+
+typedef enum ShardKind
+{
+	SHARD_GRID,
+	SHARD_BOXES,
+	SHARD_SOLID
+} ShardKind;
+
+typedef struct PileResult
+{
+	float worstStepMs;
+	float meanStepMs;
+	float worstCollideMs;
+	float worstSolveMs;
+	int contactCount;
+	int touchingManifolds;
+	int touchingContacts;
+	float maxDrift;
+} PileResult;
+
+// 27 shards of 8 x 4 x 8 boxes land on a grid floor, touching each other, in one of three representations
+static int RunShardPile( ShardKind kind, PileResult* result )
+{
+	World world;
+	CreateWorld( &world, 8, 0.6f );
+
+	Shard shard;
+	ENSURE( MakeShard( &shard, 8, 4, 8 ) );
+
+	b3BoxHull solidHull = b3MakeOffsetBoxHull( 2.0f, 1.0f, 2.0f, ( b3Vec3 ){ 2.0f, 1.0f, 2.0f } );
+
+	b3BodyId bodies[27];
+	b3Vec3 starts[27];
+	int count = 0;
+	for ( int j = 0; j < 3; ++j )
+	{
+		for ( int k = 0; k < 3; ++k )
+		{
+			for ( int i = 0; i < 3; ++i )
+			{
+				b3Vec3 position = { 1.0f + (float)i * 4.01f, SLAB_HEIGHT + 0.02f + (float)j * 2.01f, 1.0f + (float)k * 4.01f };
+				starts[count] = position;
+
+				b3ShapeDef shapeDef = b3DefaultShapeDef();
+				shapeDef.baseMaterial.friction = 0.6f;
+				if ( kind == SHARD_GRID )
+				{
+					bodies[count] = CreateShardBody( world.worldId, &shard, position, 0.6f, NULL );
+				}
+				else
+				{
+					b3BodyDef bodyDef = b3DefaultBodyDef();
+					bodyDef.type = b3_dynamicBody;
+					bodyDef.position = position;
+					bodies[count] = b3CreateBody( world.worldId, &bodyDef );
+					if ( kind == SHARD_SOLID )
+					{
+						b3CreateHullShape( bodies[count], &shapeDef, &solidHull.base );
+					}
+					else
+					{
+						shapeDef.updateBodyMass = false;
+						for ( int y = 0; y < 4; ++y )
+						{
+							for ( int z = 0; z < 8; ++z )
+							{
+								for ( int x = 0; x < 8; ++x )
+								{
+									b3Vec3 offset = { ( (float)x + 0.5f ) * 0.5f, ( (float)y + 0.5f ) * 0.5f, ( (float)z + 0.5f ) * 0.5f };
+									b3BoxHull boxHull = b3MakeOffsetBoxHull( 0.25f, 0.25f, 0.25f, offset );
+									b3CreateHullShape( bodies[count], &shapeDef, &boxHull.base );
+								}
+							}
+						}
+						b3Body_ApplyMassFromShapes( bodies[count] );
+					}
+				}
+				count += 1;
+			}
+		}
+	}
+
+	memset( result, 0, sizeof( *result ) );
+	const int stepCount = 90;
+	float total = 0.0f;
+	for ( int step = 0; step < stepCount; ++step )
+	{
+		b3World_Step( world.worldId, 1.0f / 60.0f, 4 );
+		b3Profile profile = b3World_GetProfile( world.worldId );
+		total += profile.step;
+		if ( profile.step > result->worstStepMs )
+		{
+			result->worstStepMs = profile.step;
+			result->worstCollideMs = profile.collide;
+			result->worstSolveMs = profile.solve;
+		}
+
+		b3Counters counters = b3World_GetCounters( world.worldId );
+		result->contactCount = b3MaxInt( result->contactCount, counters.contactCount );
+	}
+	result->meanStepMs = total / (float)stepCount;
+
+	// The touching contacts and manifolds at the end
+	static b3ContactData data[2048];
+	for ( int n = 0; n < 27; ++n )
+	{
+		int pairCount = b3Body_GetContactData( bodies[n], data, 2048 );
+		for ( int m = 0; m < pairCount; ++m )
+		{
+			result->touchingContacts += 1;
+			result->touchingManifolds += data[m].manifoldCount;
+		}
+
+		b3Pos p = b3Body_GetPosition( bodies[n] );
+		float drift = fabsf( p.x - starts[n].x ) + fabsf( p.z - starts[n].z );
+		result->maxDrift = b3MaxFloat( result->maxDrift, drift );
+		ENSURE( p.y > starts[n].y - 0.1f );
+	}
+
+	DestroyShard( &shard );
+	DestroyWorld( &world );
+	return 0;
+}
+
+static int VoxelGridShardPile( void )
+{
+	PileResult grid, boxes, solid;
+	ENSURE( RunShardPile( SHARD_GRID, &grid ) == 0 );
+	ENSURE( RunShardPile( SHARD_BOXES, &boxes ) == 0 );
+	ENSURE( RunShardPile( SHARD_SOLID, &solid ) == 0 );
+
+	const char* names[3] = { "grid shards", "per-box shards", "solid boxes" };
+	const PileResult* results[3] = { &grid, &boxes, &solid };
+	for ( int i = 0; i < 3; ++i )
+	{
+		const PileResult* r = results[i];
+		printf( "  pile %-14s: worst step %7.3f ms (collide %.3f solve %.3f), mean %.3f ms, contacts %d, touching contacts %d, manifolds %d, "
+				"drift %.3f\n",
+				names[i], r->worstStepMs, r->worstCollideMs, r->worstSolveMs, r->meanStepMs, r->contactCount, r->touchingContacts,
+				r->touchingManifolds, r->maxDrift );
+	}
+
+	// A grid shard is one shape and its contacts are few
+	ENSURE( grid.contactCount < 400 );
+	ENSURE( grid.worstStepMs < 0.5f * boxes.worstStepMs );
+	return 0;
+}
+
 int VoxelGridTest( void )
 {
 	RUN_SUBTEST( VoxelGridModuleCover );
@@ -1097,5 +1309,8 @@ int VoxelGridTest( void )
 	RUN_SUBTEST( VoxelGridCharacterQueries );
 	RUN_SUBTEST( VoxelGridDynamicMass );
 	RUN_SUBTEST( VoxelGridShardOnHull );
+	RUN_SUBTEST( VoxelGridShardOnGrid );
+	RUN_SUBTEST( VoxelGridShardStack );
+	RUN_SUBTEST( VoxelGridShardPile );
 	return 0;
 }

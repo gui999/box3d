@@ -84,6 +84,7 @@ int main( int argc, char** argv )
 	___tracy_startup_profiler();
 #endif
 
+	setvbuf( stdout, NULL, _IONBF, 0 );
 	const char* filter = NULL;
 	if ( argc > 1 )
 	{
