@@ -1305,6 +1305,176 @@ int b3RecoverVoxelGrid( const b3VoxelGrid* grid, b3Transform shapeTransform, con
 	return context.count;
 }
 
+// Contacts of a proxy with a grid, one per box
+
+typedef struct b3VoxelContactContext
+{
+	const b3VoxelGrid* grid;
+	const b3ShapeProxy* proxy;
+	b3VoxelContact* results;
+	int capacity;
+	int count;
+} b3VoxelContactContext;
+
+static bool b3VoxelContactFcn( int cell, int box, b3AABB boxBounds, void* context )
+{
+	b3VoxelContactContext* contactContext = context;
+	const b3VoxelGrid* grid = contactContext->grid;
+	const b3VoxelGridModule* module = b3GetVoxelGridCellModule( grid, cell );
+	b3Vec3 corner = b3VoxelGridCellCorner( grid, cell );
+	const b3ShapeProxy* proxy = contactContext->proxy;
+
+	b3Vec3 points[B3_MAX_SHAPE_CAST_POINTS];
+	int count = b3MinInt( proxy->count, B3_MAX_SHAPE_CAST_POINTS );
+	for ( int i = 0; i < count; ++i )
+	{
+		points[i] = b3Sub( proxy->points[i], corner );
+	}
+
+	// The distance between the cores, no radii: the contact normal and depth come from it
+	const b3HullData* hull = &module->hulls[box].base;
+	b3DistanceInput input;
+	input.proxyA = (b3ShapeProxy){ b3GetHullPoints( hull ), hull->vertexCount, 0.0f };
+	input.proxyB = (b3ShapeProxy){ points, count, 0.0f };
+	input.transform = b3Transform_identity;
+	input.useRadii = false;
+	b3SimplexCache cache = { 0 };
+	b3DistanceOutput output = b3ShapeDistance( &input, &cache, NULL, 0 );
+	if ( output.distance >= proxy->radius )
+	{
+		return true;
+	}
+
+	// A face that solid covers is the seam between boxes: contacts through it belong to the neighbour
+	uint8_t covered = b3GetVoxelBoxCoveredFaces( grid, cell, box );
+
+	b3Vec3 normal;
+	float depth;
+	b3Vec3 point;
+	if ( output.distance > 1.0e-5f )
+	{
+		// The core is outside the box. The true closest feature gives the normal: a face, or the diagonal of an edge or corner
+		normal = b3MulSV( 1.0f / output.distance, b3Sub( output.pointB, output.pointA ) );
+		depth = proxy->radius - output.distance;
+		point = output.pointA;
+		if ( covered != 0 && b3IsNormalIntoCoveredFace( covered, normal ) )
+		{
+			return true;
+		}
+	}
+	else
+	{
+		// The core is inside the box: leave through the nearest exposed face
+		b3Vec3 coreLower = points[0];
+		b3Vec3 coreUpper = points[0];
+		for ( int i = 1; i < count; ++i )
+		{
+			coreLower = b3Min( coreLower, points[i] );
+			coreUpper = b3Max( coreUpper, points[i] );
+		}
+		const float* lowerCore = &coreLower.x;
+		const float* upperCore = &coreUpper.x;
+		b3Vec3 lowerBox = b3Sub( boxBounds.lowerBound, corner );
+		b3Vec3 upperBox = b3Sub( boxBounds.upperBound, corner );
+		const float* lowerBoxF = &lowerBox.x;
+		const float* upperBoxF = &upperBox.x;
+
+		int bestAxis = -1;
+		float bestPush = 0.0f;
+		for ( int axis = 0; axis < 3; ++axis )
+		{
+			if ( ( covered & ( 1 << ( 2 * axis + 1 ) ) ) == 0 )
+			{
+				float distance = upperBoxF[axis] - lowerCore[axis] + proxy->radius;
+				if ( distance > 0.0f && ( bestAxis < 0 || distance < fabsf( bestPush ) ) )
+				{
+					bestAxis = axis;
+					bestPush = distance;
+				}
+			}
+
+			if ( ( covered & ( 1 << ( 2 * axis ) ) ) == 0 )
+			{
+				float distance = upperCore[axis] - lowerBoxF[axis] + proxy->radius;
+				if ( distance > 0.0f && ( bestAxis < 0 || distance < fabsf( bestPush ) ) )
+				{
+					bestAxis = axis;
+					bestPush = -distance;
+				}
+			}
+		}
+
+		if ( bestAxis < 0 )
+		{
+			return true;
+		}
+
+		normal = b3Vec3_zero;
+		( &normal.x )[bestAxis] = bestPush > 0.0f ? 1.0f : -1.0f;
+		depth = fabsf( bestPush );
+		// The point of the box nearest the middle of the core
+		b3Vec3 center = b3Vec3_zero;
+		for ( int i = 0; i < count; ++i )
+		{
+			center = b3Add( center, b3MulSV( 1.0f / (float)count, points[i] ) );
+		}
+		point = b3Clamp( center, lowerBox, upperBox );
+	}
+
+	if ( depth <= 1.0e-5f )
+	{
+		return true;
+	}
+
+	b3VoxelContact contact = { normal, depth, b3Add( point, corner ) };
+	if ( contactContext->count < contactContext->capacity )
+	{
+		contactContext->results[contactContext->count++] = contact;
+	}
+	else
+	{
+		// Keep the deepest
+		int shallowest = 0;
+		for ( int i = 1; i < contactContext->capacity; ++i )
+		{
+			if ( contactContext->results[i].depth < contactContext->results[shallowest].depth )
+			{
+				shallowest = i;
+			}
+		}
+		if ( contact.depth > contactContext->results[shallowest].depth )
+		{
+			contactContext->results[shallowest] = contact;
+		}
+	}
+
+	return true;
+}
+
+int b3CollideVoxelGrid( const b3VoxelGrid* grid, b3Transform shapeTransform, const b3ShapeProxy* proxy, b3VoxelContact* results, int capacity )
+{
+	b3Vec3 localPoints[B3_MAX_SHAPE_CAST_POINTS];
+	b3ShapeProxy localProxy = b3MakeLocalProxy( proxy, shapeTransform, localPoints );
+
+	b3AABB bounds = b3ComputeProxyAABB( &localProxy );
+	if ( capacity <= 0 || b3AABB_Overlaps( bounds, grid->bounds ) == false )
+	{
+		return 0;
+	}
+
+	b3VoxelContactContext context = { grid, &localProxy, results, capacity, 0 };
+	b3QueryVoxelGrid( grid, bounds, b3VoxelContactFcn, &context );
+
+	// Answer in the world frame
+	for ( int i = 0; i < context.count; ++i )
+	{
+		results[i].normal = b3RotateVector( shapeTransform.q, results[i].normal );
+		results[i].point = b3TransformPoint( shapeTransform, results[i].point );
+	}
+
+	return context.count;
+}
+
 // Character mover
 
 typedef struct b3VoxelMoverContext

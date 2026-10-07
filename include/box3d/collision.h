@@ -796,6 +796,27 @@ B3_API bool b3OverlapVoxelGrid( const b3VoxelGrid* grid, b3Transform shapeTransf
 /// seam is pushed straight out of the surface. Returns the number of boxes that pushed.
 B3_API int b3RecoverVoxelGrid( const b3VoxelGrid* grid, b3Transform shapeTransform, const b3ShapeProxy* proxy, b3Vec3 pushes[3] );
 
+/// One box's contact with a proxy in world space.
+typedef struct b3VoxelContact
+{
+	/// The unit direction that leaves the box: out of the surface the proxy is on. Diagonal when the proxy touches an edge or a
+	/// corner of the box.
+	b3Vec3 normal;
+
+	/// How far the proxy has to move along the normal to be clear of the box, its radius included.
+	float depth;
+
+	/// The point of the box nearest the proxy.
+	b3Vec3 point;
+} b3VoxelContact;
+
+/// The contacts of a proxy in world space with the boxes of a voxel grid its radius reaches, one per box, exact: a face gives
+/// the face normal, an edge or a corner the direction from it to the proxy's core. A face that solid voxels cover never gives
+/// a contact (the seam between two floor boxes), so a proxy across a seam leaves through the surface. A core inside a box
+/// leaves through the nearest exposed face. When more boxes touch than `capacity`, the deepest are kept. Returns the count.
+B3_API int b3CollideVoxelGrid( const b3VoxelGrid* grid, b3Transform shapeTransform, const b3ShapeProxy* proxy, b3VoxelContact* results,
+							   int capacity );
+
 /// Compute the bounding box of a transformed voxel grid.
 B3_API b3AABB b3ComputeVoxelGridAABB( const b3VoxelGrid* grid, b3Transform transform );
 
