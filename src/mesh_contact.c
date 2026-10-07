@@ -936,6 +936,49 @@ static int b3CollideMeshTriangles( const b3MeshConvexInput* input, b3TriangleCac
 		vertices[1] = b3Add( b3MulMV( relativeMatrix, triangle.vertices[1] ), transformAtoB.p );
 		vertices[2] = b3Add( b3MulMV( relativeMatrix, triangle.vertices[2] ), transformAtoB.p );
 
+		if ( shapeA->type == b3_meshShape && shapeA->mesh.data->doubleSided )
+		{
+			// A double sided mesh collides from the side the other shape is on: wind the triangle to face it
+			b3Vec3 centerB;
+			switch ( input->typeB )
+			{
+				case b3_capsuleShape:
+					centerB = b3Lerp( input->capsuleB->center1, input->capsuleB->center2, 0.5f );
+					break;
+
+				case b3_hullShape:
+					centerB = input->hullB->center;
+					break;
+
+				default:
+					centerB = input->sphereB->center;
+					break;
+			}
+
+			b3Vec3 faceNormal = b3Cross( b3Sub( vertices[1], vertices[0] ), b3Sub( vertices[2], vertices[0] ) );
+			if ( b3Dot( faceNormal, b3Sub( centerB, vertices[0] ) ) < 0.0f )
+			{
+				b3Vec3 swappedVertex = vertices[1];
+				vertices[1] = vertices[2];
+				vertices[2] = swappedVertex;
+
+				int swappedIndex = triangle.i2;
+				triangle.i2 = triangle.i3;
+				triangle.i3 = swappedIndex;
+
+				// Edges 1 and 3 trade places, and what was concave from the front is convex from the back
+				int flags = triangle.flags;
+				int swappedFlags = 0;
+				swappedFlags |= ( flags & b3_inverseConcaveEdge3 ) ? b3_concaveEdge1 : 0;
+				swappedFlags |= ( flags & b3_inverseConcaveEdge2 ) ? b3_concaveEdge2 : 0;
+				swappedFlags |= ( flags & b3_inverseConcaveEdge1 ) ? b3_concaveEdge3 : 0;
+				swappedFlags |= ( flags & b3_concaveEdge3 ) ? b3_inverseConcaveEdge1 : 0;
+				swappedFlags |= ( flags & b3_concaveEdge2 ) ? b3_inverseConcaveEdge2 : 0;
+				swappedFlags |= ( flags & b3_concaveEdge1 ) ? b3_inverseConcaveEdge3 : 0;
+				triangle.flags = swappedFlags;
+			}
+		}
+
 		b3ContactCache* cache = &triangleCaches[index].cache;
 		int pointCapacity = pointBufferCapacity - totalPointCount;
 		b3LocalManifold* manifold = manifoldBuffer + manifoldCount;

@@ -1711,6 +1711,7 @@ b3MeshData* b3CreateMesh( const b3MeshDef* def, int* degenerateTriangleIndices, 
 	mesh->materialOffset = materialIndicesOffset;
 	mesh->materialCount = materialCount;
 	mesh->flagsOffset = flagsOffset;
+	mesh->doubleSided = def->doubleSided ? 1 : 0;
 
 	b3MeshNode* nodes = b3GetMeshNodesWrite( mesh );
 	b3MeshTriangle* triangles = b3GetMeshTrianglesWrite( mesh );
@@ -1897,6 +1898,7 @@ b3CastOutput b3RayCastMesh( const b3Mesh* mesh, const b3RayCastInput* input )
 	b3V32 scale = b3LoadV( &meshScale.x );
 	b3V32 invScale = b3DivV( b3_oneV, scale );
 	bool clockwise = meshScale.x * meshScale.y * meshScale.z < 0.0f;
+	bool doubleSided = data->doubleSided != 0;
 
 	// Use the inverse scaled ray for traversal of the BVH
 	b3V32 invScaledRayStart = b3MulV( invScale, rayStart );
@@ -1954,6 +1956,18 @@ b3CastOutput b3RayCastMesh( const b3Mesh* mesh, const b3RayCastInput* input )
 
 					float alpha = b3IntersectRayTriangle( rayStart, rayDelta, v1, v2, v3 );
 					B3_ASSERT( 0 <= alpha && alpha <= 1.0f );
+
+					if ( doubleSided && alpha >= 1.0f )
+					{
+						// The ray may be arriving at the back: try the reversed winding. Its normal faces the ray.
+						alpha = b3IntersectRayTriangle( rayStart, rayDelta, v1, v3, v2 );
+						if ( alpha < bestOutput.fraction )
+						{
+							b3Vec3 swapped = vertex2;
+							vertex2 = vertex3;
+							vertex3 = swapped;
+						}
+					}
 
 					if ( alpha < bestOutput.fraction )
 					{
@@ -2412,4 +2426,152 @@ void b3QueryMesh( const b3Mesh* mesh, b3AABB bounds, b3MeshQueryFcn* fcn, void* 
 		}
 		node = stack[--count];
 	}
+}
+
+typedef struct b3MeshRecoverContext
+{
+	const b3Mesh* mesh;
+	const b3ShapeProxy* proxy;
+	b3Transform meshTransform;
+	b3MeshRecoverResult* results;
+	int capacity;
+	int count;
+	bool doubleSided;
+} b3MeshRecoverContext;
+
+static bool b3RecoverMeshCallback( b3Vec3 a, b3Vec3 b, b3Vec3 c, int triangleIndex, void* userContext )
+{
+	B3_UNUSED( a );
+	B3_UNUSED( b );
+	B3_UNUSED( c );
+
+	b3MeshRecoverContext* context = userContext;
+	const b3ShapeProxy* proxy = context->proxy;
+
+	// b3QueryMesh flips the winding of an unmirrored mesh, so take the triangle as the mesh stores it
+	b3Triangle triangle = b3GetMeshTriangle( context->mesh, triangleIndex );
+	b3Vec3 v1 = triangle.vertices[0];
+	b3Vec3 v2 = triangle.vertices[1];
+	b3Vec3 v3 = triangle.vertices[2];
+
+	b3Vec3 faceNormal = b3Cross( b3Sub( v2, v1 ), b3Sub( v3, v1 ) );
+	float faceLength = b3Length( faceNormal );
+	if ( faceLength < FLT_EPSILON )
+	{
+		return true;
+	}
+	faceNormal = b3MulSV( 1.0f / faceLength, faceNormal );
+
+	b3Vec3 trianglePoints[3] = { v1, v2, v3 };
+	b3DistanceInput input = { 0 };
+	input.proxyA = ( b3ShapeProxy ){ trianglePoints, 3, 0.0f };
+	input.proxyB = ( b3ShapeProxy ){ proxy->points, proxy->count, 0.0f };
+	input.transform = b3Transform_identity;
+	input.useRadii = false;
+
+	b3SimplexCache cache = { 0 };
+	b3DistanceOutput output = b3ShapeDistance( &input, &cache, NULL, 0 );
+	if ( output.distance >= proxy->radius )
+	{
+		return true;
+	}
+
+	b3Vec3 normal;
+	float depth;
+	if ( output.distance > 100.0f * FLT_EPSILON )
+	{
+		// The core of the proxy is clear of the triangle: leave along the line between the closest points
+		normal = b3MulSV( 1.0f / output.distance, b3Sub( output.pointB, output.pointA ) );
+		if ( context->doubleSided == false && b3Dot( normal, faceNormal ) < 0.0f )
+		{
+			// The proxy is behind a one sided triangle
+			return true;
+		}
+		depth = proxy->radius - output.distance;
+	}
+	else
+	{
+		// The core touches or crosses the triangle: leave through the face the center of the proxy is on, far enough that the
+		// whole core clears the plane
+		b3Vec3 center = proxy->points[0];
+		for ( int i = 1; i < proxy->count; ++i )
+		{
+			center = b3Add( center, proxy->points[i] );
+		}
+		center = b3MulSV( 1.0f / (float)proxy->count, center );
+
+		normal = faceNormal;
+		if ( b3Dot( normal, b3Sub( center, v1 ) ) < 0.0f )
+		{
+			if ( context->doubleSided == false )
+			{
+				return true;
+			}
+			normal = b3Neg( normal );
+		}
+
+		float lowest = b3Dot( normal, b3Sub( proxy->points[0], v1 ) );
+		for ( int i = 1; i < proxy->count; ++i )
+		{
+			lowest = b3MinFloat( lowest, b3Dot( normal, b3Sub( proxy->points[i], v1 ) ) );
+		}
+		depth = proxy->radius - lowest;
+	}
+
+	b3MeshRecoverResult result;
+	result.normal = b3RotateVector( context->meshTransform.q, normal );
+	result.depth = depth;
+	result.point = b3TransformPoint( context->meshTransform, output.pointA );
+	result.triangleIndex = triangleIndex;
+
+	if ( context->count < context->capacity )
+	{
+		context->results[context->count++] = result;
+	}
+	else
+	{
+		// Keep the deepest
+		int shallowest = 0;
+		for ( int i = 1; i < context->capacity; ++i )
+		{
+			if ( context->results[i].depth < context->results[shallowest].depth )
+			{
+				shallowest = i;
+			}
+		}
+		if ( result.depth > context->results[shallowest].depth )
+		{
+			context->results[shallowest] = result;
+		}
+	}
+
+	return true;
+}
+
+int b3RecoverMesh( const b3Mesh* mesh, b3Transform meshTransform, const b3ShapeProxy* proxy, b3MeshRecoverResult* results,
+				   int capacity )
+{
+	B3_ASSERT( proxy->count > 0 );
+	if ( capacity <= 0 )
+	{
+		return 0;
+	}
+
+	b3Vec3 buffer[B3_MAX_SHAPE_CAST_POINTS];
+	b3ShapeProxy localProxy = b3MakeLocalProxy( proxy, meshTransform, buffer );
+
+	b3AABB bounds = b3ComputeProxyAABB( &localProxy );
+	b3Vec3 radius = { localProxy.radius, localProxy.radius, localProxy.radius };
+	bounds.lowerBound = b3Sub( bounds.lowerBound, radius );
+	bounds.upperBound = b3Add( bounds.upperBound, radius );
+
+	b3MeshRecoverContext context = { 0 };
+	context.mesh = mesh;
+	context.proxy = &localProxy;
+	context.meshTransform = meshTransform;
+	context.results = results;
+	context.capacity = capacity;
+	context.doubleSided = mesh->data->doubleSided != 0;
+	b3QueryMesh( mesh, bounds, b3RecoverMeshCallback, &context );
+	return context.count;
 }

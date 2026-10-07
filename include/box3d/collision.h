@@ -577,6 +577,28 @@ typedef bool b3MeshQueryFcn( b3Vec3 a, b3Vec3 b, b3Vec3 c, int triangleIndex, vo
 /// @param context the context sent to the user function.
 B3_API void b3QueryMesh( const b3Mesh* mesh, const b3AABB bounds, b3MeshQueryFcn* fcn, void* context );
 
+/// One triangle's push on a proxy that sank into a mesh, in world space.
+typedef struct b3MeshRecoverResult
+{
+	/// The unit direction that leaves the triangle: its normal on the side the proxy is on.
+	b3Vec3 normal;
+
+	/// How far the proxy has to move along the normal to be clear of the triangle, its radius included.
+	float depth;
+
+	/// The closest point on the triangle.
+	b3Vec3 point;
+
+	/// The triangle in the mesh.
+	int triangleIndex;
+} b3MeshRecoverResult;
+
+/// Recover a proxy in world space that sank into a mesh: every triangle the radius of the proxy reaches reports the push that
+/// leaves it. A one sided mesh ignores the back of its triangles, a double sided mesh pushes the proxy out of whichever side it
+/// is on. When more triangles push than `capacity`, the deepest are kept. Returns the number of results.
+B3_API int b3RecoverMesh( const b3Mesh* mesh, b3Transform meshTransform, const b3ShapeProxy* proxy, b3MeshRecoverResult* results,
+						  int capacity );
+
 /// Query a height field for triangles overlapping a bounding box in local space. May have false positives. Useful for debug draw.
 /// @param heightField the height field to query
 /// @param bounds the bounding box in local space

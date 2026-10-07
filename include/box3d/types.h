@@ -2099,6 +2099,10 @@ typedef struct b3MeshDef
 
 	/// Compute triangle adjacency information using shared edges
 	bool identifyEdges;
+
+	/// Make the mesh double sided: rays, shape casts and contacts see every triangle from both sides, with the
+	/// triangle normal turned toward the query. Single sided meshes ignore the back of a triangle.
+	bool doubleSided;
 } b3MeshDef;
 
 /// 64-bit mesh version. Useful for validating serialized data.
@@ -2220,6 +2224,9 @@ typedef struct b3MeshData
 
 	/// Offset of the triangle flag array in bytes from the struct address.
 	int flagsOffset;
+
+	/// Non-zero when the triangles collide from both sides.
+	int doubleSided;
 } b3MeshData;
 
 /// This allows mesh data to be re-used with different scales.
