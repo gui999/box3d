@@ -1101,6 +1101,10 @@ static void b3ExecuteStage( b3SolverStage* stage, b3StepContext* context, int pr
 			// syncIndex but we only copy .block, so the struct copy never aliases the CAS target.
 			b3ExecuteBlock( stage, context, blocks[blockIndex].block, workerIndex );
 			completedCount += 1;
+
+			// Terra: report each block as it finishes instead of once per sweep, so a worker preempted after
+			// its last block (before the sweep ends) cannot hold up the stage barrier on the main thread.
+			(void)b3AtomicFetchAddInt( &stage->completionCount, 1 );
 		}
 
 		blockIndex += 1;
@@ -1110,7 +1114,7 @@ static void b3ExecuteStage( b3SolverStage* stage, b3StepContext* context, int pr
 		}
 	}
 
-	(void)b3AtomicFetchAddInt( &stage->completionCount, completedCount );
+	B3_UNUSED( completedCount );
 }
 
 // Execute a stage on worker 0 (main thread).
@@ -1139,9 +1143,16 @@ static void b3ExecuteMainStage( b3SolverStage* stage, b3StepContext* context, ui
 		b3ExecuteStage( stage, context, previousSyncIndex, syncIndex, workerIndex );
 
 		// Spin waiting for thieves to finish
+		// Terra: if the holder of a claimed block was preempted, hand the core over instead of spinning on it.
+		int waitSpins = 0;
 		while ( b3AtomicLoadInt( &stage->completionCount ) != blockCount )
 		{
 			b3Pause();
+			if ( ++waitSpins > 4000 )
+			{
+				b3Yield();
+				waitSpins = 0;
+			}
 		}
 
 		b3AtomicStoreInt( &stage->completionCount, 0 );

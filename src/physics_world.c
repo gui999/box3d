@@ -371,7 +371,7 @@ b3WorldId b3CreateWorld( const b3WorldDef* def )
 	{
 		// Built-in scheduler
 		world->workerCount = b3MinInt( def->workerCount, B3_MAX_WORKERS );
-		world->scheduler = b3CreateScheduler( world->workerCount );
+		world->scheduler = b3CreateScheduler( world->workerCount, def->workerPriority );
 		world->enqueueTaskFcn = b3SchedulerEnqueueTask;
 		world->finishTaskFcn = b3SchedulerFinishTask;
 		world->userTaskContext = world->scheduler;

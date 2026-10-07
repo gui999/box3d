@@ -32,6 +32,7 @@ extern int BodyQueryTest( void );
 extern int CollisionTest( void );
 extern int CompoundTest( void );
 extern int ContainerTest( void );
+extern int ContentionBench( void );
 extern int DeterminismTest( void );
 extern int DistanceTest( void );
 extern int HeightFieldTest( void );
@@ -101,6 +102,12 @@ int main( int argc, char** argv )
 		printf( "Filter: %s\n", filter );
 	}
 	printf( "======================================\n" );
+
+	// Terra: scheduler contention benchmark, only on request.
+	if ( filter != NULL && strcmp( filter, "ContentionBench" ) == 0 )
+	{
+		RUN_TEST( ContentionBench );
+	}
 
 	MAYBE_RUN_TEST( AllocatorTest );
 	MAYBE_RUN_TEST( BitTest );

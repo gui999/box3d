@@ -185,6 +185,10 @@ typedef struct b3WorldDef
 	/// will create threads and use an internal scheduler.
 	uint32_t workerCount;
 
+	/// Terra: OS priority of the internal scheduler's worker threads (ignored with a user task system):
+	/// 0 normal, 1 above normal, 2 highest, 3 time critical. Implemented on Windows; other platforms ignore it.
+	int workerPriority;
+
 	/// function to spawn task
 	b3EnqueueTaskCallback* enqueueTask;
 
