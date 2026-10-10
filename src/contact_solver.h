@@ -50,6 +50,9 @@ typedef struct b3ContactConstraint
 	float friction;
 	float restitution;
 	float rollingResistance;
+	// Terra: the impulse limit over the step (FLT_MAX for none) and the impulse the finished sub-steps applied
+	float maxNormalImpulse;
+	float spentNormalImpulse;
 	int manifoldCount;
 } b3ContactConstraint;
 

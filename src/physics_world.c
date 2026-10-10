@@ -354,6 +354,7 @@ b3WorldId b3CreateWorld( const b3WorldDef* def )
 	world->locked = false;
 	world->enableWarmStarting = true;
 	world->enableContinuous = def->enableContinuous;
+	world->enableLimitPassThrough = true;
 	world->enableSpeculative = true;
 	world->userTreeTask = NULL;
 	world->userData = def->userData;
@@ -2052,6 +2053,17 @@ void b3World_EnableContinuous( b3WorldId worldId, bool flag )
 	B3_REC( world, WorldEnableContinuous, worldId, flag );
 
 	world->enableContinuous = flag;
+}
+
+void b3World_EnableLimitPassThrough( b3WorldId worldId, bool flag )
+{
+	b3World* world = b3GetUnlockedWorldFromId( worldId );
+	if ( world == NULL )
+	{
+		return;
+	}
+
+	world->enableLimitPassThrough = flag;
 }
 
 bool b3World_IsContinuousEnabled( b3WorldId worldId )

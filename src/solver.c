@@ -364,6 +364,12 @@ static bool b3ContinuousQueryCallback( int proxyId, uint64_t userData, void* con
 		return true;
 	}
 
+	// Terra: skip a shape whose impulse limit gave way this step, so a body carries on through what it breaks
+	if ( world->enableLimitPassThrough && shape->limitReachedStep == world->stepIndex )
+	{
+		return true;
+	}
+
 	// Skip sensors unless both shapes want sensor events
 	bool isSensor = shape->sensorIndex != B3_NULL_INDEX;
 	if ( isSensor && ( ( shape->flags & b3_enableSensorEvents ) == 0 || ( fastShape->flags & b3_enableSensorEvents ) == 0 ) )

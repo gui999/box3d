@@ -179,6 +179,8 @@ static b3Shape* b3CreateShapeInternal( b3World* world, b3Body* body, b3WorldTran
 	shape->type = shapeType;
 	shape->density = def->density;
 	shape->explosionScale = def->explosionScale;
+	shape->maxNormalImpulse = def->maxNormalImpulse;
+	shape->limitReachedStep = 0;
 	shape->filter = def->filter;
 	shape->userData = def->userData;
 	shape->userShape = NULL;
@@ -1290,6 +1292,21 @@ float b3Shape_GetFriction( b3ShapeId shapeId )
 	b3World* world = b3GetWorld( shapeId.world0 );
 	b3Shape* shape = b3GetShape( world, shapeId );
 	return b3GetShapeMaterials( shape )[0].friction;
+}
+
+void b3Shape_SetMaxNormalImpulse( b3ShapeId shapeId, float impulse )
+{
+	B3_ASSERT( impulse >= 0.0f );
+	b3World* world = b3GetWorld( shapeId.world0 );
+	b3Shape* shape = b3GetShape( world, shapeId );
+	shape->maxNormalImpulse = impulse;
+}
+
+float b3Shape_GetMaxNormalImpulse( b3ShapeId shapeId )
+{
+	b3World* world = b3GetWorld( shapeId.world0 );
+	b3Shape* shape = b3GetShape( world, shapeId );
+	return shape->maxNormalImpulse;
 }
 
 void b3Shape_SetRestitution( b3ShapeId shapeId, float restitution )

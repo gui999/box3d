@@ -487,6 +487,12 @@ typedef struct b3ShapeDef
 	/// Explosion scale for b3World_Explode. non-dimensional
 	float explosionScale;
 
+	/// Terra: the most normal impulse in N*s that a contact of this shape may apply over one time step, its sub-steps and
+	/// restitution included (the lower of the two shapes' limits). The solver clamps the contact's impulses so their sum
+	/// stays within it, so a body pushes through a shape that cannot resist it. FLT_MAX (the default) is no limit. Only
+	/// contacts on the scalar path honour it: voxel grids, meshes, height fields and the overflow color.
+	float maxNormalImpulse;
+
 	/// Contact filtering data.
 	b3Filter filter;
 

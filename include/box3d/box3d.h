@@ -137,6 +137,10 @@ B3_API bool b3World_IsSleepingEnabled( b3WorldId worldId );
 /// @see b3WorldDef
 B3_API void b3World_EnableContinuous( b3WorldId worldId, bool flag );
 
+/// Terra: let continuous collision pass a shape whose impulse limit (b3ShapeDef::maxNormalImpulse) gave way this step, so a
+/// fast body carries on through what it breaks. On by default.
+B3_API void b3World_EnableLimitPassThrough( b3WorldId worldId, bool flag );
+
 /// Is continuous collision enabled?
 B3_API bool b3World_IsContinuousEnabled( b3WorldId worldId );
 
@@ -895,6 +899,13 @@ B3_API void b3Shape_SetFriction( b3ShapeId shapeId, float friction );
 
 /// Get the friction of a shape
 B3_API float b3Shape_GetFriction( b3ShapeId shapeId );
+
+/// Terra: set the most normal impulse a contact of this shape may apply over one time step (b3ShapeDef::maxNormalImpulse).
+/// Takes effect at the next step. FLT_MAX is no limit.
+B3_API void b3Shape_SetMaxNormalImpulse( b3ShapeId shapeId, float impulse );
+
+/// Terra: get the shape's normal impulse limit per time step.
+B3_API float b3Shape_GetMaxNormalImpulse( b3ShapeId shapeId );
 
 /// Set the shape restitution (bounciness)
 B3_API void b3Shape_SetRestitution( b3ShapeId shapeId, float restitution );

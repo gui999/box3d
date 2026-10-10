@@ -284,6 +284,8 @@ typedef struct b3World
 	bool locked;
 	bool enableWarmStarting;
 	bool enableContinuous;
+	// Terra: continuous collision passes a shape whose impulse limit gave way this step
+	bool enableLimitPassThrough;
 	bool enableSpeculative;
 	bool inUse;
 } b3World;

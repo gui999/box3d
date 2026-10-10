@@ -474,6 +474,7 @@ b3ShapeDef b3RecR_SHAPEDEF( b3RecReader* rdr )
 	def.baseMaterial = b3RecR_MATERIAL( rdr );
 	def.density = b3RecR_F32( rdr );
 	def.explosionScale = b3RecR_F32( rdr );
+	def.maxNormalImpulse = b3RecR_F32( rdr );
 	def.filter = b3RecR_FILTER( rdr );
 	def.enableCustomFiltering = b3RecR_BOOL( rdr );
 	def.isSensor = b3RecR_BOOL( rdr );

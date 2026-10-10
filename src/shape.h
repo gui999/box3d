@@ -39,6 +39,9 @@ typedef struct b3Shape
 	b3ShapeType type;
 	float density;
 	float explosionScale;
+	float maxNormalImpulse;
+	// Terra: the step in which a contact of this shape reached its impulse limit (continuous collision passes it then)
+	uint64_t limitReachedStep;
 	float aabbMargin;
 
 	b3AABB aabb;

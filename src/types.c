@@ -7,6 +7,8 @@
 
 #include "box3d/constants.h"
 
+#include <float.h>
+
 b3WorldDef b3DefaultWorldDef( void )
 {
 	float lengthUnits = b3GetLengthUnitsPerMeter();
@@ -72,6 +74,7 @@ b3ShapeDef b3DefaultShapeDef( void )
 	// density of water
 	def.density = 1000.0f / ( lengthUnits * lengthUnits * lengthUnits );
 	def.explosionScale = 1.0f;
+	def.maxNormalImpulse = FLT_MAX;
 	def.filter = b3DefaultFilter();
 	def.updateBodyMass = true;
 	def.invokeContactCreation = true;

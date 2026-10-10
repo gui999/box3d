@@ -13,9 +13,45 @@
 #include "simd.h"
 #include "solver_set.h"
 
-#if B3_ENABLE_VALIDATION
 #include "shape.h"
-#endif
+
+#include <float.h>
+
+// Terra: the sum of a contact's accumulated normal impulses over its manifolds
+static float b3SumNormalImpulses( const b3ContactConstraint* contactConstraint )
+{
+	float sum = 0.0f;
+	for ( int manifoldIndex = 0; manifoldIndex < contactConstraint->manifoldCount; ++manifoldIndex )
+	{
+		const b3ManifoldConstraint* constraint = contactConstraint->constraints + manifoldIndex;
+		for ( int pointIndex = 0; pointIndex < constraint->pointCount; ++pointIndex )
+		{
+			sum += constraint->points[pointIndex].normalImpulse;
+		}
+	}
+	return sum;
+}
+
+// Terra: scale the accumulated normal impulses down to what is left of the step's limit before a sub-step applies them
+static void b3LimitWarmStart( b3ContactConstraint* contactConstraint )
+{
+	float left = b3MaxFloat( contactConstraint->maxNormalImpulse - contactConstraint->spentNormalImpulse, 0.0f );
+	float sum = b3SumNormalImpulses( contactConstraint );
+	if ( sum <= left )
+	{
+		return;
+	}
+
+	float scale = left / sum;
+	for ( int manifoldIndex = 0; manifoldIndex < contactConstraint->manifoldCount; ++manifoldIndex )
+	{
+		b3ManifoldConstraint* constraint = contactConstraint->constraints + manifoldIndex;
+		for ( int pointIndex = 0; pointIndex < constraint->pointCount; ++pointIndex )
+		{
+			constraint->points[pointIndex].normalImpulse *= scale;
+		}
+	}
+}
 
 // contact separation for sub-stepping
 // s = s0 + dot(cB + rB - cA - rA, normal)
@@ -163,6 +199,12 @@ void b3PrepareContacts_Mesh( b3SolverBlock block, b3StepContext* context )
 			contactConstraint->restitution = contact->restitution;
 			contactConstraint->rollingResistance = contact->rollingResistance;
 
+			// Terra: the lower of the two shapes' impulse limits, none spent yet
+			const b3Shape* shapeA = b3Array_Get( world->shapes, contact->shapeIdA );
+			const b3Shape* shapeB = b3Array_Get( world->shapes, contact->shapeIdB );
+			contactConstraint->maxNormalImpulse = b3MinFloat( shapeA->maxNormalImpulse, shapeB->maxNormalImpulse );
+			contactConstraint->spentNormalImpulse = 0.0f;
+
 			b3ManifoldConstraint* manifoldConstraints = manifoldBase + specs[localIndex].manifoldStart;
 			contactConstraint->constraints = manifoldConstraints;
 
@@ -290,9 +332,14 @@ void b3WarmStartContacts_Mesh( b3SolverBlock block, b3StepContext* context )
 
 	for ( int constraintIndex = startIndex; constraintIndex < endIndex; ++constraintIndex )
 	{
-		const b3ContactConstraint* contactConstraint = constraints + constraintIndex;
+		b3ContactConstraint* contactConstraint = constraints + constraintIndex;
 		int indexA = contactConstraint->indexA;
 		int indexB = contactConstraint->indexB;
+
+		if ( contactConstraint->maxNormalImpulse < FLT_MAX )
+		{
+			b3LimitWarmStart( contactConstraint );
+		}
 
 		b3BodyState* stateA = indexA == B3_NULL_INDEX ? &dummyState : states + indexA;
 		b3BodyState* stateB = indexB == B3_NULL_INDEX ? &dummyState : states + indexB;
@@ -372,6 +419,105 @@ void b3WarmStartContacts_Mesh( b3SolverBlock block, b3StepContext* context )
 	}
 }
 
+// The twist, rolling and central friction of one manifold, limited by its normal impulses
+static void b3SolveManifoldFriction( b3ManifoldConstraint* constraint, const b3ContactConstraint* contactConstraint,
+									 float totalNormalImpulse, float totalTwistLimit, b3Vec3* velocityA, b3Vec3* angularA,
+									 b3Vec3* velocityB, b3Vec3* angularB )
+{
+	float mA = contactConstraint->invMassA;
+	b3Matrix3 iA = contactConstraint->invIA;
+	float mB = contactConstraint->invMassB;
+	b3Matrix3 iB = contactConstraint->invIB;
+	float friction = contactConstraint->friction;
+	float rollingResistance = contactConstraint->rollingResistance;
+	b3Vec3 vA = *velocityA, wA = *angularA, vB = *velocityB, wB = *angularB;
+
+	// Central twist friction
+	{
+		float twistSpeed = b3Dot( constraint->normal, b3Sub( wB, wA ) );
+		float maxImpulse = friction * totalTwistLimit;
+		float deltaImpulse = -constraint->twistMass * twistSpeed;
+		float oldImpulse = constraint->twistImpulse;
+		constraint->twistImpulse = b3ClampFloat( oldImpulse + deltaImpulse, -maxImpulse, maxImpulse );
+		deltaImpulse = constraint->twistImpulse - oldImpulse;
+
+		wA = b3Sub( wA, b3MulMV( iA, b3MulSV( deltaImpulse, constraint->normal ) ) );
+		wB = b3Add( wB, b3MulMV( iB, b3MulSV( deltaImpulse, constraint->normal ) ) );
+	}
+
+	// Rolling resistance
+	if ( rollingResistance > 0.0f )
+	{
+		b3Vec3 deltaImpulse = b3Neg( b3MulMV( contactConstraint->rollingMass, b3Sub( wB, wA ) ) );
+		b3Vec3 oldImpulse = constraint->rollingImpulse;
+		constraint->rollingImpulse = b3Add( oldImpulse, deltaImpulse );
+
+		float maxImpulse = rollingResistance * totalNormalImpulse;
+		float magSqr = b3Dot( constraint->rollingImpulse, constraint->rollingImpulse );
+		if ( magSqr > maxImpulse * maxImpulse + FLT_EPSILON )
+		{
+			constraint->rollingImpulse = b3MulSV( maxImpulse / sqrtf( magSqr ), constraint->rollingImpulse );
+		}
+
+		deltaImpulse = b3Sub( constraint->rollingImpulse, oldImpulse );
+
+		wA = b3Sub( wA, b3MulMV( iA, deltaImpulse ) );
+		wB = b3Add( wB, b3MulMV( iB, deltaImpulse ) );
+	}
+
+	// Central friction
+	{
+		b3Vec3 tangent1 = constraint->tangent1;
+		b3Vec3 tangent2 = constraint->tangent2;
+
+		// Fixed anchor points for applying impulses
+		b3Vec3 rA = constraint->centerA;
+		b3Vec3 rB = constraint->centerB;
+
+		// Relative tangent velocity at contact
+		b3Vec3 vrA = b3Add( vA, b3Cross( wA, rA ) );
+		b3Vec3 vrB = b3Add( vB, b3Cross( wB, rB ) );
+		b3Vec3 vr = b3Sub( vrB, vrA );
+		b3Vec2 vt = {
+			b3Dot( vr, tangent1 ) - constraint->tangentVelocity1,
+			b3Dot( vr, tangent2 ) - constraint->tangentVelocity2,
+		};
+
+		// Incremental tangent impulse
+		b3Vec2 tm = b3MulMV2( constraint->tangentMass, vt );
+		b3Vec2 deltaImpulse = { -tm.x, -tm.y };
+		b3Vec2 newImpulse = {
+			constraint->frictionImpulse.x + deltaImpulse.x,
+			constraint->frictionImpulse.y + deltaImpulse.y,
+		};
+
+		float maxImpulse = friction * totalNormalImpulse;
+
+		// Clamp the accumulated impulse
+		float lengthSquared = b3Dot2( newImpulse, newImpulse );
+		if ( lengthSquared > maxImpulse * maxImpulse )
+		{
+			float scale = maxImpulse / sqrtf( lengthSquared );
+			newImpulse.x *= scale;
+			newImpulse.y *= scale;
+		}
+		deltaImpulse = b3Sub2( newImpulse, constraint->frictionImpulse );
+		constraint->frictionImpulse = newImpulse;
+
+		// Apply delta impulse
+		b3Vec3 P = b3Blend2( deltaImpulse.x, tangent1, deltaImpulse.y, tangent2 );
+		vA = b3MulSub( vA, mA, P );
+		wA = b3Sub( wA, b3MulMV( iA, b3Cross( rA, P ) ) );
+		vB = b3MulAdd( vB, mB, P );
+		wB = b3Add( wB, b3MulMV( iB, b3Cross( rB, P ) ) );
+	}
+
+	*velocityA = vA;
+	*angularA = wA;
+	*velocityB = vB;
+	*angularB = wB;
+}
+
 // Merged normal and friction loops. This is much more stable for the Jenga stack.
 void b3SolveContacts_Mesh( b3SolverBlock block, b3StepContext* context, bool useBias )
 {
@@ -415,8 +561,11 @@ void b3SolveContacts_Mesh( b3SolverBlock block, b3StepContext* context, bool use
 
 		b3Vec3 dp = b3Sub( stateB->deltaPosition, stateA->deltaPosition );
 		b3Softness softness = contactConstraint->softness;
-		float friction = contactConstraint->friction;
-		float rollingResistance = contactConstraint->rollingResistance;
+
+		// Terra: under an impulse limit the points share what the finished sub-steps left of it in proportion, so the limit
+		// bends no hit off its line; friction then follows the shared impulses
+		bool limited = contactConstraint->maxNormalImpulse < FLT_MAX;
+		float left = limited ? b3MaxFloat( contactConstraint->maxNormalImpulse - contactConstraint->spentNormalImpulse, 0.0f ) : 0.0f;
 
 		for ( int j = 0; j < manifoldCount; ++j )
 		{
@@ -487,91 +636,65 @@ void b3SolveContacts_Mesh( b3SolverBlock block, b3StepContext* context, bool use
 				wB = b3Add( wB, b3MulMV( iB, b3Cross( rB, P ) ) );
 			}
 
-			// No friction when applying bias
-			if ( useBias == true )
+			// No friction when applying bias; under a limit, friction waits for the shared impulses
+			if ( useBias == true || limited )
 			{
 				// Go to next manifold
 				continue;
 			}
 
-			// Central twist friction
-			{
-				float twistSpeed = b3Dot( constraint->normal, b3Sub( wB, wA ) );
-				float maxImpulse = friction * totalTwistLimit;
-				float deltaImpulse = -constraint->twistMass * twistSpeed;
-				float oldImpulse = constraint->twistImpulse;
-				constraint->twistImpulse = b3ClampFloat( oldImpulse + deltaImpulse, -maxImpulse, maxImpulse );
-				deltaImpulse = constraint->twistImpulse - oldImpulse;
+			b3SolveManifoldFriction( constraint, contactConstraint, totalNormalImpulse, totalTwistLimit, &vA, &wA, &vB, &wB );
+		}
 
-				wA = b3Sub( wA, b3MulMV( iA, b3MulSV( deltaImpulse, constraint->normal ) ) );
-				wB = b3Add( wB, b3MulMV( iB, b3MulSV( deltaImpulse, constraint->normal ) ) );
+		if ( limited )
+		{
+			// Terra: scale every point down alike when the points together pass what is left of the limit
+			float sum = b3SumNormalImpulses( contactConstraint );
+			if ( sum > left )
+			{
+				float scale = left / sum;
+				for ( int j = 0; j < manifoldCount; ++j )
+				{
+					b3ManifoldConstraint* constraint = contactConstraint->constraints + j;
+					for ( int pointIndex = 0; pointIndex < constraint->pointCount; ++pointIndex )
+					{
+						b3ManifoldConstraintPoint* cp = constraint->points + pointIndex;
+						float correction = ( scale - 1.0f ) * cp->normalImpulse;
+						cp->normalImpulse += correction;
+						cp->totalNormalImpulse += correction;
+						if ( useBias == false )
+						{
+							cp->appliedNormalImpulse += correction;
+						}
+
+						b3Vec3 P = b3MulSV( correction, constraint->normal );
+						vA = b3MulSub( vA, mA, P );
+						wA = b3Sub( wA, b3MulMV( iA, b3Cross( cp->rA, P ) ) );
+						vB = b3MulAdd( vB, mB, P );
+						wB = b3Add( wB, b3MulMV( iB, b3Cross( cp->rB, P ) ) );
+					}
+				}
+				sum = left;
 			}
 
-			// Rolling resistance
-			if ( rollingResistance > 0.0f )
+			if ( useBias == false )
 			{
-				b3Vec3 deltaImpulse = b3Neg( b3MulMV( contactConstraint->rollingMass, b3Sub( wB, wA ) ) );
-				b3Vec3 oldImpulse = constraint->rollingImpulse;
-				constraint->rollingImpulse = b3Add( oldImpulse, deltaImpulse );
-
-				float maxImpulse = rollingResistance * totalNormalImpulse;
-				float magSqr = b3Dot( constraint->rollingImpulse, constraint->rollingImpulse );
-				if ( magSqr > maxImpulse * maxImpulse + FLT_EPSILON )
+				for ( int j = 0; j < manifoldCount; ++j )
 				{
-					constraint->rollingImpulse = b3MulSV( maxImpulse / sqrtf( magSqr ), constraint->rollingImpulse );
+					b3ManifoldConstraint* constraint = contactConstraint->constraints + j;
+					float totalNormalImpulse = 0.0f;
+					float totalTwistLimit = 0.0f;
+					for ( int pointIndex = 0; pointIndex < constraint->pointCount; ++pointIndex )
+					{
+						const b3ManifoldConstraintPoint* cp = constraint->points + pointIndex;
+						totalNormalImpulse += cp->normalImpulse;
+						totalTwistLimit += cp->leverArm * cp->normalImpulse;
+					}
+					b3SolveManifoldFriction( constraint, contactConstraint, totalNormalImpulse, totalTwistLimit, &vA, &wA, &vB, &wB );
 				}
 
-				deltaImpulse = b3Sub( constraint->rollingImpulse, oldImpulse );
-
-				wA = b3Sub( wA, b3MulMV( iA, deltaImpulse ) );
-				wB = b3Add( wB, b3MulMV( iB, deltaImpulse ) );
-			}
-
-			// Central friction
-			{
-				b3Vec3 tangent1 = constraint->tangent1;
-				b3Vec3 tangent2 = constraint->tangent2;
-
-				// Fixed anchor points for applying impulses
-				b3Vec3 rA = constraint->centerA;
-				b3Vec3 rB = constraint->centerB;
-
-				// Relative tangent velocity at contact
-				b3Vec3 vrA = b3Add( vA, b3Cross( wA, rA ) );
-				b3Vec3 vrB = b3Add( vB, b3Cross( wB, rB ) );
-				b3Vec3 vr = b3Sub( vrB, vrA );
-				b3Vec2 vt = {
-					b3Dot( vr, tangent1 ) - constraint->tangentVelocity1,
-					b3Dot( vr, tangent2 ) - constraint->tangentVelocity2,
-				};
-
-				// Incremental tangent impulse
-				b3Vec2 tm = b3MulMV2( constraint->tangentMass, vt );
-				b3Vec2 deltaImpulse = { -tm.x, -tm.y };
-				b3Vec2 newImpulse = {
-					constraint->frictionImpulse.x + deltaImpulse.x,
-					constraint->frictionImpulse.y + deltaImpulse.y,
-				};
-
-				float maxImpulse = friction * totalNormalImpulse;
-
-				// Clamp the accumulated impulse
-				float lengthSquared = b3Dot2( newImpulse, newImpulse );
-				if ( lengthSquared > maxImpulse * maxImpulse )
-				{
-					float scale = maxImpulse / sqrtf( lengthSquared );
-					newImpulse.x *= scale;
-					newImpulse.y *= scale;
-				}
-				deltaImpulse = b3Sub2( newImpulse, constraint->frictionImpulse );
-				constraint->frictionImpulse = newImpulse;
-
-				// Apply delta impulse
-				b3Vec3 P = b3Blend2( deltaImpulse.x, tangent1, deltaImpulse.y, tangent2 );
-				vA = b3MulSub( vA, mA, P );
-				wA = b3Sub( wA, b3MulMV( iA, b3Cross( rA, P ) ) );
-				vB = b3MulAdd( vB, mB, P );
-				wB = b3Add( wB, b3MulMV( iB, b3Cross( rB, P ) ) );
+				// The relax leaves the impulse this sub-step applied
+				contactConstraint->spentNormalImpulse += sum;
 			}
 		}
 
@@ -606,12 +729,17 @@ void b3ApplyRestitution_Mesh( b3SolverBlock block, b3StepContext* context )
 
 	for ( int constraintIndex = startIndex; constraintIndex < endIndex; ++constraintIndex )
 	{
-		const b3ContactConstraint* contactConstraint = constraints + constraintIndex;
+		b3ContactConstraint* contactConstraint = constraints + constraintIndex;
 		float restitution = contactConstraint->restitution;
 		if ( restitution == 0.0f )
 		{
 			continue;
 		}
+
+		// Terra: restitution adds to the step's impulse, so it takes at most what the sub-steps left of the limit
+		bool limited = contactConstraint->maxNormalImpulse < FLT_MAX;
+		float left = b3MaxFloat( contactConstraint->maxNormalImpulse - contactConstraint->spentNormalImpulse, 0.0f );
+		float extra = 0.0f;
 
 		int indexA = contactConstraint->indexA;
 		int indexB = contactConstraint->indexB;
@@ -665,7 +793,12 @@ void b3ApplyRestitution_Mesh( b3SolverBlock block, b3StepContext* context )
 
 				// clamp the accumulated impulse
 				float newImpulse = b3MaxFloat( cp->normalImpulse + impulse, 0.0f );
+				if ( limited )
+				{
+					newImpulse = b3MinFloat( newImpulse, cp->normalImpulse + b3MaxFloat( left - extra, 0.0f ) );
+				}
 				impulse = newImpulse - cp->normalImpulse;
+				extra += impulse;
 				cp->normalImpulse = newImpulse;
 				cp->totalNormalImpulse += impulse;
 				cp->appliedNormalImpulse += impulse;
@@ -689,6 +822,11 @@ void b3ApplyRestitution_Mesh( b3SolverBlock block, b3StepContext* context )
 				stateB->linearVelocity = vB;
 				stateB->angularVelocity = wB;
 			}
+		}
+
+		if ( limited )
+		{
+			contactConstraint->spentNormalImpulse += extra;
 		}
 	}
 }
@@ -783,6 +921,22 @@ void b3StoreImpulses_Mesh( b3SolverBlock block, b3StepContext* context, int work
 						hasHitEvents = true;
 						flagged = true;
 					}
+				}
+			}
+
+			// Terra: a contact that spent its impulse limit marks the limiting shape as giving way this step
+			float limit = contactConstraint->maxNormalImpulse;
+			if ( limit < FLT_MAX && contactConstraint->spentNormalImpulse >= 0.999f * limit )
+			{
+				b3Shape* shapeA = b3Array_Get( world->shapes, contact->shapeIdA );
+				b3Shape* shapeB = b3Array_Get( world->shapes, contact->shapeIdB );
+				if ( shapeA->maxNormalImpulse == limit )
+				{
+					shapeA->limitReachedStep = world->stepIndex;
+				}
+				if ( shapeB->maxNormalImpulse == limit )
+				{
+					shapeB->limitReachedStep = world->stepIndex;
 				}
 			}
 		}
