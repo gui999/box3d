@@ -1297,7 +1297,12 @@ float b3Shape_GetFriction( b3ShapeId shapeId )
 void b3Shape_SetMaxNormalImpulse( b3ShapeId shapeId, float impulse )
 {
 	B3_ASSERT( impulse >= 0.0f );
-	b3World* world = b3GetWorld( shapeId.world0 );
+	b3World* world = b3GetUnlockedWorld( shapeId.world0 );
+	if ( world == NULL )
+	{
+		return;
+	}
+
 	b3Shape* shape = b3GetShape( world, shapeId );
 	shape->maxNormalImpulse = impulse;
 }
