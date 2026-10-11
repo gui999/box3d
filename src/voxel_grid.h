@@ -45,6 +45,10 @@ struct b3VoxelGridModule
 	// Per side, the solid voxels of the boundary layer: cellVoxels rows of bits, one row per v, bit u. For side
 	// axis * 2 + side, u = axis + 1 and v = axis + 2 modulo 3. NULL when the boxes are not on the voxel lattice.
 	uint32_t* boundaryLayers;
+
+	// The solid voxels of the cell: cellVoxels * cellVoxels rows, row ( y * cellVoxels + z ), bit x. NULL when the boxes are not
+	// on the voxel lattice. Point-sampled grid contacts read it.
+	uint32_t* solidRows;
 };
 
 struct b3VoxelGrid
@@ -153,3 +157,7 @@ b3ShapeExtent b3ComputeVoxelGridExtent( const b3VoxelGrid* grid, b3Vec3 localCen
 
 // Is a box covered on every face, so that nothing can touch it?
 bool b3IsVoxelBoxEnclosed( const b3VoxelGrid* grid, int cell, int box );
+
+// Is the voxel solid? x, y, z are voxels from the grid origin. With includeRing the padding ring's cells count (solid beyond
+// the grid, owned by a neighbour shape), without it only the grid's own cells do.
+bool b3IsVoxelSolid( const b3VoxelGrid* grid, int x, int y, int z, bool includeRing );

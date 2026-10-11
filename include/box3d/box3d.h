@@ -141,6 +141,14 @@ B3_API void b3World_EnableContinuous( b3WorldId worldId, bool flag );
 /// fast body carries on through what it breaks. On by default.
 B3_API void b3World_EnableLimitPassThrough( b3WorldId worldId, bool flag );
 
+/// Terra: point-sampled voxel grid contacts. When on, a voxel grid against a voxel grid is collided by sampling the exposed
+/// box faces of each grid against the other grid's voxel occupancy, the normals and depths read from the occupied voxels,
+/// instead of box pair by box pair. Other shape pairs are unchanged. Off by default.
+B3_API void b3World_EnableVoxelPointContacts( b3WorldId worldId, bool flag );
+
+/// Terra: are voxel grid pair contacts point-sampled?
+B3_API bool b3World_IsVoxelPointContactsEnabled( b3WorldId worldId );
+
 /// Is continuous collision enabled?
 B3_API bool b3World_IsContinuousEnabled( b3WorldId worldId );
 

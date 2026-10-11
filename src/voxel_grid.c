@@ -98,6 +98,8 @@ b3VoxelGridModule* b3CreateVoxelGridModule( const float* boxes, int boxCount, fl
 	offset = b3AlignUp( offset + 6 * (size_t)cellVoxels * sizeof( uint32_t ) );
 	size_t hullsOffset = offset;
 	offset = b3AlignUp( offset + (size_t)boxCount * sizeof( b3BoxHull ) );
+	size_t solidRowsOffset = offset;
+	offset = b3AlignUp( offset + (size_t)cellVoxels * cellVoxels * sizeof( uint32_t ) );
 
 	uint8_t* block = (uint8_t*)b3Alloc( offset );
 	memset( block, 0, offset );
@@ -112,6 +114,7 @@ b3VoxelGridModule* b3CreateVoxelGridModule( const float* boxes, int boxCount, fl
 	module->coveredFaces = block + coveredOffset;
 	module->boundaryFaces = block + boundaryOffset;
 	module->boundaryLayers = NULL;
+	module->solidRows = NULL;
 	module->hulls = (b3BoxHull*)( block + hullsOffset );
 
 	if ( boxCount > 0 )
@@ -147,6 +150,7 @@ b3VoxelGridModule* b3CreateVoxelGridModule( const float* boxes, int boxCount, fl
 	if ( onLattice )
 	{
 		module->boundaryLayers = (uint32_t*)( block + layersOffset );
+		module->solidRows = (uint32_t*)( block + solidRowsOffset );
 
 		size_t solidCount = (size_t)n * n * n;
 		uint8_t* solid = (uint8_t*)b3Alloc( solidCount );
@@ -164,6 +168,7 @@ b3VoxelGridModule* b3CreateVoxelGridModule( const float* boxes, int boxCount, fl
 					for ( int x = box[0]; x < box[0] + box[3]; ++x )
 					{
 						solid[B3_SOLID_AT( x, y, z )] = 1;
+						module->solidRows[(size_t)y * n + z] |= 1u << x;
 					}
 				}
 			}
@@ -579,6 +584,49 @@ bool b3IsVoxelBoxEnclosed( const b3VoxelGrid* grid, int cell, int box )
 	}
 
 	return b3GetVoxelBoxCoveredFaces( grid, cell, box ) == 0x3f;
+}
+
+static inline int b3FloorDivide( int value, int divisor )
+{
+	return value >= 0 ? value / divisor : -( ( -value + divisor - 1 ) / divisor );
+}
+
+bool b3IsVoxelSolid( const b3VoxelGrid* grid, int x, int y, int z, bool includeRing )
+{
+	int n = grid->cellVoxels;
+	int i = b3FloorDivide( x, n ), j = b3FloorDivide( y, n ), k = b3FloorDivide( z, n );
+	int low = includeRing ? -1 : 0;
+	if ( i < low || j < low || k < low || i >= grid->size[0] - low || j >= grid->size[1] - low || k >= grid->size[2] - low )
+	{
+		return false;
+	}
+
+	int index = grid->paddedModules[b3VoxelGridPaddedIndex( grid, i, j, k )];
+	if ( index < 0 )
+	{
+		return false;
+	}
+
+	const b3VoxelGridModule* module = grid->modules[index];
+	int lx = x - i * n, ly = y - j * n, lz = z - k * n;
+	if ( module->solidRows != NULL && module->cellVoxels == n )
+	{
+		return ( module->solidRows[ly * n + lz] >> lx ) & 1u;
+	}
+
+	// Off the lattice: the voxel's centre in a box
+	float voxel = grid->cellMeters / (float)n;
+	b3Vec3 centre = { ( (float)lx + 0.5f ) * voxel, ( (float)ly + 0.5f ) * voxel, ( (float)lz + 0.5f ) * voxel };
+	for ( int b = 0; b < module->boxCount; ++b )
+	{
+		const float* box = module->boxes + 6 * b;
+		if ( box[0] <= centre.x && centre.x < box[3] && box[1] <= centre.y && centre.y < box[4] && box[2] <= centre.z &&
+			 centre.z < box[5] )
+		{
+			return true;
+		}
+	}
+	return false;
 }
 
 // The boxes of a grid are disjoint, so mass, center and inertia are sums over them.

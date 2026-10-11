@@ -10,6 +10,8 @@
 
 #include "box3d/types.h"
 
+#include <float.h>
+#include <math.h>
 #include <stdio.h>
 
 // This guards against excessive memory usage and complex collision
@@ -1949,11 +1951,467 @@ static void b3CollideVoxelBoxes( b3LocalManifold* manifold, int capacity, const 
 	}
 }
 
+// Point-sampled voxel grid against voxel grid (b3World_EnableVoxelPointContacts)
+//
+// Each grid's exposed box faces in the region where the two can touch are sampled at nine points (corners, edge midpoints
+// and centre, inset a little), and each sample is tested against the other grid's voxel occupancy. A sample whose outside
+// neighbour voxel is solid in its own grid lies on an internal seam and is skipped. A sample inside a solid voxel of the other
+// grid walks that grid's six axes to the nearest empty voxel (up to B3_VOXEL_SAMPLE_WALK_METERS): the shortest exit gives the
+// depth and the normal. A sample whose exit would push the other grid back into the sampled face (that face went through a
+// thin wall, or is the far face of a thin plate inside a block) or that finds no exit gives nothing: the touching faces'
+// samples answer. A sample in empty space probes one speculative distance along its face's outward
+// direction and gives a speculative point on the voxel it finds. Normals are axes of the grid sampled against, so the points
+// cluster into at most twelve flat manifolds (six per grid frame), each reduced to four points by the shared clustering.
+// A point's id is a hash of its side, box key and sample, so impulses carry over while a body rests.
+
+// The bound on contact points from one grid pair before reduction. Over it the deepest are kept.
+#define B3_MAX_VOXEL_SAMPLE_POINTS 8192
+
+// How far a sample inside the other grid looks for the surface
+#define B3_VOXEL_SAMPLE_WALK_METERS 1.0f
+
+typedef struct b3VoxelSampler
+{
+	const b3VoxelGrid* self;
+	const b3VoxelGrid* other;
+
+	// The body frame of self into the body frame of other
+	b3Transform selfToOther;
+
+	// The occupied bounds of other, grown by the speculative distance, in its frame
+	b3AABB otherBounds;
+
+	// Self is shape B of the contact: the points are flipped into the contact's convention afterwards
+	bool selfIsB;
+
+	b3LocalManifoldPoint* points;
+	b3Vec3* normals;
+	int capacity;
+	int count;
+	int shallowest;
+	bool overflowed;
+	int sampleCount;
+} b3VoxelSampler;
+
+static inline int b3VoxelSampleHash( int side, int key, int sample )
+{
+	uint32_t h = (uint32_t)key * 0x9E3779B1u;
+	h ^= (uint32_t)( sample * 2 + side ) + 0x7F4A7C15u + ( h << 6 ) + ( h >> 2 );
+	h *= 0x85EBCA6Bu;
+	h ^= h >> 15;
+	return (int)( h & 0x7fffffffu );
+}
+
+static void b3FindShallowestSample( b3VoxelSampler* sampler )
+{
+	sampler->shallowest = 0;
+	for ( int i = 1; i < sampler->count; ++i )
+	{
+		if ( sampler->points[i].separation > sampler->points[sampler->shallowest].separation )
+		{
+			sampler->shallowest = i;
+		}
+	}
+}
+
+static void b3AddVoxelSample( b3VoxelSampler* sampler, b3Vec3 point, b3Vec3 normal, float separation, int id )
+{
+	b3LocalManifoldPoint mp = { 0 };
+	mp.point = point;
+	mp.separation = separation;
+	mp.pair = b3FeaturePair_single;
+	mp.triangleIndex = id;
+
+	if ( sampler->count < sampler->capacity )
+	{
+		sampler->points[sampler->count] = mp;
+		sampler->normals[sampler->count] = normal;
+		sampler->count += 1;
+		if ( sampler->count == sampler->capacity )
+		{
+			b3FindShallowestSample( sampler );
+		}
+		return;
+	}
+
+	sampler->overflowed = true;
+	if ( separation < sampler->points[sampler->shallowest].separation )
+	{
+		sampler->points[sampler->shallowest] = mp;
+		sampler->normals[sampler->shallowest] = normal;
+		b3FindShallowestSample( sampler );
+	}
+}
+
+static inline void b3VoxelCoordinates( const b3VoxelGrid* grid, float invVoxel, b3Vec3 p, int v[3] )
+{
+	v[0] = (int)floorf( ( p.x - grid->origin.x ) * invVoxel );
+	v[1] = (int)floorf( ( p.y - grid->origin.y ) * invVoxel );
+	v[2] = (int)floorf( ( p.z - grid->origin.z ) * invVoxel );
+}
+
+// One sample: p is on a face of self, just inside it, with the face's outward direction, both in the frame of self. The
+// point goes in the frame of other with the normal from self to other.
+static void b3SampleVoxelPoint( b3VoxelSampler* sampler, b3Vec3 p, b3Vec3 faceNormal, int id )
+{
+	const b3VoxelGrid* other = sampler->other;
+	float voxel = other->cellMeters / (float)other->cellVoxels;
+	float invVoxel = 1.0f / voxel;
+
+	b3Vec3 q = b3TransformPoint( sampler->selfToOther, p );
+	if ( q.x < sampler->otherBounds.lowerBound.x || q.y < sampler->otherBounds.lowerBound.y || q.z < sampler->otherBounds.lowerBound.z ||
+		 q.x > sampler->otherBounds.upperBound.x || q.y > sampler->otherBounds.upperBound.y || q.z > sampler->otherBounds.upperBound.z )
+	{
+		return;
+	}
+
+	sampler->sampleCount += 1;
+	b3Vec3 outward = b3RotateVector( sampler->selfToOther.q, faceNormal );
+	const float qa[3] = { q.x, q.y, q.z };
+	const float origin[3] = { other->origin.x, other->origin.y, other->origin.z };
+
+	int v[3];
+	b3VoxelCoordinates( other, invVoxel, q, v );
+
+	if ( b3IsVoxelSolid( other, v[0], v[1], v[2], false ) )
+	{
+		// Inside: the nearest exit along the six axes
+		int maxSteps = (int)ceilf( B3_VOXEL_SAMPLE_WALK_METERS * invVoxel );
+		float best = FLT_MAX;
+		int bestAxis = -1, bestSign = 0;
+		for ( int axis = 0; axis < 3; ++axis )
+		{
+			for ( int sign = -1; sign <= 1; sign += 2 )
+			{
+				int w[3] = { v[0], v[1], v[2] };
+				for ( int step = 1; step <= maxSteps; ++step )
+				{
+					float lowerBound = ( sign > 0 ? (float)( v[axis] + step ) * voxel + origin[axis] - qa[axis]
+												  : qa[axis] - ( (float)( v[axis] - step + 1 ) * voxel + origin[axis] ) );
+					if ( lowerBound >= best )
+					{
+						break;
+					}
+
+					w[axis] = v[axis] + sign * step;
+					if ( b3IsVoxelSolid( other, w[0], w[1], w[2], true ) == false )
+					{
+						if ( lowerBound < best )
+						{
+							best = lowerBound;
+							bestAxis = axis;
+							bestSign = sign;
+						}
+						break;
+					}
+				}
+			}
+		}
+
+		// Buried past the walk: no answer from this sample
+		if ( bestAxis < 0 )
+		{
+			return;
+		}
+
+		// Moving self along the exit pushes other the opposite way: the normal from self to other is -exit. A normal that
+		// points back into self's face means this face is not the one touching (a face that went through a thin wall, the
+		// far face of a thin plate inside a block); the samples of the touching faces answer instead.
+		float n[3] = { 0.0f, 0.0f, 0.0f };
+		n[bestAxis] = -(float)bestSign;
+		b3Vec3 normal = { n[0], n[1], n[2] };
+		if ( b3Dot( normal, outward ) < -0.1f )
+		{
+			return;
+		}
+		float depth = best;
+
+		b3Vec3 point = b3MulSub( q, 0.5f * depth, normal );
+		b3AddVoxelSample( sampler, point, normal, -depth, id );
+		return;
+	}
+
+	// Outside: the voxel one speculative distance out along the face
+	float reach = B3_SPECULATIVE_DISTANCE + 0.05f * voxel;
+	b3Vec3 probe = b3MulAdd( q, reach, outward );
+	int u[3];
+	b3VoxelCoordinates( other, invVoxel, probe, u );
+	if ( ( u[0] == v[0] && u[1] == v[1] && u[2] == v[2] ) || b3IsVoxelSolid( other, u[0], u[1], u[2], false ) == false )
+	{
+		return;
+	}
+
+	// The closest point of that voxel; the normal is the axis the gap is largest along
+	float gap[3];
+	int axis = 0;
+	for ( int a = 0; a < 3; ++a )
+	{
+		float low = (float)u[a] * voxel + origin[a], high = low + voxel;
+		float closest = b3ClampFloat( qa[a], low, high );
+		gap[a] = closest - qa[a];
+		if ( fabsf( gap[a] ) > fabsf( gap[axis] ) )
+		{
+			axis = a;
+		}
+	}
+
+	float n[3] = { 0.0f, 0.0f, 0.0f };
+	n[axis] = gap[axis] >= 0.0f ? 1.0f : -1.0f;
+	b3Vec3 normal = { n[0], n[1], n[2] };
+	if ( b3Dot( normal, outward ) < -0.1f )
+	{
+		return;
+	}
+
+	float separation = fabsf( gap[axis] ) - 0.05f * voxel;
+	if ( separation > B3_SPECULATIVE_DISTANCE )
+	{
+		return;
+	}
+
+	b3Vec3 point = b3MulAdd( q, 0.5f * fabsf( gap[axis] ), normal );
+	b3AddVoxelSample( sampler, point, normal, separation, id );
+}
+
+static bool b3FindAnyVoxelBoxCallback( int cell, int box, b3AABB bounds, void* context )
+{
+	B3_UNUSED( cell, box, bounds );
+	*(bool*)context = true;
+	return false;
+}
+
+static bool b3SampleVoxelBoxCallback( int cell, int box, b3AABB bounds, void* context )
+{
+	b3VoxelSampler* sampler = context;
+	const b3VoxelGrid* self = sampler->self;
+
+	// Only a box the other grid has boxes near is sampled
+	b3AABB boundsInOther = b3AABB_Transform( sampler->selfToOther, bounds );
+	if ( b3AABB_Overlaps( boundsInOther, sampler->otherBounds ) == false )
+	{
+		return true;
+	}
+
+	boundsInOther.lowerBound = b3Sub( boundsInOther.lowerBound, ( b3Vec3 ){ B3_SPECULATIVE_DISTANCE, B3_SPECULATIVE_DISTANCE, B3_SPECULATIVE_DISTANCE } );
+	boundsInOther.upperBound = b3Add( boundsInOther.upperBound, ( b3Vec3 ){ B3_SPECULATIVE_DISTANCE, B3_SPECULATIVE_DISTANCE, B3_SPECULATIVE_DISTANCE } );
+	bool near = false;
+	b3QueryVoxelGrid( sampler->other, boundsInOther, b3FindAnyVoxelBoxCallback, &near );
+	if ( near == false )
+	{
+		return true;
+	}
+
+	uint8_t covered = b3GetVoxelBoxCoveredFaces( self, cell, box );
+	if ( covered == 0x3f )
+	{
+		return true;
+	}
+
+	float voxel = self->cellMeters / (float)self->cellVoxels;
+	float invVoxel = 1.0f / voxel;
+	float inset = 0.05f * voxel;
+	int key = b3VoxelGridKey( self, cell, box );
+	const float low[3] = { bounds.lowerBound.x, bounds.lowerBound.y, bounds.lowerBound.z };
+	const float high[3] = { bounds.upperBound.x, bounds.upperBound.y, bounds.upperBound.z };
+
+	for ( int face = 0; face < 6; ++face )
+	{
+		if ( covered & ( 1 << face ) )
+		{
+			continue;
+		}
+
+		int axis = face >> 1;
+		float sign = ( face & 1 ) ? 1.0f : -1.0f;
+		int ua = ( axis + 1 ) % 3, va = ( axis + 2 ) % 3;
+		float plane = ( face & 1 ) ? high[axis] : low[axis];
+		float n[3] = { 0.0f, 0.0f, 0.0f };
+		n[axis] = sign;
+		b3Vec3 faceNormal = { n[0], n[1], n[2] };
+
+		float us[3] = { low[ua] + inset, 0.5f * ( low[ua] + high[ua] ), high[ua] - inset };
+		float vs[3] = { low[va] + inset, 0.5f * ( low[va] + high[va] ), high[va] - inset };
+		for ( int iv = 0; iv < 3; ++iv )
+		{
+			for ( int iu = 0; iu < 3; ++iu )
+			{
+				float s[3];
+				s[axis] = plane;
+				s[ua] = us[iu];
+				s[va] = vs[iv];
+
+				// A sample whose outside neighbour is solid in its own grid is on an internal seam
+				float outside[3] = { s[0], s[1], s[2] };
+				outside[axis] += 0.5f * sign * voxel;
+				int w[3];
+				b3VoxelCoordinates( self, invVoxel, ( b3Vec3 ){ outside[0], outside[1], outside[2] }, w );
+				if ( b3IsVoxelSolid( self, w[0], w[1], w[2], true ) )
+				{
+					continue;
+				}
+
+				s[axis] -= sign * inset;
+				int id = b3VoxelSampleHash( sampler->selfIsB ? 1 : 0, key, face * 9 + iv * 3 + iu );
+				b3SampleVoxelPoint( sampler, ( b3Vec3 ){ s[0], s[1], s[2] }, faceNormal, id );
+			}
+		}
+	}
+	return true;
+}
+
+static bool b3ComputeVoxelGridSampledManifolds( b3World* world, int workerIndex, b3Contact* contact, const b3Shape* shapeA,
+												b3WorldTransform xfA, const b3Shape* shapeB, b3WorldTransform xfB, b3Arena arena )
+{
+	const b3VoxelGrid* gridA = shapeA->voxelGrid;
+	const b3VoxelGrid* gridB = shapeB->voxelGrid;
+	b3TaskContext* context = b3Array_Get( world->taskContexts, workerIndex );
+	b3MeshContact* meshContact = &contact->meshContact;
+
+	// No box pair caches on this path
+	b3Array_Resize( meshContact->triangleCache, 0 );
+
+	b3Transform transformBtoA = b3InvMulWorldTransforms( xfA, xfB );
+	b3Transform transformAtoB = b3InvMulWorldTransforms( xfB, xfA );
+
+	float margin = 2.0f * B3_SPECULATIVE_DISTANCE;
+	b3AABB region = { b3Max( shapeA->aabb.lowerBound, shapeB->aabb.lowerBound ),
+					  b3Min( shapeA->aabb.upperBound, shapeB->aabb.upperBound ) };
+	bool overlap = region.lowerBound.x <= region.upperBound.x && region.lowerBound.y <= region.upperBound.y &&
+				   region.lowerBound.z <= region.upperBound.z;
+
+	b3LocalManifoldPoint* points = b3Bump( &arena, B3_MAX_VOXEL_SAMPLE_POINTS * (int)sizeof( b3LocalManifoldPoint ) );
+	b3Vec3* normals = b3Bump( &arena, B3_MAX_VOXEL_SAMPLE_POINTS * (int)sizeof( b3Vec3 ) );
+	int countA = 0;
+	int totalSamples = 0;
+	bool overflowed = false;
+
+	if ( overlap )
+	{
+		region.lowerBound = b3Sub( region.lowerBound, ( b3Vec3 ){ margin, margin, margin } );
+		region.upperBound = b3Add( region.upperBound, ( b3Vec3 ){ margin, margin, margin } );
+		b3Vec3 grow = { B3_SPECULATIVE_DISTANCE, B3_SPECULATIVE_DISTANCE, B3_SPECULATIVE_DISTANCE };
+
+		// A's faces against B, giving points in frame B with the normal from A to B
+		b3VoxelSampler sampler = { 0 };
+		sampler.self = gridA;
+		sampler.other = gridB;
+		sampler.selfToOther = transformAtoB;
+		sampler.otherBounds = (b3AABB){ b3Sub( gridB->occupiedBounds.lowerBound, grow ), b3Add( gridB->occupiedBounds.upperBound, grow ) };
+		sampler.selfIsB = false;
+		sampler.points = points;
+		sampler.normals = normals;
+		sampler.capacity = B3_MAX_VOXEL_SAMPLE_POINTS;
+
+		b3Transform gridTransformA = b3ToRelativeTransform( xfA, b3Pos_zero );
+		b3Transform gridTransformB = b3ToRelativeTransform( xfB, b3Pos_zero );
+
+		// Each side samples only where the other has boxes
+		b3AABB occupiedA = b3AABB_Transform( gridTransformA, gridA->occupiedBounds );
+		b3AABB occupiedB = b3AABB_Transform( gridTransformB, gridB->occupiedBounds );
+		b3AABB regionForA = { b3Max( region.lowerBound, b3Sub( occupiedB.lowerBound, grow ) ), b3Min( region.upperBound, b3Add( occupiedB.upperBound, grow ) ) };
+		b3AABB regionForB = { b3Max( region.lowerBound, b3Sub( occupiedA.lowerBound, grow ) ), b3Min( region.upperBound, b3Add( occupiedA.upperBound, grow ) ) };
+		bool sampleA = regionForA.lowerBound.x <= regionForA.upperBound.x && regionForA.lowerBound.y <= regionForA.upperBound.y &&
+					   regionForA.lowerBound.z <= regionForA.upperBound.z;
+		bool sampleB = regionForB.lowerBound.x <= regionForB.upperBound.x && regionForB.lowerBound.y <= regionForB.upperBound.y &&
+					   regionForB.lowerBound.z <= regionForB.upperBound.z;
+
+		if ( sampleA )
+		{
+			b3QueryVoxelGrid( gridA, b3AABB_Transform( b3InvertTransform( gridTransformA ), regionForA ), b3SampleVoxelBoxCallback, &sampler );
+		}
+		countA = sampler.count;
+		totalSamples += sampler.sampleCount;
+		overflowed = sampler.overflowed;
+
+		// B's faces against A, in frame A with the normal from B to A, flipped below. They share the buffer.
+		b3VoxelSampler samplerB = { 0 };
+		samplerB.self = gridB;
+		samplerB.other = gridA;
+		samplerB.selfToOther = transformBtoA;
+		samplerB.otherBounds = (b3AABB){ b3Sub( gridA->occupiedBounds.lowerBound, grow ), b3Add( gridA->occupiedBounds.upperBound, grow ) };
+		samplerB.selfIsB = true;
+		samplerB.points = points + countA;
+		samplerB.normals = normals + countA;
+		samplerB.capacity = B3_MAX_VOXEL_SAMPLE_POINTS - countA;
+
+		if ( samplerB.capacity > 0 && sampleB )
+		{
+			b3QueryVoxelGrid( gridB, b3AABB_Transform( b3InvertTransform( gridTransformB ), regionForB ), b3SampleVoxelBoxCallback, &samplerB );
+		}
+
+		for ( int i = 0; i < samplerB.count; ++i )
+		{
+			b3LocalManifoldPoint* mp = points + countA + i;
+			mp->point = b3TransformPoint( transformAtoB, mp->point );
+			normals[countA + i] = b3Neg( b3RotateVector( transformAtoB.q, normals[countA + i] ) );
+		}
+
+		countA += samplerB.count;
+		totalSamples += samplerB.sampleCount;
+		overflowed = overflowed || samplerB.overflowed;
+	}
+
+	if ( overflowed )
+	{
+		static bool s_once = false;
+		if ( s_once == false )
+		{
+			b3Log( "WARNING: dense voxel grid contact, sample point capacity of %d reached", B3_MAX_VOXEL_SAMPLE_POINTS );
+			s_once = true;
+		}
+	}
+
+	int pointCount = countA;
+	context->voxelGridPairCount += 1;
+	context->voxelSampleCount += totalSamples;
+	context->voxelPointCount += pointCount;
+
+	b3LocalManifold** acceptedManifolds = b3Bump( &arena, ( pointCount + 1 ) * (int)sizeof( b3LocalManifold* ) );
+	b3LocalManifold* manifoldBuffer = b3Bump( &arena, ( pointCount + 1 ) * (int)sizeof( b3LocalManifold ) );
+	for ( int i = 0; i < pointCount; ++i )
+	{
+		context->voxelMinSeparation = b3MinFloat( context->voxelMinSeparation, points[i].separation );
+
+		b3LocalManifold* accepted = manifoldBuffer + i;
+		*accepted = (b3LocalManifold){ 0 };
+		accepted->points = points + i;
+		accepted->pointCount = 1;
+		accepted->normal = normals[i];
+		accepted->triangleNormal = normals[i];
+		accepted->triangleIndex = points[i].triangleIndex;
+		accepted->feature = b3_featureHullFace;
+		acceptedManifolds[i] = accepted;
+	}
+
+	if ( b3BuildClusterManifolds( world, contact, acceptedManifolds, pointCount, xfA, xfB, 0.0f, arena ) == false )
+	{
+		return false;
+	}
+
+	const b3SurfaceMaterial* materialA = b3GetShapeMaterials( shapeA );
+	const b3SurfaceMaterial* materialB = b3GetShapeMaterials( shapeB );
+	contact->friction =
+		world->frictionCallback( materialA->friction, materialA->userMaterialId, materialB->friction, materialB->userMaterialId );
+	contact->restitution = world->restitutionCallback( materialA->restitution, materialA->userMaterialId, materialB->restitution,
+													   materialB->userMaterialId );
+	contact->rollingResistance = 0.0f;
+
+	b3Vec3 tangentVelocityA = b3RotateVector( xfA.q, materialA->tangentVelocity );
+	b3Vec3 tangentVelocityB = b3RotateVector( xfB.q, materialB->tangentVelocity );
+	contact->tangentVelocity = b3Sub( tangentVelocityA, tangentVelocityB );
+	return true;
+}
+
 static bool b3ComputeVoxelGridPairManifolds( b3World* world, int workerIndex, b3Contact* contact, const b3Shape* shapeA,
 											 b3WorldTransform xfA, const b3Shape* shapeB, b3WorldTransform xfB, bool isFast,
 											 b3Arena arena )
 {
 	B3_ASSERT( shapeA->type == b3_voxelGridShape && shapeB->type == b3_voxelGridShape );
+
+	if ( world->enableVoxelPointContacts )
+	{
+		return b3ComputeVoxelGridSampledManifolds( world, workerIndex, contact, shapeA, xfA, shapeB, xfB, arena );
+	}
 
 	const b3VoxelGrid* gridA = shapeA->voxelGrid;
 	const b3VoxelGrid* gridB = shapeB->voxelGrid;
@@ -2136,6 +2594,17 @@ static bool b3ComputeVoxelGridPairManifolds( b3World* world, int workerIndex, b3
 		}
 
 		acceptedManifolds[acceptedManifoldCount++] = accepted;
+	}
+
+	// Terra: the same counters as the sampled path, for comparison
+	context->voxelGridPairCount += 1;
+	for ( int i = 0; i < acceptedManifoldCount; ++i )
+	{
+		context->voxelPointCount += acceptedManifolds[i]->pointCount;
+		for ( int j = 0; j < acceptedManifolds[i]->pointCount; ++j )
+		{
+			context->voxelMinSeparation = b3MinFloat( context->voxelMinSeparation, acceptedManifolds[i]->points[j].separation );
+		}
 	}
 
 	// Save the cache, still ascending by hash

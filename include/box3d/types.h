@@ -604,6 +604,13 @@ typedef struct b3Counters
 	int distanceIterations;
 	int pushBackIterations;
 	int rootIterations;
+
+	/// Terra: voxel grid against voxel grid contacts in the most recent step: the grid pairs collided, the surface samples
+	/// tested and the contact points they gave (before reduction), and the least separation of those points (FLT_MAX when none).
+	int voxelGridPairCount;
+	int voxelSampleCount;
+	int voxelPointCount;
+	float voxelMinSeparation;
 } b3Counters;
 //! @endcond
 

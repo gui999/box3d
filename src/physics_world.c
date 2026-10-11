@@ -355,6 +355,8 @@ b3WorldId b3CreateWorld( const b3WorldDef* def )
 	world->enableWarmStarting = true;
 	world->enableContinuous = def->enableContinuous;
 	world->enableLimitPassThrough = true;
+	world->enableVoxelPointContacts = false;
+	world->voxelMinSeparation = FLT_MAX;
 	world->enableSpeculative = true;
 	world->userTreeTask = NULL;
 	world->userData = def->userData;
@@ -881,6 +883,10 @@ static void b3Collide( b3StepContext* context )
 		b3TaskContext* taskContext = world->taskContexts.data + i;
 		b3SetBitCountAndClear( &taskContext->contactStateBitSet, contactIdCapacity );
 		taskContext->satCallCount = 0;
+		taskContext->voxelSampleCount = 0;
+		taskContext->voxelPointCount = 0;
+		taskContext->voxelGridPairCount = 0;
+		taskContext->voxelMinSeparation = FLT_MAX;
 		taskContext->satCacheHitCount = 0;
 		taskContext->recycledContactCount = 0;
 		memset( taskContext->manifoldCounts, 0, sizeof( taskContext->manifoldCounts ) );
@@ -904,6 +910,10 @@ static void b3Collide( b3StepContext* context )
 	b3BitSet* bitSet = &world->taskContexts.data[0].contactStateBitSet;
 	world->satCallCount = satMultiplier * world->taskContexts.data[0].satCallCount;
 	world->satCacheHitCount = satMultiplier * world->taskContexts.data[0].satCacheHitCount;
+	world->voxelSampleCount = world->taskContexts.data[0].voxelSampleCount;
+	world->voxelPointCount = world->taskContexts.data[0].voxelPointCount;
+	world->voxelGridPairCount = world->taskContexts.data[0].voxelGridPairCount;
+	world->voxelMinSeparation = world->taskContexts.data[0].voxelMinSeparation;
 	memcpy( world->manifoldCounts, world->taskContexts.data[0].manifoldCounts,
 			B3_CONTACT_MANIFOLD_COUNT_BUCKETS * sizeof( int ) );
 
@@ -912,6 +922,10 @@ static void b3Collide( b3StepContext* context )
 		b3InPlaceUnion( bitSet, &world->taskContexts.data[i].contactStateBitSet );
 		world->satCallCount += world->taskContexts.data[i].satCallCount;
 		world->satCacheHitCount += world->taskContexts.data[i].satCacheHitCount;
+		world->voxelSampleCount += world->taskContexts.data[i].voxelSampleCount;
+		world->voxelPointCount += world->taskContexts.data[i].voxelPointCount;
+		world->voxelGridPairCount += world->taskContexts.data[i].voxelGridPairCount;
+		world->voxelMinSeparation = b3MinFloat( world->voxelMinSeparation, world->taskContexts.data[i].voxelMinSeparation );
 		for ( int j = 0; j < B3_CONTACT_MANIFOLD_COUNT_BUCKETS; ++j )
 		{
 			world->manifoldCounts[j] += world->taskContexts.data[i].manifoldCounts[j];
@@ -2066,6 +2080,23 @@ void b3World_EnableLimitPassThrough( b3WorldId worldId, bool flag )
 	world->enableLimitPassThrough = flag;
 }
 
+void b3World_EnableVoxelPointContacts( b3WorldId worldId, bool flag )
+{
+	b3World* world = b3GetUnlockedWorldFromId( worldId );
+	if ( world == NULL )
+	{
+		return;
+	}
+
+	world->enableVoxelPointContacts = flag;
+}
+
+bool b3World_IsVoxelPointContactsEnabled( b3WorldId worldId )
+{
+	b3World* world = b3GetWorldFromId( worldId );
+	return world != NULL && world->enableVoxelPointContacts;
+}
+
 bool b3World_IsContinuousEnabled( b3WorldId worldId )
 {
 	b3World* world = b3GetWorldFromId( worldId );
@@ -2200,6 +2231,10 @@ b3Counters b3World_GetCounters( b3WorldId worldId )
 
 	s.satCallCount = world->satCallCount;
 	s.satCacheHitCount = world->satCacheHitCount;
+	s.voxelGridPairCount = world->voxelGridPairCount;
+	s.voxelSampleCount = world->voxelSampleCount;
+	s.voxelPointCount = world->voxelPointCount;
+	s.voxelMinSeparation = world->voxelMinSeparation;
 	memcpy( s.manifoldCounts, world->manifoldCounts, B3_CONTACT_MANIFOLD_COUNT_BUCKETS * sizeof( int ) );
 	s.stackUsed = world->stack.maxAllocation;
 	s.byteCount = b3GetByteCount();

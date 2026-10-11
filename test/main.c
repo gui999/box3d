@@ -51,6 +51,7 @@ extern int ShapeTest( void );
 extern int TableTest( void );
 extern int VoxelGridCostTest( void );
 extern int VoxelGridTest( void );
+extern int VoxelPointBench( void );
 extern int WorldTest( void );
 
 // Filter-aware test runner: skips tests that don't match the filter
@@ -107,6 +108,12 @@ int main( int argc, char** argv )
 	if ( filter != NULL && strcmp( filter, "ContentionBench" ) == 0 )
 	{
 		RUN_TEST( ContentionBench );
+	}
+
+	// Terra: voxel grid pair contacts, box pairs against point samples, only on request.
+	if ( filter != NULL && strcmp( filter, "VoxelPointBench" ) == 0 )
+	{
+		RUN_TEST( VoxelPointBench );
 	}
 
 	MAYBE_RUN_TEST( AllocatorTest );

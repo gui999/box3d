@@ -29,6 +29,7 @@ set(BOX3D_TEST_FILES
     test_table.c
     test_voxel_cost.c
     test_voxel_grid.c
+    test_voxel_point_contacts.c
     test_world.c
 )
 
