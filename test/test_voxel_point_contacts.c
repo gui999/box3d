@@ -386,6 +386,7 @@ static int SeamTowerCase( bool points, int cellsX, int storeys, float drop, floa
 
 static int RunAll( bool points )
 {
+	ENSURE( SeamTowerCase( points, 8, 20, -0.3f, 0.03f, "seam tower starts 0.3 m embedded" ) == 0 );
 	ENSURE( SeamTowerCase( points, 8, 20, 0.0f, 0.0f, "seam tower 8x20x8 at rest" ) == 0 );
 	ENSURE( SeamTowerCase( points, 8, 20, 0.0f, 0.03f, "seam tower turned at rest" ) == 0 );
 	ENSURE( SeamTowerCase( points, 8, 20, 3.0f, 0.03f, "seam tower turned drop 3 m" ) == 0 );

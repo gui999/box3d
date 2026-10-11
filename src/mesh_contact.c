@@ -1957,9 +1957,9 @@ static void b3CollideVoxelBoxes( b3LocalManifold* manifold, int capacity, const 
 // and centre, inset a little), and each sample is tested against the other grid's voxel occupancy. A sample whose outside
 // neighbour voxel is solid in its own grid lies on an internal seam and is skipped. A sample inside a solid voxel of the other
 // grid walks that grid's six axes to the nearest empty voxel (up to B3_VOXEL_SAMPLE_WALK_METERS): the shortest exit gives the
-// depth and the normal. A sample whose exit would push the other grid back into the sampled face (that face went through a
-// thin wall, or is the far face of a thin plate inside a block) or that finds no exit gives nothing: the touching faces'
-// samples answer. A sample in empty space probes one speculative distance along its face's outward
+// depth and the normal. A sample whose normal is more than 60 degrees from its face's outward direction (a side face that
+// sank, a face that went through a thin wall, the far face of a thin plate inside a block) or that finds no exit gives
+// nothing: the touching faces' samples answer. A sample in empty space probes one speculative distance along its face's outward
 // direction and gives a speculative point on the voxel it finds. Normals are axes of the grid sampled against, so the points
 // cluster into at most twelve flat manifolds (six per grid frame), each reduced to four points by the shared clustering.
 // A point's id is a hash of its side, box key and sample, so impulses carry over while a body rests.
@@ -1969,6 +1969,10 @@ static void b3CollideVoxelBoxes( b3LocalManifold* manifold, int capacity, const 
 
 // How far a sample inside the other grid looks for the surface
 #define B3_VOXEL_SAMPLE_WALK_METERS 1.0f
+
+// A sample answers only along normals within 60 degrees of its face's outward direction: a side face that sank into the
+// other grid, or a thin slab's face, would otherwise take a short exit across itself and push the wrong way
+#define B3_VOXEL_SAMPLE_MIN_FACING 0.5f
 
 typedef struct b3VoxelSampler
 {
@@ -2120,7 +2124,7 @@ static void b3SampleVoxelPoint( b3VoxelSampler* sampler, b3Vec3 p, b3Vec3 faceNo
 		float n[3] = { 0.0f, 0.0f, 0.0f };
 		n[bestAxis] = -(float)bestSign;
 		b3Vec3 normal = { n[0], n[1], n[2] };
-		if ( b3Dot( normal, outward ) < -0.1f )
+		if ( b3Dot( normal, outward ) < B3_VOXEL_SAMPLE_MIN_FACING )
 		{
 			return;
 		}
@@ -2158,7 +2162,7 @@ static void b3SampleVoxelPoint( b3VoxelSampler* sampler, b3Vec3 p, b3Vec3 faceNo
 	float n[3] = { 0.0f, 0.0f, 0.0f };
 	n[axis] = gap[axis] >= 0.0f ? 1.0f : -1.0f;
 	b3Vec3 normal = { n[0], n[1], n[2] };
-	if ( b3Dot( normal, outward ) < -0.1f )
+	if ( b3Dot( normal, outward ) < B3_VOXEL_SAMPLE_MIN_FACING )
 	{
 		return;
 	}
