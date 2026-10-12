@@ -250,6 +250,13 @@ void b3RetainVoxelGridModule( b3VoxelGridModule* module )
 	b3AtomicFetchAddInt( &module->refCount, 1 );
 }
 
+void b3VoxelGridModule_SetCoveredFaces( b3VoxelGridModule* module, const uint8_t* faces, int count )
+{
+	B3_ASSERT( module != NULL && module->refCount.value == 1 && count == module->boxCount );
+	memcpy( module->coveredFaces, faces, (size_t)count );
+	memset( module->boundaryFaces, 0, (size_t)count );
+}
+
 void b3ReleaseVoxelGridModule( b3VoxelGridModule* module )
 {
 	if ( module == NULL )
@@ -311,6 +318,7 @@ static void b3RecomputeOccupiedBounds( b3VoxelGrid* grid )
 
 b3VoxelGrid* b3CreateVoxelGrid( const b3VoxelGridDef* def )
 {
+	if ( def->occupancy != NULL && def->occupancy->occupancy != NULL ) return NULL;
 	if ( def->cellCountX < 1 || def->cellCountY < 1 || def->cellCountZ < 1 || def->cellVoxels < 1 || def->cellVoxels > 32 ||
 		 b3IsValidFloat( def->cellMeters ) == false || def->cellMeters <= 0.0f || b3IsValidVec3( def->origin ) == false )
 	{
@@ -392,6 +400,8 @@ b3VoxelGrid* b3CreateVoxelGrid( const b3VoxelGridDef* def )
 		grid->modules[i] = def->modules[i];
 	}
 	grid->moduleCount = def->moduleCount;
+	grid->occupancy = def->occupancy;
+	if ( grid->occupancy != NULL ) b3RetainVoxelGrid( grid->occupancy );
 
 	b3RecomputeOccupiedBounds( grid );
 	return grid;
@@ -413,6 +423,7 @@ void b3ReleaseVoxelGrid( b3VoxelGrid* grid )
 	B3_ASSERT( previous >= 1 );
 	if ( previous == 1 )
 	{
+		b3ReleaseVoxelGrid( grid->occupancy );
 		for ( int i = 0; i < grid->moduleCount; ++i )
 		{
 			b3ReleaseVoxelGridModule( grid->modules[i] );

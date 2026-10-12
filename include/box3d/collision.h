@@ -729,6 +729,8 @@ typedef struct b3VoxelGridDef
 	/// an empty cell, laid out as ( ( j + 1 ) * ( cellCountZ + 2 ) + ( k + 1 ) ) * ( cellCountX + 2 ) + ( i + 1 ) for cell
 	/// (i, j, k). May be NULL for an empty grid.
 	const int* paddedCells;
+	/// Optional exact occupancy for whole-body merged boxes. Retained; must not itself name an occupancy grid.
+	b3VoxelGrid* occupancy;
 } b3VoxelGridDef;
 
 /// Derive a module from boxes. boxes holds boxCount * 6 floats: minimum x y z then maximum x y z of each box in meters in
@@ -750,6 +752,9 @@ B3_API int b3VoxelGridModule_GetBoxCount( const b3VoxelGridModule* module );
 
 /// Get a module's boxes (minimum xyz, maximum xyz per box, cell frame).
 B3_API const float* b3VoxelGridModule_GetBoxes( const b3VoxelGridModule* module );
+
+/// Override face coverage on an exclusively owned module before placing it into a grid.
+B3_API void b3VoxelGridModule_SetCoveredFaces( b3VoxelGridModule* module, const uint8_t* faces, int count );
 
 /// Create a grid. Returns NULL for an invalid definition. The result has a reference count of one, owned by the caller.
 B3_API b3VoxelGrid* b3CreateVoxelGrid( const b3VoxelGridDef* def );

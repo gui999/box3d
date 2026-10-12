@@ -2058,7 +2058,7 @@ static inline void b3VoxelCoordinates( const b3VoxelGrid* grid, float invVoxel, 
 // point goes in the frame of other with the normal from self to other.
 static void b3SampleVoxelPoint( b3VoxelSampler* sampler, b3Vec3 p, b3Vec3 faceNormal, int id )
 {
-	const b3VoxelGrid* other = sampler->other;
+	const b3VoxelGrid* other = b3VoxelGridOccupancy( sampler->other );
 	float voxel = other->cellMeters / (float)other->cellVoxels;
 	float invVoxel = 1.0f / voxel;
 
@@ -2211,7 +2211,8 @@ static bool b3SampleVoxelBoxCallback( int cell, int box, b3AABB bounds, void* co
 		return true;
 	}
 
-	float voxel = self->cellMeters / (float)self->cellVoxels;
+	const b3VoxelGrid* occupancy = b3VoxelGridOccupancy( self );
+	float voxel = occupancy->cellMeters / (float)occupancy->cellVoxels;
 	float invVoxel = 1.0f / voxel;
 	float inset = 0.05f * voxel;
 	int key = b3VoxelGridKey( self, cell, box );
@@ -2248,8 +2249,8 @@ static bool b3SampleVoxelBoxCallback( int cell, int box, b3AABB bounds, void* co
 				float outside[3] = { s[0], s[1], s[2] };
 				outside[axis] += 0.5f * sign * voxel;
 				int w[3];
-				b3VoxelCoordinates( self, invVoxel, ( b3Vec3 ){ outside[0], outside[1], outside[2] }, w );
-				if ( b3IsVoxelSolid( self, w[0], w[1], w[2], true ) )
+				b3VoxelCoordinates( occupancy, invVoxel, ( b3Vec3 ){ outside[0], outside[1], outside[2] }, w );
+				if ( b3IsVoxelSolid( occupancy, w[0], w[1], w[2], true ) )
 				{
 					continue;
 				}

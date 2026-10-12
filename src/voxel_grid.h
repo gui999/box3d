@@ -76,7 +76,14 @@ struct b3VoxelGrid
 	int moduleCount;
 	int moduleCapacity;
 	b3VoxelGridModule** modules;
+	// Separate exact occupancy when geometry is merged across all storage pages.
+	b3VoxelGrid* occupancy;
 };
+
+static inline const b3VoxelGrid* b3VoxelGridOccupancy( const b3VoxelGrid* grid )
+{
+	return grid->occupancy != NULL ? grid->occupancy : grid;
+}
 
 static inline int b3VoxelGridPaddedIndex( const b3VoxelGrid* grid, int i, int j, int k )
 {

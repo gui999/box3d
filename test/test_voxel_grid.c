@@ -1578,8 +1578,59 @@ static int VoxelGridShardEdit( void )
 	return 0;
 }
 
+static int VoxelGridMergedBodyOccupancyAndRest( void )
+{
+	World world;
+	CreateWorld( &world, 4, 0.6f );
+	b3World_EnableVoxelPointContacts( world.worldId, true );
+	Floor source;
+	ENSURE( MakeFloor( &source, 4, -1, -1, -1 ) );
+	float boxes[6] = { 0, 0, 0, 8, SLAB_HEIGHT, 8 };
+	b3VoxelGridModule* module = b3CreateVoxelGridModule( boxes, 1, 8, CELL_VOXELS );
+	ENSURE( module != NULL );
+	uint8_t faces[1] = { 0 };
+	b3VoxelGridModule_SetCoveredFaces( module, faces, 1 );
+	int padded[27];
+	for ( int i = 0; i < 27; ++i ) padded[i] = -1;
+	padded[13] = 0;
+	b3VoxelGridDef def = { 0 };
+	def.cellCountX = def.cellCountY = def.cellCountZ = 1;
+	def.cellMeters = 8;
+	def.cellVoxels = CELL_VOXELS;
+	def.maxBoxesPerCell = 1;
+	def.modules = &module;
+	def.moduleCount = 1;
+	def.paddedCells = padded;
+	def.occupancy = source.grid;
+	b3VoxelGrid* merged = b3CreateVoxelGrid( &def );
+	ENSURE( merged != NULL );
+	ENSURE( source.grid->refCount.value == 2 );
+	const b3VoxelGrid* occupancy = b3VoxelGridOccupancy( merged );
+	ENSURE_SMALL( occupancy->cellMeters / occupancy->cellVoxels - 0.1f, 1e-6f );
+	ENSURE( b3IsVoxelSolid( occupancy, 79, 3, 79, false ) );
+	ENSURE( !b3IsVoxelSolid( occupancy, 79, 4, 79, false ) );
+	ENSURE_SMALL( b3ComputeVoxelGridMass( merged, 1900 ).mass - b3ComputeVoxelGridMass( source.grid, 1900 ).mass, 0.1f );
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	bodyDef.position = (b3Vec3){ 0, 1.4f, 0 };
+	b3BodyId body = b3CreateBody( world.worldId, &bodyDef );
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	shapeDef.density = 1900;
+	ENSURE( B3_IS_NON_NULL( b3CreateVoxelGridShape( body, &shapeDef, merged ) ) );
+	for ( int i = 0; i < 600; ++i ) b3World_Step( world.worldId, 1.0f / 60.0f, 4 );
+	ENSURE_SMALL( b3Body_GetPosition( body ).y - SLAB_HEIGHT, 0.02f );
+	ENSURE( !b3Body_IsAwake( body ) );
+	b3ReleaseVoxelGrid( merged );
+	b3ReleaseVoxelGridModule( module );
+	DestroyWorld( &world );
+	ENSURE( source.grid->refCount.value == 1 );
+	DestroyFloor( &source );
+	return 0;
+}
+
 int VoxelGridTest( void )
 {
+	RUN_SUBTEST( VoxelGridMergedBodyOccupancyAndRest );
 	RUN_SUBTEST( VoxelGridModuleCover );
 	RUN_SUBTEST( VoxelGridRayCast );
 	RUN_SUBTEST( VoxelGridExposedFaces );
