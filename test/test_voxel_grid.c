@@ -505,6 +505,266 @@ static float StepAndSumNormalImpulse( b3WorldId worldId, b3BodyId bodyId, float 
 	return sum;
 }
 
+// Two authored grid members belong to one standing target. Adjacent members exercise simultaneous
+// scalar constraints; stacked members let CCD encounter a member that had no solver contact.
+typedef struct ImpulseBudgetTarget
+{
+	b3BodyId bodyId;
+	b3ShapeId shapeIds[2];
+	b3VoxelGrid* grids[2];
+	b3VoxelGridModule* module;
+} ImpulseBudgetTarget;
+
+static bool MakeImpulseBudgetTarget( b3WorldId worldId, ImpulseBudgetTarget* target, bool stacked )
+{
+	memset( target, 0, sizeof( *target ) );
+	float box[6] = { 0.0f, 0.0f, 0.0f, stacked ? 2.0f : 1.0f, 0.2f, 2.0f };
+	target->module = b3CreateVoxelGridModule( box, 1, CELL_METERS, CELL_VOXELS );
+	if ( target->module == NULL )
+	{
+		return false;
+	}
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	target->bodyId = b3CreateBody( worldId, &bodyDef );
+	int padded[27];
+	for ( int i = 0; i < 27; ++i )
+	{
+		padded[i] = -1;
+	}
+	padded[13] = 0;
+	for ( int i = 0; i < 2; ++i )
+	{
+		b3VoxelGridDef gridDef = { 0 };
+		gridDef.cellCountX = gridDef.cellCountY = gridDef.cellCountZ = 1;
+		gridDef.cellMeters = CELL_METERS;
+		gridDef.cellVoxels = CELL_VOXELS;
+		gridDef.origin = (b3Vec3){ stacked ? -1.0f : -1.0f + (float)i, -0.2f - ( stacked ? 0.5f * (float)i : 0.0f ), -1.0f };
+		gridDef.maxBoxesPerCell = 1;
+		gridDef.modules = &target->module;
+		gridDef.moduleCount = 1;
+		gridDef.paddedCells = padded;
+		target->grids[i] = b3CreateVoxelGrid( &gridDef );
+		if ( target->grids[i] == NULL )
+		{
+			return false;
+		}
+		b3ShapeDef shapeDef = b3DefaultShapeDef();
+		shapeDef.baseMaterial.friction = 0.0f;
+		target->shapeIds[i] = b3CreateVoxelGridShape( target->bodyId, &shapeDef, target->grids[i] );
+		if ( B3_IS_NULL( target->shapeIds[i] ) )
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+static void DestroyImpulseBudgetTarget( ImpulseBudgetTarget* target )
+{
+	for ( int i = 0; i < 2; ++i )
+	{
+		b3ReleaseVoxelGrid( target->grids[i] );
+	}
+	b3ReleaseVoxelGridModule( target->module );
+}
+
+static b3BodyId CreateImpulseBudgetStriker( b3WorldId worldId, b3Vec3 position, float half, float speed, bool bullet )
+{
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	bodyDef.position = position;
+	bodyDef.linearVelocity = (b3Vec3){ 0.0f, -speed, 0.0f };
+	bodyDef.enableSleep = false;
+	bodyDef.isBullet = bullet;
+	b3BodyId bodyId = b3CreateBody( worldId, &bodyDef );
+	b3BoxHull box = b3MakeBoxHull( half, half, half );
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	shapeDef.density = 1.0f;
+	shapeDef.baseMaterial.friction = 0.0f;
+	b3CreateHullShape( bodyId, &shapeDef, &box.base );
+	return bodyId;
+}
+
+typedef struct TargetImpulseReadback
+{
+	float applied[2];
+	float cachedNormal;
+	int points[2];
+	int persistedPoints;
+} TargetImpulseReadback;
+
+static TargetImpulseReadback ReadTargetImpulses( b3BodyId strikerId, const ImpulseBudgetTarget* target )
+{
+	TargetImpulseReadback result = { 0 };
+	b3ContactData pairs[16];
+	int pairCount = b3Body_GetContactData( strikerId, pairs, ARRAY_COUNT( pairs ) );
+	for ( int i = 0; i < pairCount; ++i )
+	{
+		for ( int member = 0; member < 2; ++member )
+		{
+			if ( B3_ID_EQUALS( pairs[i].shapeIdA, target->shapeIds[member] ) == false &&
+				 B3_ID_EQUALS( pairs[i].shapeIdB, target->shapeIds[member] ) == false )
+			{
+				continue;
+			}
+			for ( int m = 0; m < pairs[i].manifoldCount; ++m )
+			{
+				for ( int p = 0; p < pairs[i].manifolds[m].pointCount; ++p )
+				{
+					const b3ManifoldPoint* point = pairs[i].manifolds[m].points + p;
+					result.applied[member] += point->appliedNormalImpulse;
+					result.cachedNormal += point->normalImpulse;
+					result.points[member] += 1;
+					result.persistedPoints += point->persisted ? 1 : 0;
+				}
+			}
+		}
+	}
+	return result;
+}
+
+static int BodyImpulseBudgetAcrossMembers( int strikerCount )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.gravity = b3Vec3_zero;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+	ImpulseBudgetTarget target;
+	ENSURE( MakeImpulseBudgetTarget( worldId, &target, false ) );
+	ENSURE( b3Body_GetMaxNormalImpulse( target.bodyId ) == FLT_MAX );
+	b3BodyId strikers[2];
+	for ( int i = 0; i < strikerCount; ++i )
+	{
+		strikers[i] = CreateImpulseBudgetStriker( worldId, (b3Vec3){ 0.0f, 0.255f, i == 0 ? -0.55f : 0.55f }, 0.25f, 8.0f, false );
+	}
+	float mass = b3Body_GetMass( strikers[0] );
+	float allowance = 0.5f * mass;
+	float tolerance = 1.0e-4f * allowance;
+	b3Body_SetMaxNormalImpulse( target.bodyId, allowance );
+	ENSURE( b3Body_GetMaxNormalImpulse( target.bodyId ) == allowance );
+	b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	for ( int i = 0; i < strikerCount; ++i )
+	{
+		TargetImpulseReadback readback = ReadTargetImpulses( strikers[i], &target );
+		float applied = readback.applied[0] + readback.applied[1];
+		printf( "  body allowance (%d strikers), striker %d: member points %d %d, impulse %.6f + %.6f, allowance %.6f\n",
+				strikerCount, i, readback.points[0], readback.points[1], readback.applied[0], readback.applied[1], allowance );
+		ENSURE( readback.points[0] > 0 && readback.points[1] > 0 );
+		ENSURE( applied >= 0.999f * allowance );
+		ENSURE( applied <= allowance + tolerance );
+		ENSURE_SMALL( applied - mass * ( b3Body_GetLinearVelocity( strikers[i] ).y + 8.0f ), tolerance );
+	}
+	b3DestroyWorld( worldId );
+	DestroyImpulseBudgetTarget( &target );
+	return 0;
+}
+
+static int VoxelGridBodyImpulseBudgetMembers( void )
+{
+	ENSURE( BodyImpulseBudgetAcrossMembers( 1 ) == 0 );
+	ENSURE( BodyImpulseBudgetAcrossMembers( 2 ) == 0 );
+	return 0;
+}
+
+static int VoxelGridBodyImpulseBudgetCcd( void )
+{
+	for ( int bullet = 0; bullet < 2; ++bullet )
+	{
+		b3WorldDef worldDef = b3DefaultWorldDef();
+		worldDef.gravity = b3Vec3_zero;
+		b3WorldId worldId = b3CreateWorld( &worldDef );
+		b3World_EnableLimitPassThrough( worldId, true );
+		ImpulseBudgetTarget target;
+		ENSURE( MakeImpulseBudgetTarget( worldId, &target, true ) );
+		b3BodyId exhaustingId = CreateImpulseBudgetStriker( worldId, (b3Vec3){ 0.0f, 0.105f, -0.55f }, 0.1f, 120.0f, bullet != 0 );
+		b3BodyId independentId = CreateImpulseBudgetStriker( worldId, (b3Vec3){ 0.0f, 1.1f, 0.55f }, 0.1f, 120.0f, bullet != 0 );
+		float allowance = b3Body_GetMass( exhaustingId );
+		b3Body_SetMaxNormalImpulse( target.bodyId, allowance );
+		b3World_Step( worldId, 1.0f / 60.0f, 4 );
+		TargetImpulseReadback exhausting = ReadTargetImpulses( exhaustingId, &target );
+		TargetImpulseReadback independent = ReadTargetImpulses( independentId, &target );
+		float applied = exhausting.applied[0] + exhausting.applied[1];
+		float exhaustingY = (float)b3Body_GetPosition( exhaustingId ).y;
+		float independentY = (float)b3Body_GetPosition( independentId ).y;
+		printf( "  body allowance CCD (bullet %d): exhausted impulse %.6f / %.6f, y %.4f, independent y %.4f\n",
+				bullet, applied, allowance, exhaustingY, independentY );
+		ENSURE( exhausting.points[0] > 0 && exhausting.points[1] == 0 );
+		ENSURE( applied >= 0.999f * allowance && applied <= 1.0001f * allowance );
+		// The lower member had no contact to mark. The exhausted body must pass it as well.
+		ENSURE( exhaustingY < -1.0f );
+		// This striker had no solver impulse and traverses the slab in one step unless CCD still blocks it.
+		ENSURE_SMALL( independent.applied[0] + independent.applied[1], 1.0e-4f * allowance );
+		ENSURE( independentY > 0.09f && independentY < 0.12f );
+		b3DestroyWorld( worldId );
+		DestroyImpulseBudgetTarget( &target );
+	}
+	return 0;
+}
+
+static int WarmBodyImpulseBudget( int substeps, float restitution, float* appliedOut )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.restitutionThreshold = 0.01f;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+	ImpulseBudgetTarget target;
+	ENSURE( MakeImpulseBudgetTarget( worldId, &target, false ) );
+	// Configure before contact creation: recycled warm contacts retain their mixed material.
+	for ( int i = 0; i < 2; ++i )
+	{
+		b3Shape_SetRestitution( target.shapeIds[i], restitution );
+	}
+	b3BodyId strikerId = CreateImpulseBudgetStriker( worldId, (b3Vec3){ 0.0f, 0.255f, 0.0f }, 0.25f, 0.0f, false );
+	for ( int i = 0; i < 30; ++i )
+	{
+		b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	}
+	TargetImpulseReadback warm = ReadTargetImpulses( strikerId, &target );
+	ENSURE( warm.points[0] > 0 && warm.points[1] > 0 );
+	ENSURE( warm.persistedPoints > 0 && warm.cachedNormal > 0.0f );
+	float mass = b3Body_GetMass( strikerId );
+	float allowance = 0.65f * mass;
+	float shapeAllowance = 0.25f * mass;
+	float tolerance = 1.0e-4f * allowance;
+	b3Body_SetMaxNormalImpulse( target.bodyId, allowance );
+	b3Shape_SetMaxNormalImpulse( target.shapeIds[0], shapeAllowance );
+	b3World_SetGravity( worldId, b3Vec3_zero );
+	b3Body_SetLinearVelocity( strikerId, (b3Vec3){ 0.0f, -0.5f, 0.0f } );
+	b3World_Step( worldId, 1.0f / 60.0f, substeps );
+	TargetImpulseReadback readback = ReadTargetImpulses( strikerId, &target );
+	float applied = readback.applied[0] + readback.applied[1];
+	printf( "  warm body allowance (%d substeps, restitution %.1f): member impulse %.6f / %.6f + %.6f, total %.6f / %.6f\n",
+			substeps, restitution, readback.applied[0], shapeAllowance, readback.applied[1], applied, allowance );
+	ENSURE( readback.points[0] > 0 && readback.points[1] > 0 && readback.persistedPoints > 0 );
+	ENSURE( readback.applied[0] <= shapeAllowance + tolerance );
+	ENSURE( applied <= allowance + tolerance );
+	ENSURE_SMALL( applied - mass * ( b3Body_GetLinearVelocity( strikerId ).y + 0.5f ), tolerance );
+	*appliedOut = applied;
+	b3DestroyWorld( worldId );
+	DestroyImpulseBudgetTarget( &target );
+	return 0;
+}
+
+static int VoxelGridBodyImpulseBudgetWarmRestitution( void )
+{
+	const int substeps[2] = { 4, 8 };
+	for ( int i = 0; i < ARRAY_COUNT( substeps ); ++i )
+	{
+		float inelastic, bouncing;
+		ENSURE( WarmBodyImpulseBudget( substeps[i], 0.0f, &inelastic ) == 0 );
+		ENSURE( WarmBodyImpulseBudget( substeps[i], 0.8f, &bouncing ) == 0 );
+		// A nonzero restitution setting must actually add impulse, still inside both limits.
+		ENSURE( bouncing > inelastic + 0.001f );
+	}
+	return 0;
+}
+
+int VoxelGridBodyImpulseBudgetTest( void )
+{
+	RUN_SUBTEST( VoxelGridBodyImpulseBudgetMembers );
+	RUN_SUBTEST( VoxelGridBodyImpulseBudgetCcd );
+	RUN_SUBTEST( VoxelGridBodyImpulseBudgetWarmRestitution );
+	return 0;
+}
+
 static int RestingImpulse( bool onGrid )
 {
 	World world;

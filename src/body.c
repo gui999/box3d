@@ -19,6 +19,7 @@
 #include "box3d/box3d.h"
 #include "box3d/id.h"
 
+#include <float.h>
 #include <stddef.h>
 
 // Get a validated body from a world using an id.
@@ -281,6 +282,7 @@ b3BodyId b3CreateBody( b3WorldId worldId, const b3BodyDef* def )
 	body->bodyMoveIndex = B3_NULL_INDEX;
 	body->id = bodyId;
 	body->sleepThreshold = def->sleepThreshold;
+	body->maxNormalImpulse = FLT_MAX;
 	body->sleepTime = 0.0f;
 	body->sleepVelocity = 0.0f;
 	body->mass = 0.0f;
@@ -1987,6 +1989,26 @@ void b3Body_SetSleepThreshold( b3BodyId bodyId, float sleepThreshold )
 
 	b3Body* body = b3GetBodyFullId( world, bodyId );
 	body->sleepThreshold = sleepThreshold;
+}
+
+void b3Body_SetMaxNormalImpulse( b3BodyId bodyId, float maxNormalImpulse )
+{
+	B3_ASSERT( b3IsValidFloat( maxNormalImpulse ) && maxNormalImpulse >= 0.0f );
+	b3World* world = b3GetUnlockedWorld( bodyId.world0 );
+	if ( world == NULL )
+	{
+		return;
+	}
+	B3_REC( world, BodySetMaxNormalImpulse, bodyId, maxNormalImpulse );
+	b3Body* body = b3GetBodyFullId( world, bodyId );
+	body->maxNormalImpulse = maxNormalImpulse;
+}
+
+float b3Body_GetMaxNormalImpulse( b3BodyId bodyId )
+{
+	b3World* world = b3GetWorld( bodyId.world0 );
+	b3Body* body = b3GetBodyFullId( world, bodyId );
+	return body->maxNormalImpulse;
 }
 
 float b3Body_GetSleepThreshold( b3BodyId bodyId )

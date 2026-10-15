@@ -938,6 +938,11 @@ static void b3RecDispatch_BodySetSleepThreshold( const b3RecArgs_BodySetSleepThr
 	b3Body_SetSleepThreshold( b3RecMakeBodyId( rdr, a->body ), a->threshold );
 }
 
+static void b3RecDispatch_BodySetMaxNormalImpulse( const b3RecArgs_BodySetMaxNormalImpulse* a, b3RecReader* rdr )
+{
+	b3Body_SetMaxNormalImpulse( b3RecMakeBodyId( rdr, a->body ), a->impulse );
+}
+
 static void b3RecDispatch_BodyDisable( const b3RecArgs_BodyDisable* a, b3RecReader* rdr )
 {
 	b3Body_Disable( b3RecMakeBodyId( rdr, a->body ) );

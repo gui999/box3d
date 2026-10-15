@@ -50,6 +50,7 @@ extern int SeparatingAxisTest( void );
 extern int ShapeTest( void );
 extern int TableTest( void );
 extern int VoxelGridCostTest( void );
+extern int VoxelGridBodyImpulseBudgetTest( void );
 extern int VoxelGridTest( void );
 extern int VoxelPointBench( void );
 extern int WorldTest( void );
@@ -140,6 +141,7 @@ int main( int argc, char** argv )
 	MAYBE_RUN_TEST( ShapeTest );
 	MAYBE_RUN_TEST( TableTest );
 	MAYBE_RUN_TEST( VoxelGridCostTest );
+	MAYBE_RUN_TEST( VoxelGridBodyImpulseBudgetTest );
 	MAYBE_RUN_TEST( VoxelGridTest );
 	MAYBE_RUN_TEST( WorldTest );
 

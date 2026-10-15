@@ -224,6 +224,9 @@ typedef struct b3StepContext
 	// Similar for mesh/overflow contact constraints
 	struct b3ManifoldConstraint* manifoldConstraints;
 	struct b3ContactConstraint* contactConstraints;
+	// Retained through ordinary and bullet CCD; immutable after scalar solver finalization.
+	struct b3ContactImpulseGroupSlot* contactImpulseGroupSlots;
+	size_t contactImpulseGroupCapacity;
 	b3ContactPrepareSpan* contactPrepareSpans;
 	b3ContactPrepareSpan* overflowSpans;
 	b3JointPrepareSpan* jointPrepareSpans;

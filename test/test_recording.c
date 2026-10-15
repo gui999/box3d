@@ -12,6 +12,7 @@
 #include "box3d/box3d.h"
 #include "box3d/collision.h"
 
+#include <float.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -2077,8 +2078,85 @@ static int GeometryMutatorReplay( void )
 	return 0;
 }
 
+// Record from before target creation, so replay must carry the body-cap setter rather than
+// inheriting the value from a seed snapshot. A scalar mesh contact makes the mutation physical.
+static uint64_t RunBodyAllowanceScene( b3Recording* recording, const b3MeshData* floor, bool capped, float* finalHeight )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.gravity = b3Vec3_zero;
+	worldDef.workerCount = 1;
+	b3WorldId world = b3CreateWorld( &worldDef );
+	if ( recording != NULL )
+	{
+		b3World_StartRecording( world, recording );
+	}
+	b3BodyDef targetDef = b3DefaultBodyDef();
+	b3BodyId target = b3CreateBody( world, &targetDef );
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	b3CreateMeshShape( target, &shapeDef, floor, (b3Vec3){ 1.0f, 1.0f, 1.0f } );
+	if ( capped )
+	{
+		b3Body_SetMaxNormalImpulse( target, 0.25f );
+	}
+	b3BodyDef strikerDef = b3DefaultBodyDef();
+	strikerDef.type = b3_dynamicBody;
+	strikerDef.position = (b3Pos){ 0.0f, 1.5f, 0.0f };
+	strikerDef.linearVelocity = (b3Vec3){ 0.0f, -12.0f, 0.0f };
+	b3BodyId striker = b3CreateBody( world, &strikerDef );
+	b3BoxHull box = b3MakeBoxHull( 0.5f, 0.5f, 0.5f );
+	shapeDef.density = 1.0f;
+	b3CreateHullShape( striker, &shapeDef, &box.base );
+	for ( int i = 0; i < 20; ++i )
+	{
+		b3World_Step( world, 1.0f / 60.0f, 4 );
+	}
+	*finalHeight = (float)b3Body_GetPosition( striker ).y;
+	uint64_t hash = b3HashWorldState( b3GetWorldFromId( world ) );
+	if ( recording != NULL )
+	{
+		b3World_StopRecording( world );
+	}
+	b3DestroyWorld( world );
+	return hash;
+}
+
+static int BodyAllowanceReplay( void )
+{
+	b3MeshData* floor = b3CreateGridMesh( 4, 4, 2.0f, 0, false );
+	ENSURE( floor != NULL );
+	float controlHeight, cappedHeight;
+	uint64_t controlHash = RunBodyAllowanceScene( NULL, floor, false, &controlHeight );
+	b3Recording* recording = b3CreateRecording( 0 );
+	ENSURE( recording != NULL );
+	uint64_t cappedHash = RunBodyAllowanceScene( recording, floor, true, &cappedHeight );
+	ENSURE( controlHeight > 0.35f && cappedHeight < -1.0f );
+	ENSURE( cappedHash != controlHash );
+
+	const uint8_t* data = b3Recording_GetData( recording );
+	int size = b3Recording_GetSize( recording );
+	ENSURE( b3ValidateReplay( data, size, 1 ) );
+	ENSURE( b3ValidateReplay( data, size, 4 ) );
+	b3RecPlayer* player = b3RecPlayer_Create( data, size, 1 );
+	ENSURE( player != NULL );
+	while ( b3RecPlayer_StepFrame( player ) )
+	{
+	}
+	ENSURE( b3RecPlayer_HasDiverged( player ) == false );
+	b3BodyId target = b3RecPlayer_GetBodyId( player, 0 );
+	b3BodyId striker = b3RecPlayer_GetBodyId( player, 1 );
+	ENSURE( b3Body_IsValid( target ) && b3Body_IsValid( striker ) );
+	ENSURE( b3Body_GetMaxNormalImpulse( target ) == 0.25f );
+	ENSURE( b3Body_GetMaxNormalImpulse( striker ) == FLT_MAX );
+	ENSURE( (float)b3Body_GetPosition( striker ).y == cappedHeight );
+	b3RecPlayer_Destroy( player );
+	b3DestroyRecording( recording );
+	b3DestroyMesh( floor );
+	return 0;
+}
+
 int RecordingTest( void )
 {
+	RUN_SUBTEST( BodyAllowanceReplay );
 	RUN_SUBTEST( GeometryHashCollision );
 	RUN_SUBTEST( ShapeNameReplay );
 	RUN_SUBTEST( SphereRoundTrip );

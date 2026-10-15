@@ -109,6 +109,8 @@ typedef struct b3Body
 	float sleepTime;
 	float sleepVelocity;
 	float mass;
+	// Terra: static target allowance per opposing body and step, shared by scalar contacts.
+	float maxNormalImpulse;
 
 	// local space inertia
 	b3Matrix3 inertia;

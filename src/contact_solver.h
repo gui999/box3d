@@ -17,6 +17,8 @@ typedef struct b3ManifoldConstraintPoint
 	float appliedNormalImpulse;
 	float normalMass;
 	float leverArm;
+	// Terra: positive restitution demand awaiting the shared allowance clamp.
+	float restitutionImpulse;
 } b3ManifoldConstraintPoint;
 
 typedef struct b3ManifoldConstraint
@@ -53,10 +55,33 @@ typedef struct b3ContactConstraint
 	// Terra: the impulse limit over the step (FLT_MAX for none) and the impulse the finished sub-steps applied
 	float maxNormalImpulse;
 	float spentNormalImpulse;
+	// Terra: transient links rebuilt after scalar prepare. Only the leader executes this body pair.
+	struct b3ContactConstraint* impulseGroup;
+	struct b3ContactConstraint* nextImpulseMember;
+	struct b3ContactConstraint* impulseGroupTail;
+	float sharedMaxNormalImpulse;
+	float sharedSpentNormalImpulse;
+	int impulseTargetBodyId;
+	int impulseOpposingBodyId;
 	int manifoldCount;
 } b3ContactConstraint;
 
+// Terra: step-local hash entry. Finalization copies exhaustion here before prepared constraints
+// are released, so both ordinary and later bullet CCD can query the pair without dangling pointers.
+typedef struct b3ContactImpulseGroupSlot
+{
+	b3ContactConstraint* leader;
+	int targetBodyId;
+	int opposingBodyId;
+	bool exhausted;
+} b3ContactImpulseGroupSlot;
+
 int b3GetWideContactConstraintByteCount( void );
+
+void b3PrepareContactImpulseGroups( b3StepContext* context );
+void b3FinalizeContactImpulseGroups( b3StepContext* context );
+bool b3ContactImpulseGroupAllowsPassThrough( const b3StepContext* context, int targetBodyId, int opposingBodyId );
+void b3FreeContactImpulseGroups( b3StepContext* context );
 
 // Overflow contacts don't fit into the constraint graph coloring
 void b3PrepareContacts_Overflow( b3StepContext* context );

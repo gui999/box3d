@@ -137,8 +137,9 @@ B3_API bool b3World_IsSleepingEnabled( b3WorldId worldId );
 /// @see b3WorldDef
 B3_API void b3World_EnableContinuous( b3WorldId worldId, bool flag );
 
-/// Terra: let continuous collision pass a shape whose impulse limit (b3ShapeDef::maxNormalImpulse) gave way this step, so a
-/// fast body carries on through what it breaks. On by default.
+/// Terra: let continuous collision pass a shape whose shape limit gave way this step, or all members of a static body
+/// whose body allowance was exhausted by this fast body. Body allowances remain independent for each opposing body.
+/// On by default.
 B3_API void b3World_EnableLimitPassThrough( b3WorldId worldId, bool flag );
 
 /// Terra: point-sampled voxel grid contacts. When on, a voxel grid against a voxel grid is collided by sampling the exposed
@@ -699,6 +700,16 @@ B3_API void b3Body_SetSleepThreshold( b3BodyId bodyId, float sleepThreshold );
 
 /// Get the sleep threshold, usually in meters per second.
 B3_API float b3Body_GetSleepThreshold( b3BodyId bodyId );
+
+/// Terra: set a static target's normal impulse allowance in N.s per opposing body and step.
+/// All scalar contacts of that body pair share the allowance; per-shape limits still apply.
+/// When exhausted, continuous collision passes all of the target's shapes for that opposing body only.
+/// FLT_MAX (the default) is uncapped. Dynamic targets and SIMD convex contacts do not use this allowance.
+/// The setting survives shape replacement and body type changes, and mutations are recorded for replay.
+B3_API void b3Body_SetMaxNormalImpulse( b3BodyId bodyId, float maxNormalImpulse );
+
+/// Terra: get the body's normal impulse allowance.
+B3_API float b3Body_GetMaxNormalImpulse( b3BodyId bodyId );
 
 /// Returns true if this body is enabled
 B3_API bool b3Body_IsEnabled( b3BodyId bodyId );

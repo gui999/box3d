@@ -317,6 +317,7 @@ static void b3SolveJointsTask( b3SolverBlock block, b3StepContext* context, bool
 typedef struct b3ContinuousContext
 {
 	b3World* world;
+	const b3StepContext* stepContext;
 	b3BodySim* fastBodySim;
 	b3Shape* fastShape;
 	b3Vec3 centroid1, centroid2;
@@ -364,8 +365,12 @@ static bool b3ContinuousQueryCallback( int proxyId, uint64_t userData, void* con
 		return true;
 	}
 
-	// Terra: skip a shape whose impulse limit gave way this step, so a body carries on through what it breaks
-	if ( world->enableLimitPassThrough && shape->limitReachedStep == world->stepIndex )
+	// Terra: shape limits retain their legacy shape-wide pass. Body allowances pass all target
+	// members only for the opposing body that exhausted its independent allowance this step.
+	if ( world->enableLimitPassThrough &&
+		 ( shape->limitReachedStep == world->stepIndex ||
+		   ( continuousContext->stepContext->contactImpulseGroupCapacity != 0 &&
+			 b3ContactImpulseGroupAllowsPassThrough( continuousContext->stepContext, shape->bodyId, fastShape->bodyId ) ) ) )
 	{
 		return true;
 	}
@@ -479,9 +484,10 @@ static bool b3ContinuousQueryCallback( int proxyId, uint64_t userData, void* con
 }
 
 // Continuous collision of dynamic versus static
-static void b3SolveContinuous( b3World* world, int bodySimIndex, b3TaskContext* taskContext )
+static void b3SolveContinuous( b3StepContext* stepContext, int bodySimIndex, b3TaskContext* taskContext )
 {
 	b3TracyCZoneNC( ccd, "CCD", b3_colorDarkGoldenRod, true );
+	b3World* world = stepContext->world;
 
 	uint64_t ticks = b3GetTicks();
 
@@ -509,6 +515,7 @@ static void b3SolveContinuous( b3World* world, int bodySimIndex, b3TaskContext* 
 
 	b3ContinuousContext context = { 0 };
 	context.world = world;
+	context.stepContext = stepContext;
 	context.sweep = sweep;
 	context.base = base;
 	context.fastBodySim = fastBodySim;
@@ -778,7 +785,7 @@ static void b3FinalizeBodiesTask( int startIndex, int endIndex, int workerIndex,
 				}
 				else
 				{
-					b3SolveContinuous( world, simIndex, taskContext );
+					b3SolveContinuous( stepContext, simIndex, taskContext );
 				}
 			}
 			else
@@ -1243,6 +1250,7 @@ static void b3SolverTask( void* taskContext )
 		// Single-threaded overflow work. These constraints don't fit in the graph coloring.
 		b3PrepareJoints_Overflow( context );
 		b3PrepareContacts_Overflow( context );
+		b3PrepareContactImpulseGroups( context );
 
 		profile->prepareConstraints += b3GetMillisecondsAndReset( &ticks );
 
@@ -1439,7 +1447,7 @@ static void b3BulletBodyTask( int startIndex, int endIndex, int workerIndex, voi
 	for ( int i = startIndex; i < endIndex; ++i )
 	{
 		int simIndex = stepContext->bulletBodies[i];
-		b3SolveContinuous( stepContext->world, simIndex, taskContext );
+		b3SolveContinuous( stepContext, simIndex, taskContext );
 	}
 
 	b3TracyCZoneEnd( bullet_body_task );
@@ -1874,6 +1882,9 @@ void b3Solve( b3World* world, b3StepContext* stepContext )
 			}
 		}
 
+		// All solver/store workers have joined. Freeze pair exhaustion before either CCD pass.
+		b3FinalizeContactImpulseGroups( stepContext );
+
 		// Finish island split
 		if ( splitIslandTask != NULL )
 		{
@@ -2251,6 +2262,8 @@ void b3Solve( b3World* world, b3StepContext* stepContext )
 		b3TracyCZoneEnd( bullets );
 	}
 
+	// Ordinary and bullet CCD have both joined; their immutable body-pair lookup can be released.
+	b3FreeContactImpulseGroups( stepContext );
 	b3StackFree( &world->stack, stepContext->bulletBodies );
 	stepContext->bulletBodies = NULL;
 	b3AtomicStoreInt( &stepContext->bulletBodyCount, 0 );

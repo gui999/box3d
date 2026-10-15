@@ -233,3 +233,6 @@ B3_REC_OP( 0xF1, StateHash, RET_NONE, ARG( WORLDID, world ) ARG( U64, hash ) )
 
 // Accumulated world bounds over the whole recording, written once at stop.
 B3_REC_OP( 0xF2, RecordingBounds, RET_NONE, ARG( AABB, bounds ) )
+
+// Terra: append the body allowance mutation without renumbering existing operations.
+B3_REC_OP( 0xF3, BodySetMaxNormalImpulse, RET_NONE, ARG( BODYID, body ) ARG( F32, impulse ) )

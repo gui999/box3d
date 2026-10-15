@@ -204,6 +204,22 @@ void b3PrepareContacts_Mesh( b3SolverBlock block, b3StepContext* context )
 			const b3Shape* shapeB = b3Array_Get( world->shapes, contact->shapeIdB );
 			contactConstraint->maxNormalImpulse = b3MinFloat( shapeA->maxNormalImpulse, shapeB->maxNormalImpulse );
 			contactConstraint->spentNormalImpulse = 0.0f;
+			contactConstraint->impulseGroup = NULL;
+			contactConstraint->nextImpulseMember = NULL;
+			contactConstraint->impulseTargetBodyId = B3_NULL_INDEX;
+			if ( indexA == B3_NULL_INDEX || indexB == B3_NULL_INDEX )
+			{
+				int targetEdge = indexA == B3_NULL_INDEX ? 0 : 1;
+				int targetBodyId = contact->edges[targetEdge].bodyId;
+				const b3Body* target = b3Array_Get( world->bodies, targetBodyId );
+				B3_ASSERT( target->type == b3_staticBody );
+				if ( target->maxNormalImpulse < FLT_MAX )
+				{
+					contactConstraint->impulseTargetBodyId = targetBodyId;
+					contactConstraint->impulseOpposingBodyId = contact->edges[1 - targetEdge].bodyId;
+					contactConstraint->sharedMaxNormalImpulse = target->maxNormalImpulse;
+				}
+			}
 
 			b3ManifoldConstraint* manifoldConstraints = manifoldBase + specs[localIndex].manifoldStart;
 			contactConstraint->constraints = manifoldConstraints;
@@ -244,6 +260,7 @@ void b3PrepareContacts_Mesh( b3SolverBlock block, b3StepContext* context )
 					cp->normalImpulse = warmStartScale * mp->normalImpulse;
 					cp->totalNormalImpulse = 0.0f;
 					cp->appliedNormalImpulse = 0.0f;
+					cp->restitutionImpulse = 0.0f;
 
 					b3Vec3 rA = cp->rA;
 					b3Vec3 rB = cp->rB;
@@ -316,30 +333,16 @@ void b3PrepareContacts_Mesh( b3SolverBlock block, b3StepContext* context )
 	b3TracyCZoneEnd( prepare_contact );
 }
 
-void b3WarmStartContacts_Mesh( b3SolverBlock block, b3StepContext* context )
+static void b3WarmStartContact( b3ContactConstraint* contactConstraint, b3StepContext* context )
 {
-	b3World* world = context->world;
-	b3GraphColor* color = world->constraintGraph.colors + block.colorIndex;
-	b3SolverSet* awakeSet = b3Array_Get( world->solverSets, b3_awakeSet );
-	b3BodyState* states = awakeSet->bodyStates.data;
-	b3ContactConstraint* constraints = color->contactConstraints;
+	b3BodyState* states = context->states;
 
 	// This is a dummy state to represent a static body because static bodies don't have a solver body.
 	b3BodyState dummyState = b3_identityBodyState;
 
-	int startIndex = block.startIndex;
-	int endIndex = startIndex + block.count;
-
-	for ( int constraintIndex = startIndex; constraintIndex < endIndex; ++constraintIndex )
 	{
-		b3ContactConstraint* contactConstraint = constraints + constraintIndex;
 		int indexA = contactConstraint->indexA;
 		int indexB = contactConstraint->indexB;
-
-		if ( contactConstraint->maxNormalImpulse < FLT_MAX )
-		{
-			b3LimitWarmStart( contactConstraint );
-		}
 
 		b3BodyState* stateA = indexA == B3_NULL_INDEX ? &dummyState : states + indexA;
 		b3BodyState* stateB = indexB == B3_NULL_INDEX ? &dummyState : states + indexB;
@@ -519,26 +522,18 @@ static void b3SolveManifoldFriction( b3ManifoldConstraint* constraint, const b3C
 }
 
 // Merged normal and friction loops. This is much more stable for the Jenga stack.
-void b3SolveContacts_Mesh( b3SolverBlock block, b3StepContext* context, bool useBias )
+static void b3SolveContact( b3ContactConstraint* contactConstraint, b3StepContext* context, bool useBias,
+							bool deferFriction )
 {
-	b3World* world = context->world;
-	b3GraphColor* color = world->constraintGraph.colors + block.colorIndex;
-	b3ContactConstraint* contactConstraints = color->contactConstraints;
 	b3BodyState* states = context->states;
 
 	// This is a dummy state to represent a static body because static bodies don't have a solver body.
 	b3BodyState dummyState = b3_identityBodyState;
 
-	// The last block might not be full
-	int startIndex = block.startIndex;
-	int endIndex = startIndex + block.count;
-
 	float inv_h = context->inv_h;
 	const float contactSpeed = context->world->contactSpeed;
 
-	for ( int i = startIndex; i < endIndex; ++i )
 	{
-		b3ContactConstraint* contactConstraint = contactConstraints + i;
 		int manifoldCount = contactConstraint->manifoldCount;
 
 		int indexA = contactConstraint->indexA;
@@ -637,7 +632,7 @@ void b3SolveContacts_Mesh( b3SolverBlock block, b3StepContext* context, bool use
 			}
 
 			// No friction when applying bias; under a limit, friction waits for the shared impulses
-			if ( useBias == true || limited )
+			if ( useBias == true || limited || deferFriction )
 			{
 				// Go to next manifold
 				continue;
@@ -646,7 +641,7 @@ void b3SolveContacts_Mesh( b3SolverBlock block, b3StepContext* context, bool use
 			b3SolveManifoldFriction( constraint, contactConstraint, totalNormalImpulse, totalTwistLimit, &vA, &wA, &vB, &wB );
 		}
 
-		if ( limited )
+		if ( limited && deferFriction == false )
 		{
 			// Terra: scale every point down alike when the points together pass what is left of the limit
 			float sum = b3SumNormalImpulses( contactConstraint );
@@ -712,32 +707,25 @@ void b3SolveContacts_Mesh( b3SolverBlock block, b3StepContext* context, bool use
 	}
 }
 
-void b3ApplyRestitution_Mesh( b3SolverBlock block, b3StepContext* context )
+static void b3ApplyContactRestitution( b3ContactConstraint* contactConstraint, b3StepContext* context,
+									 bool deferLimit )
 {
-	b3World* world = context->world;
-	b3GraphColor* color = world->constraintGraph.colors + block.colorIndex;
 	b3BodyState* states = context->states;
-	b3ContactConstraint* constraints = color->contactConstraints;
 
 	// This is a dummy state to represent a static body because static bodies don't have a solver body.
 	b3BodyState dummyState = b3_identityBodyState;
 
-	int startIndex = block.startIndex;
-	int endIndex = startIndex + block.count;
-
 	float threshold = context->world->restitutionThreshold;
 
-	for ( int constraintIndex = startIndex; constraintIndex < endIndex; ++constraintIndex )
 	{
-		b3ContactConstraint* contactConstraint = constraints + constraintIndex;
 		float restitution = contactConstraint->restitution;
 		if ( restitution == 0.0f )
 		{
-			continue;
+			return;
 		}
 
 		// Terra: restitution adds to the step's impulse, so it takes at most what the sub-steps left of the limit
-		bool limited = contactConstraint->maxNormalImpulse < FLT_MAX;
+		bool limited = contactConstraint->maxNormalImpulse < FLT_MAX && deferLimit == false;
 		float left = b3MaxFloat( contactConstraint->maxNormalImpulse - contactConstraint->spentNormalImpulse, 0.0f );
 		float extra = 0.0f;
 
@@ -769,6 +757,7 @@ void b3ApplyRestitution_Mesh( b3SolverBlock block, b3StepContext* context )
 			for ( int pointIndex = 0; pointIndex < pointCount; ++pointIndex )
 			{
 				b3ManifoldConstraintPoint* cp = cm->points + pointIndex;
+				cp->restitutionImpulse = 0.0f;
 
 				// If the total normal impulse is zero then there was no collision
 				// this skips speculative contact points that didn't generate an impulse
@@ -798,6 +787,7 @@ void b3ApplyRestitution_Mesh( b3SolverBlock block, b3StepContext* context )
 					newImpulse = b3MinFloat( newImpulse, cp->normalImpulse + b3MaxFloat( left - extra, 0.0f ) );
 				}
 				impulse = newImpulse - cp->normalImpulse;
+				cp->restitutionImpulse = b3MaxFloat( impulse, 0.0f );
 				extra += impulse;
 				cp->normalImpulse = newImpulse;
 				cp->totalNormalImpulse += impulse;
@@ -827,6 +817,393 @@ void b3ApplyRestitution_Mesh( b3SolverBlock block, b3StepContext* context )
 		if ( limited )
 		{
 			contactConstraint->spentNormalImpulse += extra;
+		}
+	}
+}
+
+// Terra: build body-pair groups only after all scalar preparation has joined. Contacts keep their
+// original graph reservations and identity. The first member in execution order owns the group:
+// overflow is serial and executes first, followed by the non-overflow graph colors in order.
+static size_t b3ContactImpulseGroupHash( int targetBodyId, int opposingBodyId, size_t capacity )
+{
+	uint64_t key = ( (uint64_t)(uint32_t)targetBodyId << 32 ) | (uint32_t)opposingBodyId;
+	key ^= key >> 30;
+	key *= UINT64_C( 0xbf58476d1ce4e5b9 );
+	key ^= key >> 27;
+	key *= UINT64_C( 0x94d049bb133111eb );
+	key ^= key >> 31;
+	return (size_t)key & ( capacity - 1 );
+}
+
+void b3PrepareContactImpulseGroups( b3StepContext* context )
+{
+	context->contactImpulseGroupSlots = NULL;
+	context->contactImpulseGroupCapacity = 0;
+	int candidateCount = 0;
+	for ( int pass = 0; pass < B3_GRAPH_COLOR_COUNT; ++pass )
+	{
+		int colorIndex = pass == 0 ? B3_OVERFLOW_INDEX : pass - 1;
+		b3GraphColor* color = context->graph->colors + colorIndex;
+		for ( int i = 0; i < color->contacts.count; ++i )
+		{
+			b3ContactConstraint* member = color->contactConstraints + i;
+			candidateCount += member->impulseTargetBodyId != B3_NULL_INDEX ? 1 : 0;
+		}
+	}
+	if ( candidateCount == 0 )
+	{
+		return;
+	}
+
+	// Open addressing keeps setup linear without exposing hash order to the solve. Retain this
+	// table through both CCD passes; after finalization the keys and exhaustion flags stand alone.
+	size_t capacity = 1;
+	while ( capacity < 2 * (size_t)candidateCount )
+	{
+		capacity *= 2;
+	}
+	b3ContactImpulseGroupSlot* slots = b3Alloc( capacity * sizeof( *slots ) );
+	for ( size_t i = 0; i < capacity; ++i )
+	{
+		slots[i] = (b3ContactImpulseGroupSlot){ .targetBodyId = B3_NULL_INDEX };
+	}
+	context->contactImpulseGroupSlots = slots;
+	context->contactImpulseGroupCapacity = capacity;
+	for ( int pass = 0; pass < B3_GRAPH_COLOR_COUNT; ++pass )
+	{
+		int colorIndex = pass == 0 ? B3_OVERFLOW_INDEX : pass - 1;
+		b3GraphColor* color = context->graph->colors + colorIndex;
+		for ( int i = 0; i < color->contacts.count; ++i )
+		{
+			b3ContactConstraint* member = color->contactConstraints + i;
+			if ( member->impulseTargetBodyId == B3_NULL_INDEX )
+			{
+				continue;
+			}
+			size_t slot = b3ContactImpulseGroupHash( member->impulseTargetBodyId, member->impulseOpposingBodyId, capacity );
+			while ( slots[slot].targetBodyId != B3_NULL_INDEX &&
+					( slots[slot].targetBodyId != member->impulseTargetBodyId ||
+					  slots[slot].opposingBodyId != member->impulseOpposingBodyId ) )
+			{
+				slot = ( slot + 1 ) & ( capacity - 1 );
+			}
+			b3ContactConstraint* leader = slots[slot].leader;
+			if ( leader == NULL )
+			{
+				leader = member;
+				slots[slot].leader = leader;
+				slots[slot].targetBodyId = member->impulseTargetBodyId;
+				slots[slot].opposingBodyId = member->impulseOpposingBodyId;
+				leader->impulseGroupTail = leader;
+				leader->sharedSpentNormalImpulse = 0.0f;
+			}
+			else
+			{
+				leader->impulseGroupTail->nextImpulseMember = member;
+				leader->impulseGroupTail = member;
+			}
+			member->impulseGroup = leader;
+		}
+	}
+}
+
+void b3FinalizeContactImpulseGroups( b3StepContext* context )
+{
+	// Solver/store workers have joined. Publish immutable pair exhaustion for the subsequent
+	// parallel CCD passes, retaining legacy shape-wide marks exclusively for per-shape caps.
+	for ( size_t i = 0; i < context->contactImpulseGroupCapacity; ++i )
+	{
+		b3ContactImpulseGroupSlot* slot = context->contactImpulseGroupSlots + i;
+		b3ContactConstraint* group = slot->leader;
+		if ( group == NULL )
+		{
+			continue;
+		}
+		slot->exhausted = group->sharedSpentNormalImpulse >= 0.999f * group->sharedMaxNormalImpulse;
+		slot->leader = NULL;
+	}
+}
+
+bool b3ContactImpulseGroupAllowsPassThrough( const b3StepContext* context, int targetBodyId, int opposingBodyId )
+{
+	size_t capacity = context->contactImpulseGroupCapacity;
+	if ( capacity == 0 )
+	{
+		return false;
+	}
+	size_t index = b3ContactImpulseGroupHash( targetBodyId, opposingBodyId, capacity );
+	const b3ContactImpulseGroupSlot* slots = context->contactImpulseGroupSlots;
+	while ( slots[index].targetBodyId != B3_NULL_INDEX )
+	{
+		if ( slots[index].targetBodyId == targetBodyId && slots[index].opposingBodyId == opposingBodyId )
+		{
+			return slots[index].exhausted;
+		}
+		index = ( index + 1 ) & ( capacity - 1 );
+	}
+	return false;
+}
+
+void b3FreeContactImpulseGroups( b3StepContext* context )
+{
+	if ( context->contactImpulseGroupSlots != NULL )
+	{
+		b3Free( context->contactImpulseGroupSlots,
+				context->contactImpulseGroupCapacity * sizeof( *context->contactImpulseGroupSlots ) );
+		context->contactImpulseGroupSlots = NULL;
+		context->contactImpulseGroupCapacity = 0;
+	}
+}
+
+// Cached friction must follow the normal support retained by both the shape and body allowance.
+static void b3LimitCachedFriction( b3ContactConstraint* contact )
+{
+	for ( int i = 0; i < contact->manifoldCount; ++i )
+	{
+		b3ManifoldConstraint* manifold = contact->constraints + i;
+		float normal = 0.0f, twist = 0.0f;
+		for ( int j = 0; j < manifold->pointCount; ++j )
+		{
+			const b3ManifoldConstraintPoint* point = manifold->points + j;
+			normal += point->normalImpulse;
+			twist += point->leverArm * point->normalImpulse;
+		}
+		float limit = contact->friction * normal;
+		float lengthSquared = b3Dot2( manifold->frictionImpulse, manifold->frictionImpulse );
+		if ( lengthSquared > limit * limit )
+		{
+			float scale = limit / sqrtf( lengthSquared );
+			manifold->frictionImpulse.x *= scale;
+			manifold->frictionImpulse.y *= scale;
+		}
+		limit = contact->friction * twist;
+		manifold->twistImpulse = b3ClampFloat( manifold->twistImpulse, -limit, limit );
+		limit = contact->rollingResistance * normal;
+		lengthSquared = b3Dot( manifold->rollingImpulse, manifold->rollingImpulse );
+		if ( lengthSquared > limit * limit )
+		{
+			manifold->rollingImpulse = b3MulSV( limit / sqrtf( lengthSquared ), manifold->rollingImpulse );
+		}
+	}
+}
+
+static void b3ApplyNormalCorrection( const b3ContactConstraint* contact, b3StepContext* context,
+								   const b3ManifoldConstraintPoint* point, b3Vec3 normal, float correction )
+{
+	b3Vec3 impulse = b3MulSV( correction, normal );
+	if ( contact->indexA != B3_NULL_INDEX )
+	{
+		b3BodyState* state = context->states + contact->indexA;
+		if ( state->flags & b3_dynamicFlag )
+		{
+			state->linearVelocity = b3MulSub( state->linearVelocity, contact->invMassA, impulse );
+			state->angularVelocity = b3Sub( state->angularVelocity,
+				b3MulMV( contact->invIA, b3Cross( point->rA, impulse ) ) );
+		}
+	}
+	if ( contact->indexB != B3_NULL_INDEX )
+	{
+		b3BodyState* state = context->states + contact->indexB;
+		if ( state->flags & b3_dynamicFlag )
+		{
+			state->linearVelocity = b3MulAdd( state->linearVelocity, contact->invMassB, impulse );
+			state->angularVelocity = b3Add( state->angularVelocity,
+				b3MulMV( contact->invIB, b3Cross( point->rB, impulse ) ) );
+		}
+	}
+}
+
+static float b3SumRestitutionImpulses( const b3ContactConstraint* contact )
+{
+	float sum = 0.0f;
+	for ( int i = 0; i < contact->manifoldCount; ++i )
+	{
+		const b3ManifoldConstraint* manifold = contact->constraints + i;
+		for ( int j = 0; j < manifold->pointCount; ++j )
+		{
+			sum += manifold->points[j].restitutionImpulse;
+		}
+	}
+	return sum;
+}
+
+// Scale demand only after all members solved their normals. Correct the state and every readback
+// accumulator together, preserving the original per-contact/manifold/feature storage.
+static void b3ScaleContactImpulses( b3ContactConstraint* contact, b3StepContext* context, float scale,
+								   bool warmStart, bool useBias, bool restitution )
+{
+	for ( int i = 0; i < contact->manifoldCount; ++i )
+	{
+		b3ManifoldConstraint* manifold = contact->constraints + i;
+		for ( int j = 0; j < manifold->pointCount; ++j )
+		{
+			b3ManifoldConstraintPoint* point = manifold->points + j;
+			float demand = restitution ? point->restitutionImpulse : point->normalImpulse;
+			float correction = ( scale - 1.0f ) * demand;
+			point->normalImpulse += correction;
+			if ( restitution )
+			{
+				point->restitutionImpulse *= scale;
+			}
+			if ( warmStart == false )
+			{
+				point->totalNormalImpulse += correction;
+				if ( useBias == false )
+				{
+					point->appliedNormalImpulse += correction;
+				}
+				b3ApplyNormalCorrection( contact, context, point, manifold->normal, correction );
+			}
+		}
+	}
+}
+
+static void b3LimitGroupImpulses( b3ContactConstraint* group, b3StepContext* context, bool warmStart,
+								bool useBias, bool restitution )
+{
+	float sum = 0.0f;
+	for ( b3ContactConstraint* member = group; member != NULL; member = member->nextImpulseMember )
+	{
+		float demand = restitution ? b3SumRestitutionImpulses( member ) : b3SumNormalImpulses( member );
+		float left = b3MaxFloat( member->maxNormalImpulse - member->spentNormalImpulse, 0.0f );
+		if ( member->maxNormalImpulse < FLT_MAX && demand > left )
+		{
+			b3ScaleContactImpulses( member, context, left / demand, warmStart, useBias, restitution );
+			demand = left;
+		}
+		sum += demand;
+	}
+	float left = b3MaxFloat( group->sharedMaxNormalImpulse - group->sharedSpentNormalImpulse, 0.0f );
+	if ( sum > left )
+	{
+		float scale = left / sum;
+		for ( b3ContactConstraint* member = group; member != NULL; member = member->nextImpulseMember )
+		{
+			b3ScaleContactImpulses( member, context, scale, warmStart, useBias, restitution );
+		}
+	}
+}
+
+static void b3SolveContactFriction( b3ContactConstraint* contact, b3StepContext* context )
+{
+	b3BodyState dummy = b3_identityBodyState;
+	b3BodyState* stateA = contact->indexA == B3_NULL_INDEX ? &dummy : context->states + contact->indexA;
+	b3BodyState* stateB = contact->indexB == B3_NULL_INDEX ? &dummy : context->states + contact->indexB;
+	b3Vec3 vA = stateA->linearVelocity, wA = stateA->angularVelocity;
+	b3Vec3 vB = stateB->linearVelocity, wB = stateB->angularVelocity;
+	for ( int i = 0; i < contact->manifoldCount; ++i )
+	{
+		b3ManifoldConstraint* manifold = contact->constraints + i;
+		float normal = 0.0f, twist = 0.0f;
+		for ( int j = 0; j < manifold->pointCount; ++j )
+		{
+			const b3ManifoldConstraintPoint* point = manifold->points + j;
+			normal += point->normalImpulse;
+			twist += point->leverArm * point->normalImpulse;
+		}
+		b3SolveManifoldFriction( manifold, contact, normal, twist, &vA, &wA, &vB, &wB );
+	}
+	if ( stateA->flags & b3_dynamicFlag )
+	{
+		stateA->linearVelocity = vA;
+		stateA->angularVelocity = wA;
+	}
+	if ( stateB->flags & b3_dynamicFlag )
+	{
+		stateB->linearVelocity = vB;
+		stateB->angularVelocity = wB;
+	}
+}
+
+static void b3ChargeGroupImpulses( b3ContactConstraint* group, bool restitution )
+{
+	float sum = 0.0f;
+	for ( b3ContactConstraint* member = group; member != NULL; member = member->nextImpulseMember )
+	{
+		float applied = restitution ? b3SumRestitutionImpulses( member ) : b3SumNormalImpulses( member );
+		member->spentNormalImpulse += applied;
+		sum += applied;
+	}
+	group->sharedSpentNormalImpulse += sum;
+}
+
+void b3WarmStartContacts_Mesh( b3SolverBlock block, b3StepContext* context )
+{
+	b3ContactConstraint* base = context->graph->colors[block.colorIndex].contactConstraints;
+	for ( int i = block.startIndex; i < block.startIndex + block.count; ++i )
+	{
+		b3ContactConstraint* contact = base + i;
+		b3ContactConstraint* group = contact->impulseGroup;
+		if ( group == NULL )
+		{
+			if ( contact->maxNormalImpulse < FLT_MAX )
+			{
+				b3LimitWarmStart( contact );
+				b3LimitCachedFriction( contact );
+			}
+			b3WarmStartContact( contact, context );
+		}
+		else if ( group == contact )
+		{
+			b3LimitGroupImpulses( group, context, true, false, false );
+			for ( b3ContactConstraint* member = group; member != NULL; member = member->nextImpulseMember )
+			{
+				b3LimitCachedFriction( member );
+				b3WarmStartContact( member, context );
+			}
+		}
+	}
+}
+
+void b3SolveContacts_Mesh( b3SolverBlock block, b3StepContext* context, bool useBias )
+{
+	b3ContactConstraint* base = context->graph->colors[block.colorIndex].contactConstraints;
+	for ( int i = block.startIndex; i < block.startIndex + block.count; ++i )
+	{
+		b3ContactConstraint* contact = base + i;
+		b3ContactConstraint* group = contact->impulseGroup;
+		if ( group == NULL )
+		{
+			b3SolveContact( contact, context, useBias, false );
+		}
+		else if ( group == contact )
+		{
+			for ( b3ContactConstraint* member = group; member != NULL; member = member->nextImpulseMember )
+			{
+				b3SolveContact( member, context, useBias, true );
+			}
+			b3LimitGroupImpulses( group, context, false, useBias, false );
+			if ( useBias == false )
+			{
+				for ( b3ContactConstraint* member = group; member != NULL; member = member->nextImpulseMember )
+				{
+					b3SolveContactFriction( member, context );
+				}
+				b3ChargeGroupImpulses( group, false );
+			}
+		}
+	}
+}
+
+void b3ApplyRestitution_Mesh( b3SolverBlock block, b3StepContext* context )
+{
+	b3ContactConstraint* base = context->graph->colors[block.colorIndex].contactConstraints;
+	for ( int i = block.startIndex; i < block.startIndex + block.count; ++i )
+	{
+		b3ContactConstraint* contact = base + i;
+		b3ContactConstraint* group = contact->impulseGroup;
+		if ( group == NULL )
+		{
+			b3ApplyContactRestitution( contact, context, false );
+		}
+		else if ( group == contact )
+		{
+			for ( b3ContactConstraint* member = group; member != NULL; member = member->nextImpulseMember )
+			{
+				b3ApplyContactRestitution( member, context, true );
+			}
+			b3LimitGroupImpulses( group, context, false, false, true );
+			b3ChargeGroupImpulses( group, true );
 		}
 	}
 }
