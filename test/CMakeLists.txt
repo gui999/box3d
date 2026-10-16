@@ -30,6 +30,7 @@ set(BOX3D_TEST_FILES
     test_voxel_cost.c
     test_voxel_grid.c
     test_voxel_point_contacts.c
+    test_voxel_terrain_halo.c
     test_world.c
 )
 

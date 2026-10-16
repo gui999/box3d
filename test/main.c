@@ -53,6 +53,7 @@ extern int VoxelGridCostTest( void );
 extern int VoxelGridBodyImpulseBudgetTest( void );
 extern int VoxelGridTest( void );
 extern int VoxelPointBench( void );
+extern int VoxelTerrainHaloTest( void );
 extern int WorldTest( void );
 
 // Filter-aware test runner: skips tests that don't match the filter
@@ -143,6 +144,7 @@ int main( int argc, char** argv )
 	MAYBE_RUN_TEST( VoxelGridCostTest );
 	MAYBE_RUN_TEST( VoxelGridBodyImpulseBudgetTest );
 	MAYBE_RUN_TEST( VoxelGridTest );
+	MAYBE_RUN_TEST( VoxelTerrainHaloTest );
 	MAYBE_RUN_TEST( WorldTest );
 
 	printf( "======================================\n" );

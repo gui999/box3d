@@ -2135,6 +2135,14 @@ static void b3SampleVoxelPoint( b3VoxelSampler* sampler, b3Vec3 p, b3Vec3 faceNo
 		return;
 	}
 
+	// A sample outside this grid's owned cells but inside its solid neighbour ring
+	// is already within the same occupied terrain union. Do not turn the boundary
+	// between owners into a speculative side contact; the neighbour owns this point.
+	if ( b3IsVoxelSolid( other, v[0], v[1], v[2], true ) )
+	{
+		return;
+	}
+
 	// Outside: the voxel one speculative distance out along the face
 	float reach = B3_SPECULATIVE_DISTANCE + 0.05f * voxel;
 	b3Vec3 probe = b3MulAdd( q, reach, outward );
