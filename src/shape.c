@@ -1675,6 +1675,51 @@ static bool b3VoxelWakeQueryCallback( int proxyId, uint64_t userData, void* cont
 	return true;
 }
 
+// A body the edit may now overlap: its shape's bounds meet a box of the edited grid inside the change (geometry added
+// into or next to a body that rests close without touching the grid).
+typedef struct b3VoxelOverlapWakeContext
+{
+	b3VoxelWakeContext* wake;
+	const b3VoxelGrid* grid;
+	b3Transform toGrid;
+	b3AABB changed;
+} b3VoxelOverlapWakeContext;
+
+static bool b3VoxelBoxFound( int cell, int box, b3AABB bounds, void* context )
+{
+	B3_UNUSED( cell );
+	B3_UNUSED( box );
+	B3_UNUSED( bounds );
+	*(bool*)context = true;
+	return false;
+}
+
+static bool b3VoxelOverlapWakeCallback( int proxyId, uint64_t userData, void* context )
+{
+	b3VoxelOverlapWakeContext* overlap = context;
+	b3Shape* other = b3Array_Get( overlap->wake->world->shapes, (int)userData );
+	if ( other->bodyId == overlap->wake->gridBodyId )
+	{
+		return true;
+	}
+
+	b3AABB local = b3AABB_Transform( overlap->toGrid, other->aabb );
+	b3AABB reach = { b3Max( local.lowerBound, overlap->changed.lowerBound ), b3Min( local.upperBound, overlap->changed.upperBound ) };
+	if ( reach.lowerBound.x > reach.upperBound.x || reach.lowerBound.y > reach.upperBound.y || reach.lowerBound.z > reach.upperBound.z )
+	{
+		return true;
+	}
+
+	bool found = false;
+	b3QueryVoxelGrid( overlap->grid, reach, b3VoxelBoxFound, &found );
+	if ( found )
+	{
+		b3VoxelWakeQueryCallback( proxyId, userData, overlap->wake );
+	}
+	return true;
+}
+
+
 // Contacts of a grid shape after its boxes changed inside `changed` (grid frame): those whose boxes may differ forget their
 // cached boxes and re-query on the next step, keeping their manifolds so impulses carry over; bodies near the change wake.
 // `affected` bounds the boxes that may differ or change their covered faces (and the box keys a replaced module renumbered).
@@ -1733,7 +1778,18 @@ static void b3RefreshVoxelGridContacts( b3World* world, b3Shape* shape, b3AABB a
 	}
 
 	// Wake the bodies, including resting ones whose support may be gone. Collect first, waking moves solver sets.
-	if ( touching == false )
+	if ( touching )
+	{
+		// Besides the touching ones, a body the edit now overlaps (geometry added where it lies) wakes.
+		b3Transform toGrid = b3InvertTransform( gridTransform );
+		b3VoxelOverlapWakeContext overlap = { &wake, shape->voxelGrid, toGrid, changed };
+		b3AABB changedWorld = b3AABB_Transform( gridTransform, changed );
+		b3DynamicTree_Query( world->broadPhase.trees + b3_dynamicBody, changedWorld, B3_DEFAULT_MASK_BITS, false,
+							 b3VoxelOverlapWakeCallback, &overlap );
+		b3DynamicTree_Query( world->broadPhase.trees + b3_kinematicBody, changedWorld, B3_DEFAULT_MASK_BITS, false,
+							 b3VoxelOverlapWakeCallback, &overlap );
+	}
+	else
 	{
 		b3DynamicTree_Query( world->broadPhase.trees + b3_dynamicBody, wakeBounds, B3_DEFAULT_MASK_BITS, false,
 							 b3VoxelWakeQueryCallback, &wake );

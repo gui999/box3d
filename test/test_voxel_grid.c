@@ -1832,8 +1832,102 @@ static int VoxelGridMergedCornerCarveInPlace( void )
 	return 0;
 }
 
+
+// A merged body's edit that adds geometry where a body sleeps beside the grid (its contact with the grid touching nothing
+// yet) wakes it (D755, Codex C1 on PR 335), while a body away from the grid stays asleep.
+static int VoxelGridMergedRegionAddWakesOverlap( void )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+	b3World_EnableVoxelPointContacts( worldId, true );
+
+	// A separate floor under everything, its top at y = 0
+	b3BodyDef floorDef = b3DefaultBodyDef();
+	floorDef.position = ( b3Vec3 ){ 0, -0.5f, 0 };
+	b3BodyId floor = b3CreateBody( worldId, &floorDef );
+	b3BoxHull floorHull = b3MakeBoxHull( 20, 0.5f, 20 );
+	b3ShapeDef floorShape = b3DefaultShapeDef();
+	b3CreateHullShape( floor, &floorShape, &floorHull.base );
+
+	// A merged grid of two one-cell regions along x: region 0 a solid cube, region 1 empty
+	const float regionMeters = CELL_METERS;
+	float cube[6] = { 0, 0, 0, CELL_METERS, CELL_METERS, CELL_METERS };
+	b3VoxelGridModule* page = b3CreateVoxelGridModule( cube, 1, CELL_METERS, CELL_VOXELS );
+	b3VoxelGridModule* regions[2] = { b3CreateVoxelGridModule( cube, 1, regionMeters, CELL_VOXELS ), b3CreateVoxelGridModule( NULL, 0, regionMeters, CELL_VOXELS ) };
+	uint8_t none[2] = { 0, 0 };
+	b3VoxelGridModule_SetCoveredFaces( regions[0], none, 1 );
+	int occupancyCells[4 * 3 * 3];
+	for ( int i = 0; i < 4 * 3 * 3; ++i ) occupancyCells[i] = -1;
+	occupancyCells[( 1 * 3 + 1 ) * 4 + 1] = 0;
+	b3VoxelGridDef occupancyDef = { 0 };
+	occupancyDef.cellCountX = 2;
+	occupancyDef.cellCountY = occupancyDef.cellCountZ = 1;
+	occupancyDef.cellMeters = CELL_METERS;
+	occupancyDef.cellVoxels = CELL_VOXELS;
+	occupancyDef.modules = &page;
+	occupancyDef.moduleCount = 1;
+	occupancyDef.paddedCells = occupancyCells;
+	b3VoxelGrid* occupancy = b3CreateVoxelGrid( &occupancyDef );
+	int regionCells[4 * 3 * 3];
+	for ( int i = 0; i < 4 * 3 * 3; ++i ) regionCells[i] = -1;
+	regionCells[( 1 * 3 + 1 ) * 4 + 1] = 0;
+	regionCells[( 1 * 3 + 1 ) * 4 + 2] = 1;
+	b3VoxelGridDef mergedDef = { 0 };
+	mergedDef.cellCountX = 2;
+	mergedDef.cellCountY = mergedDef.cellCountZ = 1;
+	mergedDef.cellMeters = regionMeters;
+	mergedDef.cellVoxels = CELL_VOXELS;
+	mergedDef.maxBoxesPerCell = 1 << 20;
+	mergedDef.modules = regions;
+	mergedDef.moduleCount = 2;
+	mergedDef.paddedCells = regionCells;
+	mergedDef.occupancy = occupancy;
+	b3VoxelGrid* merged = b3CreateVoxelGrid( &mergedDef );
+	b3ReleaseVoxelGrid( occupancy );
+	ENSURE( merged != NULL );
+	b3BodyDef gridDef = b3DefaultBodyDef();
+	gridDef.position = ( b3Vec3 ){ 0, 0.01f, 0 };
+	b3BodyId gridBody = b3CreateBody( worldId, &gridDef );
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	b3ShapeId shape = b3CreateVoxelGridShape( gridBody, &shapeDef, merged );
+	b3ReleaseVoxelGrid( merged );
+
+	// A crate sleeping on the floor inside the empty cell, and one on the floor well outside the grid
+	b3BodyDef crateDef = b3DefaultBodyDef();
+	crateDef.type = b3_dynamicBody;
+	crateDef.position = ( b3Vec3 ){ 3.0f, 0.25f, 1.0f };
+	b3BodyId inside = b3CreateBody( worldId, &crateDef );
+	crateDef.position = ( b3Vec3 ){ 8.0f, 0.25f, 1.0f };
+	b3BodyId away = b3CreateBody( worldId, &crateDef );
+	b3BoxHull crate = b3MakeBoxHull( 0.25f, 0.25f, 0.25f );
+	b3ShapeDef crateShape = b3DefaultShapeDef();
+	b3CreateHullShape( inside, &crateShape, &crate.base );
+	b3CreateHullShape( away, &crateShape, &crate.base );
+	for ( int i = 0; i < 300; ++i ) b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	ENSURE( b3Body_IsAwake( inside ) == false && b3Body_IsAwake( away ) == false );
+
+	// Cell 1 is filled: its page joins the occupancy and region 1 holds a cube
+	ENSURE( b3Shape_VoxelGridAddOccupancyModule( shape, page ) == 1 );
+	int cells[1] = { ( 1 * 3 + 1 ) * 4 + 2 }, modules[1] = { 1 };
+	b3Shape_VoxelGridSetOccupancyCells( shape, cells, modules, 1 );
+	b3VoxelGridModule* filled = b3CreateVoxelGridModule( cube, 1, regionMeters, CELL_VOXELS );
+	b3VoxelGridModule_SetCoveredFaces( filled, none, 1 );
+	b3AABB changed = { { CELL_METERS, 0, 0 }, { 2 * CELL_METERS, CELL_METERS, CELL_METERS } };
+	ENSURE( b3Shape_VoxelGridReplaceModule( shape, 1, filled, changed ) );
+	b3ReleaseVoxelGridModule( filled );
+	ENSURE( b3Body_IsAwake( inside ) == true );
+	ENSURE( b3Body_IsAwake( away ) == false );
+
+	b3DestroyWorld( worldId );
+	b3ReleaseVoxelGridModule( page );
+	b3ReleaseVoxelGridModule( regions[0] );
+	b3ReleaseVoxelGridModule( regions[1] );
+	return 0;
+}
+
 int VoxelGridTest( void )
 {
+	RUN_SUBTEST( VoxelGridMergedRegionAddWakesOverlap );
 	RUN_SUBTEST( VoxelGridMergedCornerCarveInPlace );
 	RUN_SUBTEST( VoxelGridMergedRegionReplace );
 	RUN_SUBTEST( VoxelGridMergedBodyOccupancyAndRest );
