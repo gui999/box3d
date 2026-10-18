@@ -1677,18 +1677,20 @@ static bool b3VoxelWakeQueryCallback( int proxyId, uint64_t userData, void* cont
 
 // Contacts of a grid shape after its boxes changed inside `changed` (grid frame): those whose boxes may differ forget their
 // cached boxes and re-query on the next step, keeping their manifolds so impulses carry over; bodies near the change wake.
-// Boxes within `reach` of the change may change their covered faces.
-static void b3RefreshVoxelGridContacts( b3World* world, b3Shape* shape, b3AABB changed, float reach )
+// `affected` bounds the boxes that may differ or change their covered faces (and the box keys a replaced module renumbered).
+// `touching` wakes only the bodies whose contact with the shape touches near the change (a merged body's edit, which, like
+// the shape made again, must not wake a neighbour that only lies close); otherwise every body near it wakes.
+static void b3RefreshVoxelGridContacts( b3World* world, b3Shape* shape, b3AABB affected, b3AABB changed, bool touching )
 {
 	b3Body* body = b3Array_Get( world->bodies, shape->bodyId );
 	b3Transform gridTransform = b3ToRelativeTransform( b3GetBodyTransformQuick( world, body ), b3Pos_zero );
 
 	// Boxes in the cells next to a changed cell change their covered faces
 	// The cached query bounds of a contact are in the grid frame
-	b3AABB affected = b3AABB_Inflate( changed, reach );
 	b3AABB wakeBounds = b3AABB_Transform( gridTransform, b3AABB_Inflate( changed, 2.0f * B3_SPECULATIVE_DISTANCE ) );
 
 	int shapeIndex = shape->id;
+	b3VoxelWakeContext wake = { world, NULL, 0, 0, shape->bodyId };
 	int contactKey = body->headContactKey;
 	while ( contactKey != B3_NULL_INDEX )
 	{
@@ -1696,12 +1698,22 @@ static void b3RefreshVoxelGridContacts( b3World* world, b3Shape* shape, b3AABB c
 		contactKey = contact->edges[contactKey & 1].nextKey;
 
 		bool isA = contact->shapeIdA == shapeIndex;
-		if ( ( isA == false && contact->shapeIdB != shapeIndex ) || ( contact->flags & b3_simMeshContact ) == 0 )
+		if ( isA == false && contact->shapeIdB != shapeIndex )
 		{
 			continue;
 		}
 
 		const b3Shape* otherShape = b3Array_Get( world->shapes, isA ? contact->shapeIdB : contact->shapeIdA );
+		if ( touching && ( contact->flags & b3_contactTouchingFlag ) != 0 && b3AABB_Overlaps( otherShape->fatAABB, wakeBounds ) )
+		{
+			b3VoxelWakeQueryCallback( 0, (uint64_t)otherShape->id, &wake );
+		}
+
+		if ( ( contact->flags & b3_simMeshContact ) == 0 )
+		{
+			continue;
+		}
+
 		bool findsBoxesOnce = isA && otherShape->type != b3_voxelGridShape;
 		if ( findsBoxesOnce && b3AABB_Overlaps( contact->meshContact.queryBounds, affected ) == false )
 		{
@@ -1721,11 +1733,13 @@ static void b3RefreshVoxelGridContacts( b3World* world, b3Shape* shape, b3AABB c
 	}
 
 	// Wake the bodies, including resting ones whose support may be gone. Collect first, waking moves solver sets.
-	b3VoxelWakeContext wake = { world, NULL, 0, 0, shape->bodyId };
-	b3DynamicTree_Query( world->broadPhase.trees + b3_dynamicBody, wakeBounds, B3_DEFAULT_MASK_BITS, false,
-						 b3VoxelWakeQueryCallback, &wake );
-	b3DynamicTree_Query( world->broadPhase.trees + b3_kinematicBody, wakeBounds, B3_DEFAULT_MASK_BITS, false,
-						 b3VoxelWakeQueryCallback, &wake );
+	if ( touching == false )
+	{
+		b3DynamicTree_Query( world->broadPhase.trees + b3_dynamicBody, wakeBounds, B3_DEFAULT_MASK_BITS, false,
+							 b3VoxelWakeQueryCallback, &wake );
+		b3DynamicTree_Query( world->broadPhase.trees + b3_kinematicBody, wakeBounds, B3_DEFAULT_MASK_BITS, false,
+							 b3VoxelWakeQueryCallback, &wake );
+	}
 	for ( int i = 0; i < wake.count; ++i )
 	{
 		b3Body* other = b3Array_Get( world->bodies, wake.bodyIds[i] );
@@ -1784,7 +1798,7 @@ void b3Shape_VoxelGridSetCells( b3ShapeId shapeId, const int* paddedCells, const
 	b3VoxelGrid* grid = shape->voxelGrid;
 	b3AABB changed = b3VoxelGridCellsBounds( grid, paddedCells, count );
 	b3VoxelGrid_SetCells( grid, paddedCells, modules, count );
-	b3RefreshVoxelGridContacts( world, shape, changed, grid->cellMeters );
+	b3RefreshVoxelGridContacts( world, shape, b3AABB_Inflate( changed, grid->cellMeters ), changed, false );
 
 	world->locked = false;
 }
@@ -1809,13 +1823,29 @@ bool b3Shape_VoxelGridReplaceModule( b3ShapeId shapeId, int index, b3VoxelGridMo
 
 	world->locked = true;
 
+	// Every box key of the module's cells is renumbered: their contacts all re-query. Only bodies near `changed` wake.
+	b3AABB cells = { { FLT_MAX, FLT_MAX, FLT_MAX }, { -FLT_MAX, -FLT_MAX, -FLT_MAX } };
+	for ( int padded = 0; padded < grid->paddedCount; ++padded )
+	{
+		if ( grid->paddedModules[padded] == index )
+		{
+			cells = b3AABB_Union( cells, b3VoxelGridCellsBounds( grid, &padded, 1 ) );
+		}
+	}
+
 	b3RetainVoxelGridModule( module );
 	b3ReleaseVoxelGridModule( grid->modules[index] );
 	grid->modules[index] = module;
 	b3VoxelGrid_RecomputeOccupiedBounds( grid );
-	if ( changed.lowerBound.x <= changed.upperBound.x && changed.lowerBound.y <= changed.upperBound.y && changed.lowerBound.z <= changed.upperBound.z )
+	bool bounded = changed.lowerBound.x <= changed.upperBound.x && changed.lowerBound.y <= changed.upperBound.y && changed.lowerBound.z <= changed.upperBound.z;
+	if ( bounded )
 	{
-		b3RefreshVoxelGridContacts( world, shape, changed, B3_SPECULATIVE_DISTANCE );
+		b3RefreshVoxelGridContacts( world, shape, b3AABB_Union( cells, b3AABB_Inflate( changed, B3_SPECULATIVE_DISTANCE ) ), changed, true );
+	}
+	else if ( cells.lowerBound.x <= cells.upperBound.x )
+	{
+		// No bounds given: the module's cells are the change.
+		b3RefreshVoxelGridContacts( world, shape, cells, cells, true );
 	}
 
 	world->locked = false;
@@ -1859,7 +1889,7 @@ void b3Shape_VoxelGridSetOccupancyCells( b3ShapeId shapeId, const int* paddedCel
 	world->locked = true;
 	b3AABB changed = b3VoxelGridCellsBounds( occupancy, paddedCells, count );
 	b3VoxelGrid_SetCells( occupancy, paddedCells, modules, count );
-	b3RefreshVoxelGridContacts( world, shape, changed, occupancy->cellMeters );
+	b3RefreshVoxelGridContacts( world, shape, b3AABB_Inflate( changed, occupancy->cellMeters ), changed, true );
 	world->locked = false;
 }
 

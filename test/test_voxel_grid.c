@@ -1701,13 +1701,140 @@ static int VoxelGridMergedRegionReplace( void )
 	ENSURE( b3Body_GetPosition( dropped ).y < -1.0f );
 	ENSURE_SMALL( b3Body_GetPosition( resting ).y - ( SLAB_HEIGHT + half ), 0.05f );
 
+	// Region 3 (under the resting box) keeps its slab as two boxes, changed at its near corner: every box key of the region
+	// is renumbered, so its contacts re-query, and the box away from the change rests as it was, asleep.
+	for ( int i = 0; i < 120; ++i ) b3World_Step( world.worldId, 1.0f / 60.0f, 4 );
+	ENSURE( b3Body_IsAwake( resting ) == false );
+	float split[12] = { 0, 0, 0, regionMeters, SLAB_HEIGHT, 1.0f, 0, 0, 1.0f, regionMeters, SLAB_HEIGHT, regionMeters };
+	uint8_t splitFaces[2] = { 1 << 5, 1 << 4 };
+	b3VoxelGridModule* resplit = b3CreateVoxelGridModule( split, 2, regionMeters, CELL_VOXELS );
+	ENSURE( resplit != NULL );
+	b3VoxelGridModule_SetCoveredFaces( resplit, splitFaces, 2 );
+	b3AABB corner = { { regionMeters, 0, regionMeters }, { regionMeters + 0.5f, SLAB_HEIGHT, regionMeters + 0.5f } };
+	ENSURE( b3Shape_VoxelGridReplaceModule( shape, 3, resplit, corner ) );
+	b3ReleaseVoxelGridModule( resplit );
+	ENSURE( b3Body_IsAwake( resting ) == false );
+	for ( int i = 0; i < 60; ++i ) b3World_Step( world.worldId, 1.0f / 60.0f, 4 );
+	ENSURE_SMALL( b3Body_GetPosition( resting ).y - ( SLAB_HEIGHT + half ), 0.05f );
+
 	for ( int r = 0; r < 4; ++r ) b3ReleaseVoxelGridModule( regions[r] );
 	DestroyWorld( &world );
 	return 0;
 }
 
+
+// A one-cell static merged body carved at a corner in place (D755) behaves as the same body made again: a box resting on
+// the uncarved part stays where it rests, the carved corner is open and the rest of the cell solid. `inPlace` picks the
+// path: the live shape's occupancy and region edited, or the shape destroyed and created from the carved data.
+static int MergedCornerCarve( bool inPlace, float* restingY, bool* openCorner, bool* solidRest )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+	b3World_EnableVoxelPointContacts( worldId, true );
+
+	float cube[6] = { 0, 0, 0, CELL_METERS, CELL_METERS, CELL_METERS };
+	float carved[18] = { 0, 0, 0, 2.0f, 1.7f, 2.0f, 0, 1.7f, 0, 1.7f, 2.0f, 2.0f, 1.7f, 1.7f, 0, 2.0f, 2.0f, 1.7f };
+	b3VoxelGridModule* page = b3CreateVoxelGridModule( cube, 1, CELL_METERS, CELL_VOXELS );
+	b3VoxelGridModule* carvedPage = b3CreateVoxelGridModule( carved, 3, CELL_METERS, CELL_VOXELS );
+	const float regionMeters = 4.0f * CELL_METERS;
+	b3VoxelGridModule* region = b3CreateVoxelGridModule( cube, 1, regionMeters, CELL_VOXELS );
+	b3VoxelGridModule* carvedRegion = b3CreateVoxelGridModule( carved, 3, regionMeters, CELL_VOXELS );
+	uint8_t none[3] = { 0, 0, 0 };
+	b3VoxelGridModule_SetCoveredFaces( region, none, 1 );
+	b3VoxelGridModule_SetCoveredFaces( carvedRegion, none, 3 );
+
+	int padded[27];
+	for ( int i = 0; i < 27; ++i ) padded[i] = -1;
+	padded[13] = 0;
+	b3VoxelGridDef occupancyDef = { 0 };
+	occupancyDef.cellCountX = occupancyDef.cellCountY = occupancyDef.cellCountZ = 1;
+	occupancyDef.cellMeters = CELL_METERS;
+	occupancyDef.cellVoxels = CELL_VOXELS;
+	occupancyDef.modules = &page;
+	occupancyDef.moduleCount = 1;
+	occupancyDef.paddedCells = padded;
+	b3VoxelGrid* occupancy = b3CreateVoxelGrid( &occupancyDef );
+	b3VoxelGridDef mergedDef = { 0 };
+	mergedDef.cellCountX = mergedDef.cellCountY = mergedDef.cellCountZ = 1;
+	mergedDef.cellMeters = regionMeters;
+	mergedDef.cellVoxels = CELL_VOXELS;
+	mergedDef.maxBoxesPerCell = 1 << 24;
+	mergedDef.modules = &region;
+	mergedDef.moduleCount = 1;
+	mergedDef.paddedCells = padded;
+	mergedDef.occupancy = occupancy;
+	b3VoxelGrid* merged = b3CreateVoxelGrid( &mergedDef );
+	b3ReleaseVoxelGrid( occupancy );
+	ENSURE( merged != NULL );
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	b3BodyId ground = b3CreateBody( worldId, &bodyDef );
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	b3ShapeId shape = b3CreateVoxelGridShape( ground, &shapeDef, merged );
+	b3ReleaseVoxelGrid( merged );
+
+	b3BodyDef boxDef = b3DefaultBodyDef();
+	boxDef.type = b3_dynamicBody;
+	float half = 0.25f;
+	boxDef.position = ( b3Vec3 ){ 0.5f, CELL_METERS + half + 0.02f, 0.5f };
+	b3BodyId box = b3CreateBody( worldId, &boxDef );
+	b3BoxHull hull = b3MakeBoxHull( half, half, half );
+	b3ShapeDef boxShape = b3DefaultShapeDef();
+	b3CreateHullShape( box, &boxShape, &hull.base );
+	for ( int i = 0; i < 300; ++i ) b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	ENSURE( b3Body_IsAwake( box ) == false );
+
+	if ( inPlace )
+	{
+		ENSURE( b3Shape_VoxelGridAddOccupancyModule( shape, carvedPage ) == 1 );
+		int cells[1] = { 13 }, modules[1] = { 1 };
+		b3Shape_VoxelGridSetOccupancyCells( shape, cells, modules, 1 );
+		b3AABB changed = { { 0, 0, 0 }, { CELL_METERS, CELL_METERS, CELL_METERS } };
+		ENSURE( b3Shape_VoxelGridReplaceModule( shape, 0, carvedRegion, changed ) );
+	}
+	else
+	{
+		b3DestroyShape( shape, true );
+		occupancyDef.modules = &carvedPage;
+		occupancy = b3CreateVoxelGrid( &occupancyDef );
+		mergedDef.modules = &carvedRegion;
+		mergedDef.occupancy = occupancy;
+		merged = b3CreateVoxelGrid( &mergedDef );
+		b3ReleaseVoxelGrid( occupancy );
+		shape = b3CreateVoxelGridShape( ground, &shapeDef, merged );
+		b3ReleaseVoxelGrid( merged );
+	}
+	const b3VoxelGrid* live = b3VoxelGrid_GetOccupancy( b3Shape_GetVoxelGrid( shape ) );
+	*openCorner = !b3IsVoxelSolid( live, 19, 19, 19, false );
+	*solidRest = b3IsVoxelSolid( live, 5, 19, 5, false ) && b3IsVoxelSolid( live, 19, 5, 19, false );
+	for ( int i = 0; i < 60; ++i ) b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	*restingY = b3Body_GetPosition( box ).y;
+
+	b3DestroyWorld( worldId );
+	b3ReleaseVoxelGridModule( page );
+	b3ReleaseVoxelGridModule( carvedPage );
+	b3ReleaseVoxelGridModule( region );
+	b3ReleaseVoxelGridModule( carvedRegion );
+	return 0;
+}
+
+static int VoxelGridMergedCornerCarveInPlace( void )
+{
+	float inPlaceY = 0, madeY = 0;
+	bool inPlaceOpen = false, madeOpen = false, inPlaceSolid = false, madeSolid = false;
+	ENSURE( MergedCornerCarve( true, &inPlaceY, &inPlaceOpen, &inPlaceSolid ) == 0 );
+	ENSURE( MergedCornerCarve( false, &madeY, &madeOpen, &madeSolid ) == 0 );
+	printf( "  corner carve: in place y %.3f open %d solid %d, made again y %.3f open %d solid %d\n", inPlaceY, inPlaceOpen, inPlaceSolid, madeY,
+			madeOpen, madeSolid );
+	ENSURE( inPlaceOpen && madeOpen && inPlaceSolid && madeSolid );
+	ENSURE_SMALL( inPlaceY - ( CELL_METERS + 0.25f ), 0.05f );
+	ENSURE_SMALL( inPlaceY - madeY, 0.01f );
+	return 0;
+}
+
 int VoxelGridTest( void )
 {
+	RUN_SUBTEST( VoxelGridMergedCornerCarveInPlace );
 	RUN_SUBTEST( VoxelGridMergedRegionReplace );
 	RUN_SUBTEST( VoxelGridMergedBodyOccupancyAndRest );
 	RUN_SUBTEST( VoxelGridModuleCover );
