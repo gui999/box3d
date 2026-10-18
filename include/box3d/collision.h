@@ -779,6 +779,9 @@ B3_API int b3VoxelGrid_GetPaddedCellCount( const b3VoxelGrid* grid );
 /// Get the number of modules.
 B3_API int b3VoxelGrid_GetModuleCount( const b3VoxelGrid* grid );
 
+/// The exact occupancy grid of a merged grid, or NULL.
+B3_API const b3VoxelGrid* b3VoxelGrid_GetOccupancy( const b3VoxelGrid* grid );
+
 /// Get the number of solid boxes in the collidable cells.
 B3_API int b3VoxelGrid_GetBoxCount( const b3VoxelGrid* grid );
 

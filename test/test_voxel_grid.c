@@ -1628,8 +1628,87 @@ static int VoxelGridMergedBodyOccupancyAndRest( void )
 	return 0;
 }
 
+
+// A merged body's boxes in regions (D755): replacing one region's module and its occupancy cells in place keeps the shape,
+// drops what rested on that region and leaves a body resting on another region asleep.
+static int VoxelGridMergedRegionReplace( void )
+{
+	World world;
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	world.worldId = b3CreateWorld( &worldDef );
+	b3World_EnableVoxelPointContacts( world.worldId, true );
+	ENSURE( MakeFloor( &world.floor, 4, -1, -1, -1 ) );
+
+	// Two regions of two cells a side along x and z (2 x 1 x 2), each a slab over its cells
+	const float regionMeters = 2.0f * CELL_METERS;
+	float slab[6] = { 0, 0, 0, regionMeters, SLAB_HEIGHT, regionMeters };
+	uint8_t faces[1] = { 0 };
+	b3VoxelGridModule* regions[4];
+	for ( int r = 0; r < 4; ++r )
+	{
+		regions[r] = b3CreateVoxelGridModule( slab, 1, regionMeters, CELL_VOXELS );
+		ENSURE( regions[r] != NULL );
+		b3VoxelGridModule_SetCoveredFaces( regions[r], faces, 1 );
+	}
+	int padded[4 * 3 * 4];
+	for ( int i = 0; i < 4 * 3 * 4; ++i ) padded[i] = -1;
+	for ( int k = 0; k < 2; ++k )
+		for ( int i = 0; i < 2; ++i ) padded[( 1 * 4 + ( k + 1 ) ) * 4 + ( i + 1 )] = k * 2 + i;
+	b3VoxelGridDef def = { 0 };
+	def.cellCountX = 2;
+	def.cellCountY = 1;
+	def.cellCountZ = 2;
+	def.cellMeters = regionMeters;
+	def.cellVoxels = CELL_VOXELS;
+	def.maxBoxesPerCell = 1 << 20;
+	def.modules = regions;
+	def.moduleCount = 4;
+	def.paddedCells = padded;
+	def.occupancy = world.floor.grid;
+	b3VoxelGrid* merged = b3CreateVoxelGrid( &def );
+	ENSURE( merged != NULL );
+	ENSURE( b3VoxelGrid_GetOccupancy( merged ) == world.floor.grid );
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	b3BodyId floorBody = b3CreateBody( world.worldId, &bodyDef );
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	b3ShapeId shape = b3CreateVoxelGridShape( floorBody, &shapeDef, merged );
+	ENSURE( B3_IS_NON_NULL( shape ) );
+	b3ReleaseVoxelGrid( merged );
+
+	float half = 0.5f;
+	b3BodyId dropped = CreateBox( &world, ( b3Vec3 ){ 1.0f, SLAB_HEIGHT + half + 0.02f, 1.0f }, half, 0.6f );
+	b3BodyId resting = CreateBox( &world, ( b3Vec3 ){ 7.0f, SLAB_HEIGHT + half + 0.02f, 7.0f }, half, 0.6f );
+	for ( int i = 0; i < 300; ++i ) b3World_Step( world.worldId, 1.0f / 60.0f, 4 );
+	ENSURE( b3Body_IsAwake( dropped ) == false && b3Body_IsAwake( resting ) == false );
+
+	// Region 0 (cells 0..1 in x and z) loses its boxes and its occupancy
+	b3VoxelGridModule* empty = b3CreateVoxelGridModule( NULL, 0, regionMeters, CELL_VOXELS );
+	ENSURE( empty != NULL );
+	b3AABB changed = { { 0, 0, 0 }, { regionMeters, CELL_METERS, regionMeters } };
+	int cells[4] = { PaddedIndex( &world.floor, 0, 0, 0 ), PaddedIndex( &world.floor, 1, 0, 0 ), PaddedIndex( &world.floor, 0, 0, 1 ),
+					 PaddedIndex( &world.floor, 1, 0, 1 ) };
+	int none[4] = { -1, -1, -1, -1 };
+	b3Shape_VoxelGridSetOccupancyCells( shape, cells, none, 4 );
+	ENSURE( b3Shape_VoxelGridReplaceModule( shape, 0, empty, changed ) );
+	b3ReleaseVoxelGridModule( empty );
+	ENSURE( b3Shape_IsValid( shape ) );
+	ENSURE( b3Body_IsAwake( dropped ) == true );
+	ENSURE( b3Body_IsAwake( resting ) == false );
+
+	for ( int i = 0; i < 60; ++i ) b3World_Step( world.worldId, 1.0f / 60.0f, 4 );
+	printf( "  region replace: dropped y %.3f, resting y %.3f\n", b3Body_GetPosition( dropped ).y, b3Body_GetPosition( resting ).y );
+	ENSURE( b3Body_GetPosition( dropped ).y < -1.0f );
+	ENSURE_SMALL( b3Body_GetPosition( resting ).y - ( SLAB_HEIGHT + half ), 0.05f );
+
+	for ( int r = 0; r < 4; ++r ) b3ReleaseVoxelGridModule( regions[r] );
+	DestroyWorld( &world );
+	return 0;
+}
+
 int VoxelGridTest( void )
 {
+	RUN_SUBTEST( VoxelGridMergedRegionReplace );
 	RUN_SUBTEST( VoxelGridMergedBodyOccupancyAndRest );
 	RUN_SUBTEST( VoxelGridModuleCover );
 	RUN_SUBTEST( VoxelGridRayCast );

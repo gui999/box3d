@@ -1675,47 +1675,17 @@ static bool b3VoxelWakeQueryCallback( int proxyId, uint64_t userData, void* cont
 	return true;
 }
 
-// Changing cells changes what a contact finds. The contacts of the shape forget their cached boxes and re-query on the
-// next step, keeping their manifolds so impulses carry over; bodies near the change are woken.
-void b3Shape_VoxelGridSetCells( b3ShapeId shapeId, const int* paddedCells, const int* modules, int count )
+// Contacts of a grid shape after its boxes changed inside `changed` (grid frame): those whose boxes may differ forget their
+// cached boxes and re-query on the next step, keeping their manifolds so impulses carry over; bodies near the change wake.
+// Boxes within `reach` of the change may change their covered faces.
+static void b3RefreshVoxelGridContacts( b3World* world, b3Shape* shape, b3AABB changed, float reach )
 {
-	b3World* world = b3GetUnlockedWorld( shapeId.world0 );
-	if ( world == NULL || count <= 0 )
-	{
-		return;
-	}
-
-	world->locked = true;
-
-	b3Shape* shape = b3GetShape( world, shapeId );
-	B3_ASSERT( shape->type == b3_voxelGridShape );
-	b3VoxelGrid* grid = shape->voxelGrid;
-
-	// The bounds of the changed cells in the grid frame, the padding ring included
-	b3AABB changed = { { FLT_MAX, FLT_MAX, FLT_MAX }, { -FLT_MAX, -FLT_MAX, -FLT_MAX } };
-	int sx = grid->size[0] + 2, sz = grid->size[2] + 2;
-	for ( int n = 0; n < count; ++n )
-	{
-		int padded = paddedCells[n];
-		B3_ASSERT( 0 <= padded && padded < grid->paddedCount );
-		int i = padded % sx - 1;
-		int k = ( padded / sx ) % sz - 1;
-		int j = padded / ( sx * sz ) - 1;
-		b3Vec3 lower = { grid->origin.x + (float)i * grid->cellMeters, grid->origin.y + (float)j * grid->cellMeters,
-						 grid->origin.z + (float)k * grid->cellMeters };
-		b3Vec3 upper = { lower.x + grid->cellMeters, lower.y + grid->cellMeters, lower.z + grid->cellMeters };
-		changed.lowerBound = b3Min( changed.lowerBound, lower );
-		changed.upperBound = b3Max( changed.upperBound, upper );
-	}
-
-	b3VoxelGrid_SetCells( grid, paddedCells, modules, count );
-
 	b3Body* body = b3Array_Get( world->bodies, shape->bodyId );
 	b3Transform gridTransform = b3ToRelativeTransform( b3GetBodyTransformQuick( world, body ), b3Pos_zero );
 
 	// Boxes in the cells next to a changed cell change their covered faces
 	// The cached query bounds of a contact are in the grid frame
-	b3AABB affected = b3AABB_Inflate( changed, grid->cellMeters );
+	b3AABB affected = b3AABB_Inflate( changed, reach );
 	b3AABB wakeBounds = b3AABB_Transform( gridTransform, b3AABB_Inflate( changed, 2.0f * B3_SPECULATIVE_DISTANCE ) );
 
 	int shapeIndex = shape->id;
@@ -1775,6 +1745,121 @@ void b3Shape_VoxelGridSetCells( b3ShapeId shapeId, const int* paddedCells, const
 		}
 	}
 
+}
+
+// The bounds, in the grid frame, of padded cells.
+static b3AABB b3VoxelGridCellsBounds( const b3VoxelGrid* grid, const int* paddedCells, int count )
+{
+	b3AABB changed = { { FLT_MAX, FLT_MAX, FLT_MAX }, { -FLT_MAX, -FLT_MAX, -FLT_MAX } };
+	int sx = grid->size[0] + 2, sz = grid->size[2] + 2;
+	for ( int n = 0; n < count; ++n )
+	{
+		int padded = paddedCells[n];
+		B3_ASSERT( 0 <= padded && padded < grid->paddedCount );
+		int i = padded % sx - 1;
+		int k = ( padded / sx ) % sz - 1;
+		int j = padded / ( sx * sz ) - 1;
+		b3Vec3 lower = { grid->origin.x + (float)i * grid->cellMeters, grid->origin.y + (float)j * grid->cellMeters,
+						 grid->origin.z + (float)k * grid->cellMeters };
+		b3Vec3 upper = { lower.x + grid->cellMeters, lower.y + grid->cellMeters, lower.z + grid->cellMeters };
+		changed.lowerBound = b3Min( changed.lowerBound, lower );
+		changed.upperBound = b3Max( changed.upperBound, upper );
+	}
+	return changed;
+}
+
+// Changing cells changes what a contact finds (b3RefreshVoxelGridContacts).
+void b3Shape_VoxelGridSetCells( b3ShapeId shapeId, const int* paddedCells, const int* modules, int count )
+{
+	b3World* world = b3GetUnlockedWorld( shapeId.world0 );
+	if ( world == NULL || count <= 0 )
+	{
+		return;
+	}
+
+	world->locked = true;
+
+	b3Shape* shape = b3GetShape( world, shapeId );
+	B3_ASSERT( shape->type == b3_voxelGridShape );
+	b3VoxelGrid* grid = shape->voxelGrid;
+	b3AABB changed = b3VoxelGridCellsBounds( grid, paddedCells, count );
+	b3VoxelGrid_SetCells( grid, paddedCells, modules, count );
+	b3RefreshVoxelGridContacts( world, shape, changed, grid->cellMeters );
+
+	world->locked = false;
+}
+
+// A module of the grid replaced in place (a region of a merged body's boxes): every cell naming it now holds the new boxes.
+// `changed` (grid frame) bounds the boxes that differ; contacts and wakes follow it, not the whole module.
+bool b3Shape_VoxelGridReplaceModule( b3ShapeId shapeId, int index, b3VoxelGridModule* module, b3AABB changed )
+{
+	b3World* world = b3GetUnlockedWorld( shapeId.world0 );
+	if ( world == NULL )
+	{
+		return false;
+	}
+
+	b3Shape* shape = b3GetShape( world, shapeId );
+	B3_ASSERT( shape->type == b3_voxelGridShape );
+	b3VoxelGrid* grid = shape->voxelGrid;
+	if ( index < 0 || index >= grid->moduleCount || module->boxCount > ( 1 << grid->boxBits ) || module->cellVoxels != grid->cellVoxels )
+	{
+		return false;
+	}
+
+	world->locked = true;
+
+	b3RetainVoxelGridModule( module );
+	b3ReleaseVoxelGridModule( grid->modules[index] );
+	grid->modules[index] = module;
+	b3VoxelGrid_RecomputeOccupiedBounds( grid );
+	if ( changed.lowerBound.x <= changed.upperBound.x && changed.lowerBound.y <= changed.upperBound.y && changed.lowerBound.z <= changed.upperBound.z )
+	{
+		b3RefreshVoxelGridContacts( world, shape, changed, B3_SPECULATIVE_DISTANCE );
+	}
+
+	world->locked = false;
+	return true;
+}
+
+int b3Shape_VoxelGridAddOccupancyModule( b3ShapeId shapeId, b3VoxelGridModule* module )
+{
+	b3World* world = b3GetUnlockedWorld( shapeId.world0 );
+	if ( world == NULL )
+	{
+		return -1;
+	}
+
+	b3Shape* shape = b3GetShape( world, shapeId );
+	B3_ASSERT( shape->type == b3_voxelGridShape );
+	if ( shape->voxelGrid->occupancy == NULL )
+	{
+		return -1;
+	}
+
+	return b3VoxelGrid_AddModule( shape->voxelGrid->occupancy, module );
+}
+
+void b3Shape_VoxelGridSetOccupancyCells( b3ShapeId shapeId, const int* paddedCells, const int* modules, int count )
+{
+	b3World* world = b3GetUnlockedWorld( shapeId.world0 );
+	if ( world == NULL || count <= 0 )
+	{
+		return;
+	}
+
+	b3Shape* shape = b3GetShape( world, shapeId );
+	B3_ASSERT( shape->type == b3_voxelGridShape );
+	b3VoxelGrid* occupancy = shape->voxelGrid->occupancy;
+	if ( occupancy == NULL )
+	{
+		return;
+	}
+
+	world->locked = true;
+	b3AABB changed = b3VoxelGridCellsBounds( occupancy, paddedCells, count );
+	b3VoxelGrid_SetCells( occupancy, paddedCells, modules, count );
+	b3RefreshVoxelGridContacts( world, shape, changed, occupancy->cellMeters );
 	world->locked = false;
 }
 

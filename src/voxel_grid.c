@@ -316,6 +316,11 @@ static void b3RecomputeOccupiedBounds( b3VoxelGrid* grid )
 	grid->occupiedBounds = bounds;
 }
 
+void b3VoxelGrid_RecomputeOccupiedBounds( b3VoxelGrid* grid )
+{
+	b3RecomputeOccupiedBounds( grid );
+}
+
 b3VoxelGrid* b3CreateVoxelGrid( const b3VoxelGridDef* def )
 {
 	if ( def->occupancy != NULL && def->occupancy->occupancy != NULL ) return NULL;
@@ -518,6 +523,11 @@ void b3VoxelGrid_SetCells( b3VoxelGrid* grid, const int* paddedCells, const int*
 int b3VoxelGrid_GetPaddedCellCount( const b3VoxelGrid* grid )
 {
 	return grid->paddedCount;
+}
+
+const b3VoxelGrid* b3VoxelGrid_GetOccupancy( const b3VoxelGrid* grid )
+{
+	return grid->occupancy;
 }
 
 int b3VoxelGrid_GetModuleCount( const b3VoxelGrid* grid )

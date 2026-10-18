@@ -168,3 +168,6 @@ bool b3IsVoxelBoxEnclosed( const b3VoxelGrid* grid, int cell, int box );
 // Is the voxel solid? x, y, z are voxels from the grid origin. With includeRing the padding ring's cells count (solid beyond
 // the grid, owned by a neighbour shape), without it only the grid's own cells do.
 bool b3IsVoxelSolid( const b3VoxelGrid* grid, int x, int y, int z, bool includeRing );
+
+// The occupied bounds again from every cell (after a module was replaced in place).
+void b3VoxelGrid_RecomputeOccupiedBounds( b3VoxelGrid* grid );

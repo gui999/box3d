@@ -856,6 +856,17 @@ B3_API int b3Shape_VoxelGridAddModule( b3ShapeId shapeId, b3VoxelGridModule* mod
 /// bodies near the changed cells. Call between steps.
 B3_API void b3Shape_VoxelGridSetCells( b3ShapeId shapeId, const int* paddedCells, const int* modules, int count );
 
+/// Replace the shape grid's module at `index` in place (a region of a merged body's boxes), refreshing the contacts and
+/// waking the bodies near `changed` (the grid frame bounds of the boxes that differ). False when the module does not fit
+/// the grid's cells. Call between steps.
+B3_API bool b3Shape_VoxelGridReplaceModule( b3ShapeId shapeId, int index, b3VoxelGridModule* module, b3AABB changed );
+
+/// Append a module to the exact occupancy grid of a merged grid shape. Returns its index, or -1 without one. Call between steps.
+B3_API int b3Shape_VoxelGridAddOccupancyModule( b3ShapeId shapeId, b3VoxelGridModule* module );
+
+/// Set cells of a merged grid shape's exact occupancy grid, refreshing contacts near them. Call between steps.
+B3_API void b3Shape_VoxelGridSetOccupancyCells( b3ShapeId shapeId, const int* paddedCells, const int* modules, int count );
+
 /// Baked compound shapes are only allowed on static bodies.
 /// Note: runtime compounds are achieved by adding multiple shapes to a body.
 /// Runtime compounds can be dynamic and/or kinematic.
