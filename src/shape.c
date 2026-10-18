@@ -1675,8 +1675,8 @@ static bool b3VoxelWakeQueryCallback( int proxyId, uint64_t userData, void* cont
 	return true;
 }
 
-// A body the edit may now overlap: its shape's bounds meet a box of the edited grid inside the change (geometry added
-// into or next to a body that rests close without touching the grid).
+// A body the edit may now overlap: its shape's bounds sink into a box of the edited grid inside the change (geometry
+// added around a body that rests close without touching the grid).
 typedef struct b3VoxelOverlapWakeContext
 {
 	b3VoxelWakeContext* wake;
@@ -1685,13 +1685,26 @@ typedef struct b3VoxelOverlapWakeContext
 	b3AABB changed;
 } b3VoxelOverlapWakeContext;
 
+// A box the body's bounds sink into by more than the speculative distance on every axis: a neighbour resting against the
+// grid's face meets it only on that face, and is the touching rule's.
+typedef struct b3VoxelSinkContext
+{
+	b3AABB reach;
+	bool found;
+} b3VoxelSinkContext;
+
 static bool b3VoxelBoxFound( int cell, int box, b3AABB bounds, void* context )
 {
 	B3_UNUSED( cell );
 	B3_UNUSED( box );
-	B3_UNUSED( bounds );
-	*(bool*)context = true;
-	return false;
+	b3VoxelSinkContext* sink = context;
+	b3Vec3 low = b3Max( bounds.lowerBound, sink->reach.lowerBound ), high = b3Min( bounds.upperBound, sink->reach.upperBound );
+	if ( high.x - low.x > B3_SPECULATIVE_DISTANCE && high.y - low.y > B3_SPECULATIVE_DISTANCE && high.z - low.z > B3_SPECULATIVE_DISTANCE )
+	{
+		sink->found = true;
+		return false;
+	}
+	return true;
 }
 
 static bool b3VoxelOverlapWakeCallback( int proxyId, uint64_t userData, void* context )
@@ -1710,9 +1723,9 @@ static bool b3VoxelOverlapWakeCallback( int proxyId, uint64_t userData, void* co
 		return true;
 	}
 
-	bool found = false;
-	b3QueryVoxelGrid( overlap->grid, reach, b3VoxelBoxFound, &found );
-	if ( found )
+	b3VoxelSinkContext sink = { reach, false };
+	b3QueryVoxelGrid( overlap->grid, reach, b3VoxelBoxFound, &sink );
+	if ( sink.found )
 	{
 		b3VoxelWakeQueryCallback( proxyId, userData, overlap->wake );
 	}
