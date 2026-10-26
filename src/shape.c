@@ -1809,7 +1809,7 @@ static void b3RefreshVoxelGridContacts( b3World* world, b3Shape* shape, b3AABB a
 		}
 
 		const b3Shape* otherShape = b3Array_Get( world->shapes, isA ? contact->shapeIdB : contact->shapeIdA );
-		if ( touching && ( contact->flags & b3_contactTouchingFlag ) != 0 && b3AABB_Overlaps( otherShape->fatAABB, wakeBounds ) )
+		if ( touching && ( contact->flags & b3_contactTouchingFlag ) != 0 && b3AABB_Overlaps( world->fatAABBs.data[otherShape->id], wakeBounds ) )
 		{
 			b3VoxelWakeQueryCallback( 0, (uint64_t)otherShape->id, &wake );
 		}
@@ -1824,7 +1824,7 @@ static void b3RefreshVoxelGridContacts( b3World* world, b3Shape* shape, b3AABB a
 		{
 			continue;
 		}
-		if ( !findsBoxesOnce && !b3AABB_Overlaps( b3AABB_Transform( b3InvertTransform( gridTransform ), otherShape->fatAABB ), affected ) )
+		if ( !findsBoxesOnce && !b3AABB_Overlaps( b3AABB_Transform( b3InvertTransform( gridTransform ), world->fatAABBs.data[otherShape->id] ), affected ) )
 		{
 			continue;
 		}
@@ -2204,8 +2204,9 @@ bool b3CommitPreparedVoxelGridEdit( b3PreparedVoxelGridEdit* edit )
 	// Preserve contacts while publishing the new moving-grid AABB into the broad phase.
 	b3Body* body = b3Array_Get( world->bodies, shape->bodyId );
 	b3BodyType proxyType = shape->proxyKey == B3_NULL_INDEX ? body->type : B3_PROXY_TYPE( shape->proxyKey );
-	b3UpdateShapeAABBs( shape, b3GetBodyTransformQuick( world, body ), proxyType );
-	if ( shape->proxyKey != B3_NULL_INDEX ) b3BroadPhase_MoveProxy( &world->broadPhase, shape->proxyKey, shape->fatAABB );
+	b3AABB* fatAABB = world->fatAABBs.data + shape->id;
+	b3UpdateShapeAABBs( shape, fatAABB, b3GetBodyTransformQuick( world, body ), proxyType );
+	if ( shape->proxyKey != B3_NULL_INDEX ) b3BroadPhase_MoveProxy( &world->broadPhase, shape->proxyKey, *fatAABB );
 	world->locked = false;
 	return true;
 }
