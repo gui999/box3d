@@ -322,7 +322,13 @@ typedef struct b3ContinuousContext
 	b3Sweep sweep;
 	// World base for re-centering sweeps. Keeps TOI in float precision far from the origin.
 	b3Pos base;
-	float fraction;
+    float fraction;
+    // The last admitted earliest impact, retained only for observational capture.
+    b3ShapeId clipMovingShape;
+    b3ShapeId clipOtherShape;
+    uint64_t clipOtherShapeUserData;
+    b3Pos clipPoint;
+    b3Vec3 clipNormal;
 	b3SensorHit sensorHits[B2_MAX_CONTINUOUS_SENSOR_HITS];
 	float sensorFractions[B2_MAX_CONTINUOUS_SENSOR_HITS];
 	int sensorCount;
@@ -356,6 +362,12 @@ static bool b3ContinuousQueryCallback( int proxyId, uint64_t userData, void* con
 
 	// Skip same body
 	if ( shape->bodyId == fastShape->bodyId )
+	{
+		return true;
+	}
+
+	// Terra: skip a shape whose impulse limit gave way this step, so a body carries on through what it breaks
+	if ( world->enableLimitPassThrough && shape->limitReachedStep == world->stepIndex )
 	{
 		return true;
 	}
@@ -447,6 +459,11 @@ static bool b3ContinuousQueryCallback( int proxyId, uint64_t userData, void* con
 		if ( didHit )
 		{
 			continuousContext->fraction = output.fraction;
+            continuousContext->clipMovingShape = (b3ShapeId){ fastShape->id + 1, world->worldId, fastShape->generation };
+            continuousContext->clipOtherShape = (b3ShapeId){ shape->id + 1, world->worldId, shape->generation };
+            continuousContext->clipOtherShapeUserData = (uint64_t)(uintptr_t)shape->userData;
+            continuousContext->clipPoint = b3OffsetPos( continuousContext->base, output.point );
+            continuousContext->clipNormal = output.normal;
 			continuousContext->distanceIterations = b3MaxInt( continuousContext->distanceIterations, output.distanceIterations );
 			continuousContext->pushBackIterations = b3MaxInt( continuousContext->pushBackIterations, output.pushBackIterations );
 			continuousContext->rootIterations = b3MaxInt( continuousContext->rootIterations, output.rootIterations );
@@ -585,6 +602,23 @@ static void b3SolveContinuous( b3World* world, int bodySimIndex, b3TaskContext* 
 		// Advance body
 		b3WorldTransform transform = { b3OffsetPos( base, origin ), q };
 		b3Pos center = b3OffsetPos( base, c );
+        int slot = b3AtomicFetchAddInt( &world->ccdClipEventCount, 1 );
+        if ( slot < B3_CCD_CLIP_CAPACITY )
+        {
+            world->ccdClipEvents[slot] = (b3CcdClipEvent){
+                .bodyUserData = (uint64_t)(uintptr_t)fastBody->userData,
+                .otherShapeUserData = context.clipOtherShapeUserData,
+                .body = (b3BodyId){ fastBody->id + 1, world->worldId, fastBody->generation },
+                .movingShape = context.clipMovingShape,
+                .otherShape = context.clipOtherShape,
+                .fraction = context.fraction,
+                .preClip = fastBodySim->transform,
+                .postClip = transform,
+                .removedDisplacement = b3SubPos( fastBodySim->transform.p, transform.p ),
+                .point = context.clipPoint,
+                .normal = context.clipNormal,
+            };
+        }
 		fastBodySim->transform = transform;
 		fastBodySim->center = center;
 		fastBodySim->rotation0 = q;
@@ -1119,6 +1153,10 @@ static void b3ExecuteStage( b3SolverStage* stage, b3StepContext* context, int pr
 			// syncIndex but we only copy .block, so the struct copy never aliases the CAS target.
 			b3ExecuteBlock( stage, context, blocks[blockIndex].block, workerIndex );
 			completedCount += 1;
+
+			// Terra: report each block as it finishes instead of once per sweep, so a worker preempted after
+			// its last block (before the sweep ends) cannot hold up the stage barrier on the main thread.
+			(void)b3AtomicFetchAddInt( &stage->completionCount, 1 );
 		}
 
 		blockIndex += 1;
@@ -1128,7 +1166,7 @@ static void b3ExecuteStage( b3SolverStage* stage, b3StepContext* context, int pr
 		}
 	}
 
-	(void)b3AtomicFetchAddInt( &stage->completionCount, completedCount );
+	B3_UNUSED( completedCount );
 }
 
 // Execute a stage on worker 0 (main thread).
@@ -1157,9 +1195,16 @@ static void b3ExecuteMainStage( b3SolverStage* stage, b3StepContext* context, ui
 		b3ExecuteStage( stage, context, previousSyncIndex, syncIndex, workerIndex );
 
 		// Spin waiting for thieves to finish
+		// Terra: if the holder of a claimed block was preempted, hand the core over instead of spinning on it.
+		int waitSpins = 0;
 		while ( b3AtomicLoadInt( &stage->completionCount ) != blockCount )
 		{
 			b3Pause();
+			if ( ++waitSpins > 4000 )
+			{
+				b3Yield();
+				waitSpins = 0;
+			}
 		}
 
 		b3AtomicStoreInt( &stage->completionCount, 0 );

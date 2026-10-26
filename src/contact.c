@@ -137,6 +137,12 @@ void b3InitializeContactRegisters( void )
 		b3AddType( b3_heightShape, b3_sphereShape );
 		b3AddType( b3_heightShape, b3_capsuleShape );
 		b3AddType( b3_heightShape, b3_hullShape );
+		b3AddType( b3_voxelGridShape, b3_sphereShape );
+		b3AddType( b3_voxelGridShape, b3_capsuleShape );
+		b3AddType( b3_voxelGridShape, b3_hullShape );
+		b3AddType( b3_voxelGridShape, b3_voxelGridShape );
+		b3AddType( b3_meshShape, b3_voxelGridShape );
+		b3AddType( b3_heightShape, b3_voxelGridShape );
 		s_initialized = true;
 	}
 }
@@ -212,8 +218,9 @@ void b3CreateContact( b3World* world, b3Shape* shapeA, b3Shape* shapeB, int chil
 	contact->encodedBodySimA = b3EncodeBodySimIndex( bodyA );
 	contact->encodedBodySimB = b3EncodeBodySimIndex( bodyB );
 
-	if ( shapeA->type == b3_meshShape || shapeA->type == b3_heightShape )
+	if ( shapeA->type == b3_meshShape || shapeA->type == b3_heightShape || shapeA->type == b3_voxelGridShape )
 	{
+		// A voxel grid contact keeps one manifold cache per box in the mesh contact triangle cache, keyed by cell and box.
 		contact->flags |= b3_simMeshContact;
 	}
 	else if ( shapeA->type == b3_compoundShape )
@@ -226,7 +233,8 @@ void b3CreateContact( b3World* world, b3Shape* shapeA, b3Shape* shapeB, int chil
 	}
 
 	// todo impose these restrictions to make life easier
-	B3_ASSERT( shapeB->type == b3_sphereShape || shapeB->type == b3_capsuleShape || shapeB->type == b3_hullShape );
+	B3_ASSERT( shapeB->type == b3_sphereShape || shapeB->type == b3_capsuleShape || shapeB->type == b3_hullShape ||
+			   shapeB->type == b3_voxelGridShape );
 	// B3_ASSERT( bodyB->type != b3_staticBody );
 
 	// Is either body static?
@@ -589,6 +597,7 @@ static bool b3ComputeConvexManifold( b3World* world, int workerIndex, b3Contact*
 	{
 		b3ManifoldPoint* pt2 = manifold->points + i;
 		pt2->totalNormalImpulse = 0.0f;
+		pt2->appliedNormalImpulse = 0.0f;
 		pt2->persisted = false;
 
 		for ( int j = 0; j < oldCount; ++j )
@@ -836,6 +845,36 @@ bool b3UpdateContact( b3World* world, int workerIndex, b3Contact* contact, b3Sha
 				mp->anchorA = b3Add( mp->anchorA, offset );
 			}
 		}
+	}
+	else if ( shapeA->type == b3_voxelGridShape )
+	{
+		touching = b3ComputeVoxelGridManifolds( world, workerIndex, contact, shapeA, xfA, shapeB, xfB, isFast, arena );
+
+		if ( touching && ( ( shapeA->flags & b3_enableHitEvents ) || ( shapeB->flags & b3_enableHitEvents ) ) )
+		{
+			contact->flags |= b3_simEnableHitEvent;
+		}
+		else
+		{
+			contact->flags &= ~b3_simEnableHitEvent;
+		}
+
+		B3_ASSERT( ( touching == true && contact->manifoldCount > 0 ) || ( touching == false && contact->manifoldCount == 0 ) );
+	}
+	else if ( ( shapeA->type == b3_meshShape || shapeA->type == b3_heightShape ) && shapeB->type == b3_voxelGridShape )
+	{
+		touching = b3ComputeMeshVoxelGridManifolds( world, workerIndex, contact, shapeA, xfA, shapeB, xfB, isFast, arena );
+
+		if ( touching && ( ( shapeA->flags & b3_enableHitEvents ) || ( shapeB->flags & b3_enableHitEvents ) ) )
+		{
+			contact->flags |= b3_simEnableHitEvent;
+		}
+		else
+		{
+			contact->flags &= ~b3_simEnableHitEvent;
+		}
+
+		B3_ASSERT( ( touching == true && contact->manifoldCount > 0 ) || ( touching == false && contact->manifoldCount == 0 ) );
 	}
 	else if ( shapeA->type == b3_meshShape || shapeA->type == b3_heightShape )
 	{

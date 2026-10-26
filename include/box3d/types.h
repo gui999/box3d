@@ -209,6 +209,10 @@ typedef struct b3WorldDef
 	/// threads and use an internal scheduler.
 	uint32_t workerCount;
 
+	/// Terra: OS priority of the internal scheduler's worker threads (ignored with a user task system):
+	/// 0 normal, 1 above normal, 2 highest, 3 time critical. Implemented on Windows; other platforms ignore it.
+	int workerPriority;
+
 	/// function to spawn task
 	b3EnqueueTaskCallback* enqueueTask;
 
@@ -485,6 +489,10 @@ typedef enum b3ShapeType
 	/// A sphere with an offset
 	b3_sphereShape,
 
+	/// A static grid of cells whose modules are sets of solid axis-aligned boxes (Terra Prime). Appended after the
+	/// original shape types so existing values are unchanged.
+	b3_voxelGridShape,
+
 	/// The number of shape types
 	b3_shapeTypeCount
 } b3ShapeType;
@@ -514,6 +522,12 @@ typedef struct b3ShapeDef
 
 	/// Explosion scale for b3World_Explode. non-dimensional
 	float explosionScale;
+
+	/// Terra: the most normal impulse in N*s that a contact of this shape may apply over one time step, its sub-steps and
+	/// restitution included (the lower of the two shapes' limits). The solver clamps the contact's impulses so their sum
+	/// stays within it, so a body pushes through a shape that cannot resist it. FLT_MAX (the default) is no limit. Only
+	/// contacts on the scalar path honour it: voxel grids, meshes, height fields and the overflow color.
+	float maxNormalImpulse;
 
 	/// Contact filtering data.
 	b3Filter filter;
@@ -636,6 +650,13 @@ typedef struct b3Counters
 
 	/// Maximum TOI root solver iterations.
 	int rootIterations;
+
+	/// Terra: voxel grid against voxel grid contacts in the most recent step: the grid pairs collided, the surface samples
+	/// tested and the contact points they gave (before reduction), and the least separation of those points (FLT_MAX when none).
+	int voxelGridPairCount;
+	int voxelSampleCount;
+	int voxelPointCount;
+	float voxelMinSeparation;
 } b3Counters;
 
 /// Joint type enumeration. This is useful because all joint types use b3JointId and sometimes you
@@ -2780,6 +2801,12 @@ typedef struct b3ManifoldPoint
 	/// This includes the warm starting impulse, the sub-step delta impulse, and the restitution
 	/// impulse.
 	float totalNormalImpulse;
+
+	/// The net normal impulse applied over the whole time step in N*s: the sum over the sub-steps of the accumulated
+	/// impulse left after the relax iteration, plus the restitution impulse. Unlike totalNormalImpulse it counts neither
+	/// the solve and the relax twice nor the push-out impulse that the relax takes back, so for a body at rest it is the
+	/// contact force times the time step. (Terra)
+	float appliedNormalImpulse;
 
 	/// Relative normal velocity pre-solve. Negative when approaching. This is only
 	/// computed if hit events are enabled.

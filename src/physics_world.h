@@ -12,6 +12,7 @@
 #include "name_cache.h"
 
 #include "box3d/types.h"
+#include "box3d/box3d.h"
 
 #define B3_DEBUG_POINT_CAPACITY 64
 #define B3_DEBUG_LINE_CAPACITY 64
@@ -102,6 +103,11 @@ typedef struct b3TaskContext
 	// Profiling
 	int satCallCount;
 	int satCacheHitCount;
+	// Terra: point-sampled voxel grid contacts this step
+	int voxelSampleCount;
+	int voxelPointCount;
+	int voxelGridPairCount;
+	float voxelMinSeparation;
 	int distanceIterations;
 	int pushBackIterations;
 	int rootIterations;
@@ -126,6 +132,9 @@ b3DeclareArray( b3TaskContext );
 // The world also contains efficient memory management facilities.
 typedef struct b3World
 {
+    // Fixed per-step observer storage; workers reserve disjoint slots without allocation.
+    b3CcdClipEvent ccdClipEvents[B3_CCD_CLIP_CAPACITY];
+    b3AtomicInt ccdClipEventCount;
 	b3Stack stack;
 	b3BroadPhase broadPhase;
 	b3ConstraintGraph constraintGraph;
@@ -252,6 +261,10 @@ typedef struct b3World
 	b3Profile profile;
 	int satCallCount;
 	int satCacheHitCount;
+	int voxelSampleCount;
+	int voxelPointCount;
+	int voxelGridPairCount;
+	float voxelMinSeparation;
 	int manifoldCounts[B3_CONTACT_MANIFOLD_COUNT_BUCKETS];
 
 	b3Capacity maxCapacity;
@@ -295,6 +308,10 @@ typedef struct b3World
 	bool locked;
 	bool enableWarmStarting;
 	bool enableContinuous;
+	// Terra: continuous collision passes a shape whose impulse limit gave way this step
+	bool enableLimitPassThrough;
+	// Terra: voxel grid against voxel grid contacts are point-sampled against occupancy instead of collided box pair by box pair
+	bool enableVoxelPointContacts;
 	bool enableSpeculative;
 	bool inUse;
 } b3World;

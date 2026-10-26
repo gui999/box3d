@@ -35,6 +35,26 @@
 /// @return the world id.
 B3_API b3WorldId b3CreateWorld( const b3WorldDef* def );
 
+// Terra observational extension: events describe actual final CCD pose clipping only.
+// Pointers are borrowed until the next step/world destruction. Read only while unlocked.
+#define B3_CCD_CLIP_CAPACITY 256
+typedef struct b3CcdClipEvent
+{
+    uint64_t bodyUserData;
+    uint64_t otherShapeUserData;
+    b3BodyId body;
+    b3ShapeId movingShape;
+    b3ShapeId otherShape;
+    float fraction;
+    b3WorldTransform preClip;
+    b3WorldTransform postClip;
+    b3Vec3 removedDisplacement;
+    b3Pos point;
+    b3Vec3 normal;
+} b3CcdClipEvent;
+B3_API bool b3World_ReadCcdClipEvents( b3WorldId worldId, const b3CcdClipEvent** events, int* count, int* overflow );
+B3_API int b3CcdClipEventSize( void );
+
 /// Destroy a world
 B3_API void b3DestroyWorld( b3WorldId worldId );
 
@@ -82,6 +102,20 @@ B3_API b3JointEvents b3World_GetJointEvents( b3WorldId worldId );
 /// Overlap test for all shapes that *potentially* overlap the provided AABB
 B3_API b3TreeStats b3World_OverlapAABB( b3WorldId worldId, b3AABB aabb, b3QueryFilter filter,
 										b3OverlapResultFcn* fcn, void* context );
+
+/// Terra broadphase-only gameplay candidates. Returns false for an invalid/unavailable/locked
+/// world, invalid bounds/segment, NULL callback or NULL stats; non-NULL stats are zeroed first.
+/// A true result may be empty. Callbacks are synchronous, unordered, and may inspect shape identity
+/// but must not mutate/reenter the world. Returning false stops all body-type trees explicitly.
+/// Caller applies exact voxel tests and eligibility filtering; broadphase bounds may be fat.
+B3_API bool b3World_QueryAABBCandidates( b3WorldId worldId, b3AABB bounds, b3QueryFilter filter,
+                                     b3OverlapResultFcn* callback, void* context, b3TreeStats* stats );
+
+/// Terra finite full-segment candidates, including initial/endpoint overlap and zero-length segments.
+/// No shape narrowphase or fraction clipping occurs; only callback false terminates traversal.
+/// Same readiness, callback lifetime and stats contract as b3World_QueryAABBCandidates.
+B3_API bool b3World_QueryRayCandidates( b3WorldId worldId, b3Pos origin, b3Vec3 translation, b3QueryFilter filter,
+                                    b3OverlapResultFcn* callback, void* context, b3TreeStats* stats );
 
 /// Overlap test for all shapes that overlap the provided shape proxy. The proxy points are relative
 /// to the world origin, which lets the query stay precise far from the world origin.
@@ -153,6 +187,18 @@ B3_API bool b3World_IsSleepingEnabled( b3WorldId worldId );
 /// The performance gain from disabling continuous collision is minor.
 /// @see b3WorldDef
 B3_API void b3World_EnableContinuous( b3WorldId worldId, bool flag );
+
+/// Terra: let continuous collision pass a shape whose impulse limit (b3ShapeDef::maxNormalImpulse) gave way this step, so a
+/// fast body carries on through what it breaks. On by default.
+B3_API void b3World_EnableLimitPassThrough( b3WorldId worldId, bool flag );
+
+/// Terra: point-sampled voxel grid contacts. When on, a voxel grid against a voxel grid is collided by sampling the exposed
+/// box faces of each grid against the other grid's voxel occupancy, the normals and depths read from the occupied voxels,
+/// instead of box pair by box pair. Other shape pairs are unchanged. Off by default.
+B3_API void b3World_EnableVoxelPointContacts( b3WorldId worldId, bool flag );
+
+/// Terra: are voxel grid pair contacts point-sampled?
+B3_API bool b3World_IsVoxelPointContactsEnabled( b3WorldId worldId );
 
 /// Is continuous collision enabled?
 B3_API bool b3World_IsContinuousEnabled( b3WorldId worldId );
@@ -917,6 +963,65 @@ B3_API b3ShapeId b3CreateMeshShape( b3BodyId bodyId, const b3ShapeDef* def, cons
 B3_API b3ShapeId b3CreateHeightFieldShape( b3BodyId bodyId, const b3ShapeDef* def,
 										   const b3HeightFieldData* heightField );
 
+/// Create a voxel grid shape and attach it to a static body. One shape stands for the whole grid: boxes are not shapes.
+/// The shape retains the grid. Contacts are not created until the next time step.
+/// @return the shape id, or b3_nullShapeId for a non static body
+B3_API b3ShapeId b3CreateVoxelGridShape( b3BodyId bodyId, const b3ShapeDef* def, b3VoxelGrid* grid );
+
+/// Get the shape's voxel grid. Asserts the type is correct.
+B3_API b3VoxelGrid* b3Shape_GetVoxelGrid( b3ShapeId shapeId );
+
+/// Append a module to the shape's grid. Returns its index, or -1 when it has more boxes than a cell can hold.
+/// Call between steps.
+B3_API int b3Shape_VoxelGridAddModule( b3ShapeId shapeId, b3VoxelGridModule* module );
+
+/// Set cells of the shape's grid (see b3VoxelGrid_SetCells), refreshing the contacts of the shape in place and waking
+/// bodies near the changed cells. Call between steps.
+B3_API void b3Shape_VoxelGridSetCells( b3ShapeId shapeId, const int* paddedCells, const int* modules, int count );
+
+/// Replace the shape grid's module at `index` in place (a region of a merged body's boxes), refreshing the contacts and
+/// waking the bodies near `changed` (the grid frame bounds of the boxes that differ). False when the module does not fit
+/// the grid's cells. Call between steps.
+B3_API bool b3Shape_VoxelGridReplaceModule( b3ShapeId shapeId, int index, b3VoxelGridModule* module, b3AABB changed );
+
+/// Append a module to the exact occupancy grid of a merged grid shape. Returns its index, or -1 without one. Call between steps.
+B3_API int b3Shape_VoxelGridAddOccupancyModule( b3ShapeId shapeId, b3VoxelGridModule* module );
+
+/// Set cells of a merged grid shape's exact occupancy grid, refreshing contacts near them. Call between steps.
+B3_API void b3Shape_VoxelGridSetOccupancyCells( b3ShapeId shapeId, const int* paddedCells, const int* modules, int count );
+
+/// Terra prepared local edit. Normal (unpadded) cells have one permanent module slot each, including empty cells.
+/// Input modules are immutable after preparation; the receipt retains grids, expected modules and candidates.
+typedef struct b3VoxelGridCellUpdate
+{
+	int cell;
+	b3VoxelGridModule* module;
+} b3VoxelGridCellUpdate;
+typedef struct b3PreparedVoxelGridEdit b3PreparedVoxelGridEdit;
+typedef struct b3VoxelGridEditStats
+{
+	int collisionCells;
+	int occupancyCells;
+	int aggregateRefitNodes;
+} b3VoxelGridEditStats;
+
+/// Preflight all ordinary failures and allocate/retain batch payloads before any live mutation.
+/// Requires a separate exact occupancy grid, stable cell-index module mappings and both nonempty update lists.
+/// changed is a finite ordered bound in the grid frame covering the actual geometry/occupancy differences.
+/// Returns NULL on invalid input. Native allocator exhaustion remains process-fatal, as elsewhere in Box3D.
+B3_API b3PreparedVoxelGridEdit* b3PrepareVoxelGridEdit( b3ShapeId shapeId,
+	const b3VoxelGridCellUpdate* collisionUpdates, int collisionCount,
+	const b3VoxelGridCellUpdate* occupancyUpdates, int occupancyCount, b3AABB changed );
+/// Call between steps on the native owner's thread. False for stale shape/grid/revisions or a locked world.
+B3_API bool b3ValidatePreparedVoxelGridEdit( const b3PreparedVoxelGridEdit* edit );
+/// Validates before its first write, then replaces both grids, refits, refreshes contacts/wakes and mass once.
+/// A successful receipt cannot commit again. No recoverable failure is returned after live mutation begins.
+/// Contact/wake/solver-set callbacks may allocate with Box3D's process-fatal OOM policy.
+B3_API bool b3CommitPreparedVoxelGridEdit( b3PreparedVoxelGridEdit* edit );
+B3_API b3VoxelGridEditStats b3GetPreparedVoxelGridEditStats( const b3PreparedVoxelGridEdit* edit );
+/// Required after success, failure or cancellation; NULL is accepted. Does not access the world.
+B3_API void b3DestroyPreparedVoxelGridEdit( b3PreparedVoxelGridEdit* edit );
+
 /// Baked compound shapes are only allowed on static bodies.
 /// Note: runtime compounds are achieved by adding multiple shapes to a body.
 /// Runtime compounds can be dynamic and/or kinematic.
@@ -970,6 +1075,13 @@ B3_API void b3Shape_SetFriction( b3ShapeId shapeId, float friction );
 
 /// Get the friction of a shape
 B3_API float b3Shape_GetFriction( b3ShapeId shapeId );
+
+/// Terra: set the most normal impulse a contact of this shape may apply over one time step (b3ShapeDef::maxNormalImpulse).
+/// Takes effect at the next step. FLT_MAX is no limit.
+B3_API void b3Shape_SetMaxNormalImpulse( b3ShapeId shapeId, float impulse );
+
+/// Terra: get the shape's normal impulse limit per time step.
+B3_API float b3Shape_GetMaxNormalImpulse( b3ShapeId shapeId );
 
 /// Set the shape restitution (bounciness)
 B3_API void b3Shape_SetRestitution( b3ShapeId shapeId, float restitution );

@@ -33,6 +33,7 @@ extern int BroadPhaseTest( void );
 extern int CollisionTest( void );
 extern int CompoundTest( void );
 extern int ContainerTest( void );
+extern int ContentionBench( void );
 extern int DeterminismTest( void );
 extern int DistanceTest( void );
 extern int DynamicTreeTest( void );
@@ -52,6 +53,9 @@ extern int RestitutionTest( void );
 extern int SeparatingAxisTest( void );
 extern int ShapeTest( void );
 extern int TableTest( void );
+extern int VoxelGridCostTest( void );
+extern int VoxelGridTest( void );
+extern int VoxelPointBench( void );
 extern int WorldTest( void );
 
 // Filter-aware test runner: skips tests that don't match the filter
@@ -88,6 +92,7 @@ int main( int argc, char** argv )
 	___tracy_startup_profiler();
 #endif
 
+	setvbuf( stdout, NULL, _IONBF, 0 );
 	const char* filter = NULL;
 	if ( argc > 1 )
 	{
@@ -102,6 +107,18 @@ int main( int argc, char** argv )
 		printf( "Filter: %s\n", filter );
 	}
 	printf( "======================================\n" );
+
+	// Terra: scheduler contention benchmark, only on request.
+	if ( filter != NULL && strcmp( filter, "ContentionBench" ) == 0 )
+	{
+		RUN_TEST( ContentionBench );
+	}
+
+	// Terra: voxel grid pair contacts, box pairs against point samples, only on request.
+	if ( filter != NULL && strcmp( filter, "VoxelPointBench" ) == 0 )
+	{
+		RUN_TEST( VoxelPointBench );
+	}
 
 	MAYBE_RUN_TEST( AllocatorTest );
 	MAYBE_RUN_TEST( BitTest );
@@ -130,6 +147,8 @@ int main( int argc, char** argv )
 	MAYBE_RUN_TEST( SeparatingAxisTest );
 	MAYBE_RUN_TEST( ShapeTest );
 	MAYBE_RUN_TEST( TableTest );
+	MAYBE_RUN_TEST( VoxelGridCostTest );
+	MAYBE_RUN_TEST( VoxelGridTest );
 	MAYBE_RUN_TEST( WorldTest );
 
 	printf( "======================================\n" );
