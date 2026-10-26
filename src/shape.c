@@ -1342,7 +1342,39 @@ void b3Shape_SetMaxNormalImpulse( b3ShapeId shapeId, float impulse )
 	}
 
 	b3Shape* shape = b3GetShape( world, shapeId );
+	bool wasLimited = shape->maxNormalImpulse < FLT_MAX;
 	shape->maxNormalImpulse = impulse;
+	if ( wasLimited == ( impulse < FLT_MAX ) )
+	{
+		return;
+	}
+
+	// The graph picks a contact's solver when the contact joins it: limited contacts go to the scalar overflow color,
+	// the only path that honours the limit. Move this shape's live contacts so the change applies at the next step.
+	b3Body* body = b3Array_Get( world->bodies, shape->bodyId );
+	int contactKey = body->headContactKey;
+	while ( contactKey != B3_NULL_INDEX )
+	{
+		b3Contact* contact = b3Array_Get( world->contacts, contactKey >> 1 );
+		contactKey = contact->edges[contactKey & 1].nextKey;
+		if ( contact->colorIndex == B3_NULL_INDEX || ( contact->shapeIdA != shape->id && contact->shapeIdB != shape->id ) )
+		{
+			continue;
+		}
+
+		const b3Shape* shapeA = b3Array_Get( world->shapes, contact->shapeIdA );
+		const b3Shape* shapeB = b3Array_Get( world->shapes, contact->shapeIdB );
+		bool limited = shapeA->maxNormalImpulse < FLT_MAX || shapeB->maxNormalImpulse < FLT_MAX;
+		if ( limited == ( contact->colorIndex == B3_OVERFLOW_INDEX ) )
+		{
+			continue;
+		}
+
+		bool meshContact = contact->flags & b3_simMeshContact;
+		b3RemoveContactFromGraph( world, contact->edges[0].bodyId, contact->edges[1].bodyId, contact->colorIndex,
+								  contact->localIndex, meshContact );
+		b3AddContactToGraph( world, contact );
+	}
 }
 
 float b3Shape_GetMaxNormalImpulse( b3ShapeId shapeId )
