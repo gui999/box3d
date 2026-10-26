@@ -1848,6 +1848,48 @@ static int ImpulseLimitPlankTest( void )
 	return 0;
 }
 
+// Terra: weakening a plank under a resting ball takes effect at the next step, although the contact joined the
+// constraint graph unlimited; the ball then falls through.
+static int ImpulseLimitLiveContactTest( void )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	b3BodyDef plankDef = b3DefaultBodyDef();
+	b3BodyId plankId = b3CreateBody( worldId, &plankDef );
+	b3BoxHull plank = b3MakeBoxHull( 1.0f, 0.05f, 1.0f );
+	b3ShapeDef plankShapeDef = b3DefaultShapeDef();
+	b3ShapeId plankShapeId = b3CreateHullShape( plankId, &plankShapeDef, &plank.base );
+
+	b3BodyDef ballDef = b3DefaultBodyDef();
+	ballDef.type = b3_dynamicBody;
+	ballDef.enableSleep = false;
+	ballDef.position = (b3Pos){ 0.0f, 0.3f, 0.0f };
+	b3BodyId ballId = b3CreateBody( worldId, &ballDef );
+	b3ShapeDef ballShapeDef = b3DefaultShapeDef();
+	b3Sphere ball = { { 0.0f, 0.0f, 0.0f }, 0.2f };
+	b3CreateSphereShape( ballId, &ballShapeDef, &ball );
+
+	for ( int i = 0; i < 60; ++i )
+	{
+		b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	}
+	float restY = (float)b3Body_GetPosition( ballId ).y;
+	ENSURE( restY > 0.2f );
+
+	b3Shape_SetMaxNormalImpulse( plankShapeId, 0.0f );
+	for ( int i = 0; i < 60; ++i )
+	{
+		b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	}
+	float fallenY = (float)b3Body_GetPosition( ballId ).y;
+	printf( "  impulse limit live contact: rest y %.3f, after limit y %.3f\n", restY, fallenY );
+	ENSURE( fallenY < -0.5f );
+
+	b3DestroyWorld( worldId );
+	return 0;
+}
+
 int WorldTest( void )
 {
 	RUN_SUBTEST( HelloWorld );
@@ -1877,6 +1919,7 @@ int WorldTest( void )
 	RUN_SUBTEST( TestCompoundShapeCount );
 	RUN_SUBTEST( BodySimLocatorTest );
 	RUN_SUBTEST( ImpulseLimitPlankTest );
+	RUN_SUBTEST( ImpulseLimitLiveContactTest );
 
 	return 0;
 }
