@@ -22,6 +22,9 @@ typedef enum b3ShapeFlags
 	b3_enablePreSolveEvents = 0x10,
 	// 0x20 is free, it was the enlarged AABB flag before the broad-phase marked the tree
 	b3_enableSpeculative = 0x40,
+
+	// A voxel grid on a kinematic or dynamic body: its AABB is that of the occupied boxes, not the whole grid
+	b3_tightGridBounds = 0x80,
 } b3ShapeFlags;
 
 typedef struct b3Shape
@@ -35,6 +38,9 @@ typedef struct b3Shape
 	b3ShapeType type;
 	float density;
 	float explosionScale;
+	float maxNormalImpulse;
+	// Terra: the step in which a contact of this shape reached its impulse limit (continuous collision passes it then)
+	uint64_t limitReachedStep;
 	float aabbMargin;
 
 	b3AABB aabb;
@@ -62,6 +68,7 @@ typedef struct b3Shape
 		b3Mesh mesh;
 		const b3HeightFieldData* heightField;
 		const b3CompoundData* compound;
+		b3VoxelGrid* voxelGrid;
 	};
 
 } b3Shape;
@@ -113,6 +120,7 @@ int b3CollideMoverAndSphere( b3PlaneResult* result, const b3Sphere* shape, const
 int b3CollideMoverAndCapsule( b3PlaneResult* result, const b3Capsule* shape, const b3Capsule* mover );
 int b3CollideMoverAndHull( b3PlaneResult* result, const b3HullData* shape, const b3Capsule* mover );
 int b3CollideMoverAndMesh( b3PlaneResult* planes, int capacity, const b3Mesh* shape, const b3Capsule* mover );
+int b3CollideMoverAndVoxelGrid( b3PlaneResult* results, int capacity, const b3VoxelGrid* grid, const b3Capsule* mover );
 int b3CollideMoverAndHeightField( b3PlaneResult* results, int capacity, const b3HeightFieldData* shape, const b3Capsule* mover );
 int b3CollideMover( b3PlaneResult* planes, int planeCapacity, const b3Shape* shape, b3Transform transform,
 					const b3Capsule* mover );

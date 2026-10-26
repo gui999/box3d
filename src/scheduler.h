@@ -6,7 +6,7 @@
 typedef void b3TaskCallback( void* taskContext );
 typedef struct b3Scheduler b3Scheduler;
 
-b3Scheduler* b3CreateScheduler( int workerCount );
+b3Scheduler* b3CreateScheduler( int workerCount, int workerPriority );
 void b3DestroyScheduler( b3Scheduler* scheduler );
 void b3ResetScheduler( b3Scheduler* scheduler );
 

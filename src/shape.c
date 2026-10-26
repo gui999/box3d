@@ -9,12 +9,15 @@
 #include "physics_world.h"
 #include "recording.h"
 #include "sensor.h"
+#include "voxel_grid.h"
 
 // needed for dll export
 #include "aabb.h"
 #include "compound.h"
 
 #include "box3d/box3d.h"
+
+#include <stdlib.h>
 
 static b3Shape* b3GetShape( b3World* world, b3ShapeId shapeId )
 {
@@ -60,10 +63,10 @@ static float b3ComputeShapeMargin( b3Shape* shape )
 		case b3_meshShape:
 		case b3_heightShape:
 		case b3_compoundShape:
+		case b3_voxelGridShape:
 		{
-			// Static-only shapes: broadphase uses speculative distance for static
-			// proxies, so the per-shape margin is never consumed in practice.
-			// Return the cap so any incidental use is generous.
+			// Static shapes use the speculative distance in the broadphase and never consume this margin. A voxel grid on a
+			// moving body does: the cap keeps its fat AABB generous.
 			return B3_MAX_AABB_MARGIN;
 		}
 
@@ -158,6 +161,13 @@ static b3Shape* b3CreateShapeInternal( b3World* world, b3Body* body, b3WorldTran
 			shape->heightField = (b3HeightFieldData*)geometry;
 			break;
 
+		case b3_voxelGridShape:
+			// The shape holds a reference, released when the shape is destroyed
+			shape->voxelGrid = (b3VoxelGrid*)geometry;
+			b3RetainVoxelGrid( shape->voxelGrid );
+			shape->voxelGrid->shapeUsers += 1;
+			break;
+
 		default:
 			B3_ASSERT( false );
 			break;
@@ -168,6 +178,8 @@ static b3Shape* b3CreateShapeInternal( b3World* world, b3Body* body, b3WorldTran
 	shape->type = shapeType;
 	shape->density = def->density;
 	shape->explosionScale = def->explosionScale;
+	shape->maxNormalImpulse = def->maxNormalImpulse;
+	shape->limitReachedStep = 0;
 	shape->filter = def->filter;
 	shape->userData = def->userData;
 	shape->userShape = NULL;
@@ -178,6 +190,11 @@ static b3Shape* b3CreateShapeInternal( b3World* world, b3Body* body, b3WorldTran
 	shape->flags |= def->enableHitEvents ? b3_enableHitEvents : 0;
 	shape->flags |= def->enablePreSolveEvents ? b3_enablePreSolveEvents : 0;
 	shape->flags |= def->enableSpeculativeContact ? b3_enableSpeculative : 0;
+	if ( shapeType == b3_voxelGridShape && body->type != b3_staticBody )
+	{
+		// A grid that moves has an AABB that follows its boxes
+		shape->flags |= b3_tightGridBounds;
+	}
 	shape->proxyKey = B3_NULL_INDEX;
 	shape->localCentroid = b3GetShapeCentroid( shape );
 	shape->aabbMargin = b3ComputeShapeMargin( shape );
@@ -273,7 +290,7 @@ static b3ShapeId b3CreateShape( b3BodyId bodyId, const b3ShapeDef* def, const vo
 	b3Body* body = b3GetBodyFullId( world, bodyId );
 	if ( body->type != b3_staticBody && ( shapeType == b3_compoundShape || shapeType == b3_heightShape ) )
 	{
-		// Compound and height shapes must be on static bodies.
+		// Compound and height shapes must be on static bodies. A voxel grid can be on any body.
 		return b3_nullShapeId;
 	}
 
@@ -451,6 +468,12 @@ b3ShapeId b3CreateHeightFieldShape( b3BodyId bodyId, const b3ShapeDef* def, cons
 	return shapeId;
 }
 
+b3ShapeId b3CreateVoxelGridShape( b3BodyId bodyId, const b3ShapeDef* def, b3VoxelGrid* grid )
+{
+	// Not recorded: recordings and snapshots have no voxel grid geometry.
+	return b3CreateShape( bodyId, def, grid, b3_voxelGridShape, b3Transform_identity, b3Vec3_one, false );
+}
+
 b3ShapeId b3CreateBakedCompoundShape( b3BodyId bodyId, b3ShapeDef* def, const b3CompoundData* compound )
 {
 	B3_ASSERT( compound->version == B3_COMPOUND_VERSION );
@@ -614,6 +637,10 @@ b3AABB b3ComputeShapeAABB( const b3Shape* shape, b3Transform transform )
 		case b3_heightShape:
 			return b3ComputeHeightFieldAABB( shape->heightField, transform );
 
+		case b3_voxelGridShape:
+			return ( shape->flags & b3_tightGridBounds ) ? b3ComputeVoxelGridOccupiedAABB( shape->voxelGrid, transform )
+														 : b3ComputeVoxelGridAABB( shape->voxelGrid, transform );
+
 		case b3_hullShape:
 			return b3ComputeHullAABB( shape->hull, transform );
 
@@ -669,6 +696,9 @@ b3AABB b3ComputeSweptShapeAABB( const b3Shape* shape, const b3Sweep* sweep, floa
 		case b3_sphereShape:
 			return b3ComputeSweptSphereAABB( &shape->sphere, xf1, xf2 );
 
+		case b3_voxelGridShape:
+			return b3AABB_Union( b3ComputeVoxelGridOccupiedAABB( shape->voxelGrid, xf1 ), b3ComputeVoxelGridOccupiedAABB( shape->voxelGrid, xf2 ) );
+
 		default:
 			B3_ASSERT( false );
 			return (b3AABB){ xf1.p, xf1.p };
@@ -700,6 +730,9 @@ b3Vec3 b3GetShapeCentroid( const b3Shape* shape )
 			b3AABB aabb = b3ComputeHeightFieldAABB( shape->heightField, b3Transform_identity );
 			return b3AABB_Center( aabb );
 		}
+		case b3_voxelGridShape:
+			return b3AABB_Center( ( shape->flags & b3_tightGridBounds ) ? b3ComputeVoxelGridOccupiedAABB( shape->voxelGrid, b3Transform_identity )
+																			 : shape->voxelGrid->bounds );
 		default:
 			return b3Vec3_zero;
 	}
@@ -764,6 +797,9 @@ b3MassData b3ComputeShapeMass( const b3Shape* shape )
 		case b3_sphereShape:
 			return b3ComputeSphereMass( &shape->sphere, shape->density );
 
+		case b3_voxelGridShape:
+			return b3ComputeVoxelGridMass( shape->voxelGrid, shape->density );
+
 		default:
 			return (b3MassData){ 0 };
 	}
@@ -810,6 +846,10 @@ b3ShapeExtent b3ComputeShapeExtent( const b3Shape* shape, b3Vec3 localCenter )
 
 		case b3_hullShape:
 			extent = b3ComputeHullExtent( shape->hull, localCenter );
+			break;
+
+		case b3_voxelGridShape:
+			extent = b3ComputeVoxelGridExtent( shape->voxelGrid, localCenter );
 			break;
 
 		case b3_meshShape:
@@ -876,6 +916,9 @@ b3CastOutput b3RayCastShape( const b3Shape* shape, b3Transform transform, const 
 		case b3_heightShape:
 			output = b3RayCastHeightField( shape->heightField, &localInput );
 			break;
+		case b3_voxelGridShape:
+			output = b3RayCastVoxelGrid( shape->voxelGrid, &localInput );
+			break;
 		default:
 			return output;
 	}
@@ -925,6 +968,10 @@ b3CastOutput b3ShapeCastShape( const b3Shape* shape, b3Transform transform, cons
 		case b3_sphereShape:
 			output = b3ShapeCastSphere( &shape->sphere, &localInput );
 			break;
+
+		case b3_voxelGridShape:
+			output = b3ShapeCastVoxelGrid( shape->voxelGrid, &localInput );
+			break;
 		default:
 			return output;
 	}
@@ -956,6 +1003,9 @@ bool b3OverlapShape( const b3Shape* shape, b3Transform transform, const b3ShapeP
 
 		case b3_sphereShape:
 			return b3OverlapSphere( &shape->sphere, transform, proxy );
+
+		case b3_voxelGridShape:
+			return b3OverlapVoxelGrid( shape->voxelGrid, transform, proxy );
 
 		default:
 			B3_ASSERT( false );
@@ -1003,6 +1053,10 @@ int b3CollideMover( b3PlaneResult* planes, int planeCapacity, const b3Shape* sha
 			planeCount = b3CollideMoverAndHeightField( planes, planeCapacity, shape->heightField, &localMover );
 			break;
 
+		case b3_voxelGridShape:
+			planeCount = b3CollideMoverAndVoxelGrid( planes, planeCapacity, shape->voxelGrid, &localMover );
+			break;
+
 		default:
 			B3_ASSERT( false );
 			break;
@@ -1048,6 +1102,12 @@ static void b3DestroyShapeAllocationForShapeChange( b3World* world, b3Shape* sha
 		case b3_hullShape:
 			b3RemoveHullFromDatabase( world, shape->hull );
 			shape->hull = NULL;
+			break;
+
+		case b3_voxelGridShape:
+			shape->voxelGrid->shapeUsers -= 1;
+			b3ReleaseVoxelGrid( shape->voxelGrid );
+			shape->voxelGrid = NULL;
 			break;
 
 		default:
@@ -1270,6 +1330,26 @@ float b3Shape_GetFriction( b3ShapeId shapeId )
 	b3World* world = b3GetWorld( shapeId.world0 );
 	b3Shape* shape = b3GetShape( world, shapeId );
 	return b3GetShapeMaterials( shape )[0].friction;
+}
+
+void b3Shape_SetMaxNormalImpulse( b3ShapeId shapeId, float impulse )
+{
+	B3_ASSERT( impulse >= 0.0f );
+	b3World* world = b3GetUnlockedWorld( shapeId.world0 );
+	if ( world == NULL )
+	{
+		return;
+	}
+
+	b3Shape* shape = b3GetShape( world, shapeId );
+	shape->maxNormalImpulse = impulse;
+}
+
+float b3Shape_GetMaxNormalImpulse( b3ShapeId shapeId )
+{
+	b3World* world = b3GetWorld( shapeId.world0 );
+	b3Shape* shape = b3GetShape( world, shapeId );
+	return shape->maxNormalImpulse;
 }
 
 void b3Shape_SetRestitution( b3ShapeId shapeId, float restitution )
@@ -1575,6 +1655,585 @@ const b3CompoundData* b3Shape_GetCompound( b3ShapeId shapeId )
 	return shape->compound;
 }
 
+b3VoxelGrid* b3Shape_GetVoxelGrid( b3ShapeId shapeId )
+{
+	b3World* world = b3GetWorld( shapeId.world0 );
+	b3Shape* shape = b3GetShape( world, shapeId );
+	B3_ASSERT( shape->type == b3_voxelGridShape );
+	return shape->voxelGrid;
+}
+
+int b3Shape_VoxelGridAddModule( b3ShapeId shapeId, b3VoxelGridModule* module )
+{
+	b3World* world = b3GetUnlockedWorld( shapeId.world0 );
+	if ( world == NULL )
+	{
+		return -1;
+	}
+
+	b3Shape* shape = b3GetShape( world, shapeId );
+	B3_ASSERT( shape->type == b3_voxelGridShape );
+
+	// Modules only append, so no cell keys or contact caches change
+	return b3VoxelGrid_AddModule( shape->voxelGrid, module );
+}
+
+typedef struct b3VoxelWakeContext
+{
+	b3World* world;
+	int* bodyIds;
+	int count;
+	int capacity;
+	int gridBodyId;
+} b3VoxelWakeContext;
+
+static bool b3VoxelWakeQueryCallback( int proxyId, uint64_t userData, void* context )
+{
+	B3_UNUSED( proxyId );
+	b3VoxelWakeContext* wake = context;
+	b3Shape* shape = b3Array_Get( wake->world->shapes, (int)userData );
+	if ( shape->bodyId == wake->gridBodyId )
+	{
+		return true;
+	}
+
+	for ( int i = 0; i < wake->count; ++i )
+	{
+		if ( wake->bodyIds[i] == shape->bodyId )
+		{
+			return true;
+		}
+	}
+
+	if ( wake->count == wake->capacity )
+	{
+		int capacity = wake->capacity > 0 ? 2 * wake->capacity : 16;
+		int* ids = b3Alloc( capacity * sizeof( int ) );
+		if ( wake->count > 0 )
+		{
+			memcpy( ids, wake->bodyIds, wake->count * sizeof( int ) );
+		}
+		b3Free( wake->bodyIds, wake->capacity * sizeof( int ) );
+		wake->bodyIds = ids;
+		wake->capacity = capacity;
+	}
+
+	wake->bodyIds[wake->count++] = shape->bodyId;
+	return true;
+}
+
+// A body the edit may now overlap: its shape's bounds sink into a box of the edited grid inside the change (geometry
+// added around a body that rests close without touching the grid).
+typedef struct b3VoxelOverlapWakeContext
+{
+	b3VoxelWakeContext* wake;
+	const b3VoxelGrid* grid;
+	b3Transform toGrid;
+	b3AABB changed;
+} b3VoxelOverlapWakeContext;
+
+// A box the body's bounds sink into by more than the speculative distance on every axis: a neighbour resting against the
+// grid's face meets it only on that face, and is the touching rule's.
+typedef struct b3VoxelSinkContext
+{
+	b3AABB reach;
+	bool found;
+} b3VoxelSinkContext;
+
+static bool b3VoxelBoxFound( int cell, int box, b3AABB bounds, void* context )
+{
+	B3_UNUSED( cell );
+	B3_UNUSED( box );
+	b3VoxelSinkContext* sink = context;
+	b3Vec3 low = b3Max( bounds.lowerBound, sink->reach.lowerBound ), high = b3Min( bounds.upperBound, sink->reach.upperBound );
+	if ( high.x - low.x > B3_SPECULATIVE_DISTANCE && high.y - low.y > B3_SPECULATIVE_DISTANCE && high.z - low.z > B3_SPECULATIVE_DISTANCE )
+	{
+		sink->found = true;
+		return false;
+	}
+	return true;
+}
+
+static bool b3VoxelOverlapWakeCallback( int proxyId, uint64_t userData, void* context )
+{
+	b3VoxelOverlapWakeContext* overlap = context;
+	b3Shape* other = b3Array_Get( overlap->wake->world->shapes, (int)userData );
+	if ( other->bodyId == overlap->wake->gridBodyId )
+	{
+		return true;
+	}
+
+	b3AABB local = b3AABB_Transform( overlap->toGrid, other->aabb );
+	b3AABB reach = { b3Max( local.lowerBound, overlap->changed.lowerBound ), b3Min( local.upperBound, overlap->changed.upperBound ) };
+	if ( reach.lowerBound.x > reach.upperBound.x || reach.lowerBound.y > reach.upperBound.y || reach.lowerBound.z > reach.upperBound.z )
+	{
+		return true;
+	}
+
+	b3VoxelSinkContext sink = { reach, false };
+	b3QueryVoxelGrid( overlap->grid, reach, b3VoxelBoxFound, &sink );
+	if ( sink.found )
+	{
+		b3VoxelWakeQueryCallback( proxyId, userData, overlap->wake );
+	}
+	return true;
+}
+
+
+// Contacts of a grid shape after its boxes changed inside `changed` (grid frame): those whose boxes may differ forget their
+// cached boxes and re-query on the next step, keeping their manifolds so impulses carry over; bodies near the change wake.
+// `affected` bounds the boxes that may differ or change their covered faces (and the box keys a replaced module renumbered).
+// `touching` wakes only the bodies whose contact with the shape touches near the change (a merged body's edit, which, like
+// the shape made again, must not wake a neighbour that only lies close); otherwise every body near it wakes.
+static void b3RefreshVoxelGridContacts( b3World* world, b3Shape* shape, b3AABB affected, b3AABB changed, bool touching )
+{
+	b3Body* body = b3Array_Get( world->bodies, shape->bodyId );
+	b3Transform gridTransform = b3ToRelativeTransform( b3GetBodyTransformQuick( world, body ), b3Pos_zero );
+
+	// Boxes in the cells next to a changed cell change their covered faces
+	// The cached query bounds of a contact are in the grid frame
+	b3AABB wakeBounds = b3AABB_Transform( gridTransform, b3AABB_Inflate( changed, 2.0f * B3_SPECULATIVE_DISTANCE ) );
+
+	int shapeIndex = shape->id;
+	b3VoxelWakeContext wake = { world, NULL, 0, 0, shape->bodyId };
+	int contactKey = body->headContactKey;
+	while ( contactKey != B3_NULL_INDEX )
+	{
+		b3Contact* contact = b3Array_Get( world->contacts, contactKey >> 1 );
+		contactKey = contact->edges[contactKey & 1].nextKey;
+
+		bool isA = contact->shapeIdA == shapeIndex;
+		if ( isA == false && contact->shapeIdB != shapeIndex )
+		{
+			continue;
+		}
+
+		const b3Shape* otherShape = b3Array_Get( world->shapes, isA ? contact->shapeIdB : contact->shapeIdA );
+		if ( touching && ( contact->flags & b3_contactTouchingFlag ) != 0 && b3AABB_Overlaps( otherShape->fatAABB, wakeBounds ) )
+		{
+			b3VoxelWakeQueryCallback( 0, (uint64_t)otherShape->id, &wake );
+		}
+
+		if ( ( contact->flags & b3_simMeshContact ) == 0 )
+		{
+			continue;
+		}
+
+		bool findsBoxesOnce = isA && otherShape->type != b3_voxelGridShape;
+		if ( findsBoxesOnce && b3AABB_Overlaps( contact->meshContact.queryBounds, affected ) == false )
+		{
+			continue;
+		}
+		if ( !findsBoxesOnce && !b3AABB_Overlaps( b3AABB_Transform( b3InvertTransform( gridTransform ), otherShape->fatAABB ), affected ) )
+		{
+			continue;
+		}
+
+		// A contact against another grid or a mesh finds its boxes again on every update, so only its cached hints and its
+		// recycled manifolds go stale. A contact against a convex shape keeps a list of boxes in the query bounds.
+
+		// Forget the cached boxes and force a re-query. Dropping the cache also drops the old keys SAT hints.
+		b3Array_Resize( contact->meshContact.triangleCache, 0 );
+		contact->meshContact.queryBounds.lowerBound = (b3Vec3){ FLT_MAX, FLT_MAX, FLT_MAX };
+		contact->meshContact.queryBounds.upperBound = (b3Vec3){ -FLT_MAX, -FLT_MAX, -FLT_MAX };
+
+		// A recycled contact would skip the update
+		contact->flags &= ~b3_relativeTransformValid;
+	}
+
+	// Wake the bodies, including resting ones whose support may be gone. Collect first, waking moves solver sets.
+	if ( touching )
+	{
+		// Besides the touching ones, a body the edit now overlaps (geometry added where it lies) wakes.
+		b3Transform toGrid = b3InvertTransform( gridTransform );
+		b3VoxelOverlapWakeContext overlap = { &wake, shape->voxelGrid, toGrid, changed };
+		b3AABB changedWorld = b3AABB_Transform( gridTransform, changed );
+		b3DynamicTree_Query( world->broadPhase.trees + b3_dynamicBody, changedWorld, B3_DEFAULT_MASK_BITS, false,
+							 b3VoxelOverlapWakeCallback, &overlap );
+		b3DynamicTree_Query( world->broadPhase.trees + b3_kinematicBody, changedWorld, B3_DEFAULT_MASK_BITS, false,
+							 b3VoxelOverlapWakeCallback, &overlap );
+	}
+	else
+	{
+		b3DynamicTree_Query( world->broadPhase.trees + b3_dynamicBody, wakeBounds, B3_DEFAULT_MASK_BITS, false,
+							 b3VoxelWakeQueryCallback, &wake );
+		b3DynamicTree_Query( world->broadPhase.trees + b3_kinematicBody, wakeBounds, B3_DEFAULT_MASK_BITS, false,
+							 b3VoxelWakeQueryCallback, &wake );
+	}
+	for ( int i = 0; i < wake.count; ++i )
+	{
+		b3Body* other = b3Array_Get( world->bodies, wake.bodyIds[i] );
+		b3WakeBody( world, other );
+	}
+	b3Free( wake.bodyIds, wake.capacity * sizeof( int ) );
+
+	if ( body->type != b3_staticBody )
+	{
+		// The boxes of a grid on a moving body changed: the body wakes, its centroid follows its boxes and a dynamic body takes
+		// the mass of the boxes that are left. A body that defers its mass computation keeps doing so.
+		b3WakeBody( world, body );
+		shape->localCentroid = b3GetShapeCentroid( shape );
+		if ( body->type == b3_dynamicBody && ( body->flags & b3_dirtyMass ) == 0 )
+		{
+			b3UpdateBodyMassData( world, body );
+		}
+	}
+
+}
+
+// The bounds, in the grid frame, of padded cells.
+static b3AABB b3VoxelGridCellsBounds( const b3VoxelGrid* grid, const int* paddedCells, int count )
+{
+	b3AABB changed = { { FLT_MAX, FLT_MAX, FLT_MAX }, { -FLT_MAX, -FLT_MAX, -FLT_MAX } };
+	int sx = grid->size[0] + 2, sz = grid->size[2] + 2;
+	for ( int n = 0; n < count; ++n )
+	{
+		int padded = paddedCells[n];
+		B3_ASSERT( 0 <= padded && padded < grid->paddedCount );
+		int i = padded % sx - 1;
+		int k = ( padded / sx ) % sz - 1;
+		int j = padded / ( sx * sz ) - 1;
+		b3Vec3 lower = { grid->origin.x + (float)i * grid->cellMeters, grid->origin.y + (float)j * grid->cellMeters,
+						 grid->origin.z + (float)k * grid->cellMeters };
+		b3Vec3 upper = { lower.x + grid->cellMeters, lower.y + grid->cellMeters, lower.z + grid->cellMeters };
+		changed.lowerBound = b3Min( changed.lowerBound, lower );
+		changed.upperBound = b3Max( changed.upperBound, upper );
+	}
+	return changed;
+}
+
+// Changing cells changes what a contact finds (b3RefreshVoxelGridContacts).
+void b3Shape_VoxelGridSetCells( b3ShapeId shapeId, const int* paddedCells, const int* modules, int count )
+{
+	b3World* world = b3GetUnlockedWorld( shapeId.world0 );
+	if ( world == NULL || count <= 0 )
+	{
+		return;
+	}
+
+	world->locked = true;
+
+	b3Shape* shape = b3GetShape( world, shapeId );
+	B3_ASSERT( shape->type == b3_voxelGridShape );
+	b3VoxelGrid* grid = shape->voxelGrid;
+	b3AABB changed = b3VoxelGridCellsBounds( grid, paddedCells, count );
+	b3VoxelGrid_SetCells( grid, paddedCells, modules, count );
+	b3RefreshVoxelGridContacts( world, shape, b3AABB_Inflate( changed, grid->cellMeters ), changed, false );
+
+	world->locked = false;
+}
+
+// A module of the grid replaced in place (a region of a merged body's boxes): every cell naming it now holds the new boxes.
+// `changed` (grid frame) bounds the boxes that differ; contacts and wakes follow it, not the whole module.
+bool b3Shape_VoxelGridReplaceModule( b3ShapeId shapeId, int index, b3VoxelGridModule* module, b3AABB changed )
+{
+	b3World* world = b3GetUnlockedWorld( shapeId.world0 );
+	if ( world == NULL )
+	{
+		return false;
+	}
+
+	b3Shape* shape = b3GetShape( world, shapeId );
+	B3_ASSERT( shape->type == b3_voxelGridShape );
+	b3VoxelGrid* grid = shape->voxelGrid;
+	if ( index < 0 || index >= grid->moduleCount || module->boxCount > ( 1 << grid->boxBits ) || module->cellVoxels != grid->cellVoxels )
+	{
+		return false;
+	}
+
+	world->locked = true;
+
+	// Every box key of the module's cells is renumbered: their contacts all re-query. Only bodies near `changed` wake.
+	b3RetainVoxelGridModule( module );
+	b3ReleaseVoxelGridModule( grid->modules[index] );
+	grid->modules[index] = module;
+	b3AABB cells = { { FLT_MAX, FLT_MAX, FLT_MAX }, { -FLT_MAX, -FLT_MAX, -FLT_MAX } };
+	for ( int padded = 0; padded < grid->paddedCount; ++padded )
+	{
+		if ( grid->paddedModules[padded] == index )
+		{
+			cells = b3AABB_Union( cells, b3VoxelGridCellsBounds( grid, &padded, 1 ) );
+			int sx = grid->size[0] + 2, sz = grid->size[2] + 2;
+			int i = padded % sx - 1, k = ( padded / sx ) % sz - 1, j = padded / ( sx * sz ) - 1;
+			if ( i >= 0 && i < grid->size[0] && j >= 0 && j < grid->size[1] && k >= 0 && k < grid->size[2] )
+			{
+				b3VoxelGrid_RefitCell( grid, b3VoxelGridCellIndex( grid, i, j, k ) );
+			}
+		}
+	}
+	grid->editRevision += 1;
+	bool bounded = changed.lowerBound.x <= changed.upperBound.x && changed.lowerBound.y <= changed.upperBound.y && changed.lowerBound.z <= changed.upperBound.z;
+	if ( bounded )
+	{
+		b3RefreshVoxelGridContacts( world, shape, b3AABB_Union( cells, b3AABB_Inflate( changed, B3_SPECULATIVE_DISTANCE ) ), changed, true );
+	}
+	else if ( cells.lowerBound.x <= cells.upperBound.x )
+	{
+		// No bounds given: the module's cells are the change.
+		b3RefreshVoxelGridContacts( world, shape, cells, cells, true );
+	}
+
+	world->locked = false;
+	return true;
+}
+
+int b3Shape_VoxelGridAddOccupancyModule( b3ShapeId shapeId, b3VoxelGridModule* module )
+{
+	b3World* world = b3GetUnlockedWorld( shapeId.world0 );
+	if ( world == NULL )
+	{
+		return -1;
+	}
+
+	b3Shape* shape = b3GetShape( world, shapeId );
+	B3_ASSERT( shape->type == b3_voxelGridShape );
+	if ( shape->voxelGrid->occupancy == NULL )
+	{
+		return -1;
+	}
+
+	return b3VoxelGrid_AddModule( shape->voxelGrid->occupancy, module );
+}
+
+void b3Shape_VoxelGridSetOccupancyCells( b3ShapeId shapeId, const int* paddedCells, const int* modules, int count )
+{
+	b3World* world = b3GetUnlockedWorld( shapeId.world0 );
+	if ( world == NULL || count <= 0 )
+	{
+		return;
+	}
+
+	b3Shape* shape = b3GetShape( world, shapeId );
+	B3_ASSERT( shape->type == b3_voxelGridShape );
+	b3VoxelGrid* occupancy = shape->voxelGrid->occupancy;
+	if ( occupancy == NULL )
+	{
+		return;
+	}
+
+	world->locked = true;
+	b3AABB changed = b3VoxelGridCellsBounds( occupancy, paddedCells, count );
+	b3VoxelGrid_SetCells( occupancy, paddedCells, modules, count );
+	b3RefreshVoxelGridContacts( world, shape, b3AABB_Inflate( changed, occupancy->cellMeters ), changed, true );
+	world->locked = false;
+}
+
+// Terra batch receipts own no live-world pointers: retained grids/modules survive shape/world retirement.
+typedef struct b3PreparedVoxelCell
+{
+	int cell;
+	b3VoxelGridModule* expected;
+	b3VoxelGridModule* candidate;
+} b3PreparedVoxelCell;
+
+struct b3PreparedVoxelGridEdit
+{
+	b3ShapeId shapeId;
+	b3VoxelGrid* collision;
+	b3VoxelGrid* occupancy;
+	uint64_t collisionRevision;
+	uint64_t occupancyRevision;
+	b3PreparedVoxelCell* collisionCells;
+	b3PreparedVoxelCell* occupancyCells;
+	b3AABB changed;
+	b3AABB affected;
+	b3VoxelGridEditStats stats;
+	bool committed;
+};
+
+static bool b3VoxelEditBoundIsValid( b3AABB bounds )
+{
+	return b3IsValidVec3( bounds.lowerBound ) && b3IsValidVec3( bounds.upperBound ) &&
+		bounds.lowerBound.x <= bounds.upperBound.x && bounds.lowerBound.y <= bounds.upperBound.y &&
+		bounds.lowerBound.z <= bounds.upperBound.z;
+}
+
+static bool b3VoxelEditLayoutIsValid( const b3VoxelGrid* grid )
+{
+	return grid != NULL && grid->stableCellSlots && grid->aggregates != NULL &&
+		grid->moduleCount == grid->size[0] * grid->size[1] * grid->size[2];
+}
+
+static int b3ComparePreparedVoxelCells( const void* a, const void* b )
+{
+	int x = ( (const b3PreparedVoxelCell*)a )->cell;
+	int y = ( (const b3PreparedVoxelCell*)b )->cell;
+	return ( x > y ) - ( x < y );
+}
+
+// Validate the exact gameplay lattice, rather than the coarser collision module's face-cover lattice.
+// The collision grid may use 8m/20 while its exact occupancy uses 2m/20.
+static bool b3VoxelEditModuleFits( const b3VoxelGrid* grid, const b3VoxelGridModule* module, float voxelMeters, bool occupancy )
+{
+	if ( module == NULL || module->cellMeters != grid->cellMeters || module->cellVoxels != grid->cellVoxels ||
+		module->boxCount > ( 1 << grid->boxBits ) || ( occupancy && module->solidRows == NULL ) ) return false;
+	for ( int box = 0; box < module->boxCount; ++box )
+	{
+		for ( int a = 0; a < 6; ++a )
+		{
+			float value = module->boxes[6 * box + a];
+			if ( value < -1.0e-5f || value > grid->cellMeters + 1.0e-5f ||
+				fabsf( value / voxelMeters - roundf( value / voxelMeters ) ) > 1.0e-3f ) return false;
+		}
+	}
+	return true;
+}
+
+static bool b3PrepareVoxelCells( b3VoxelGrid* grid, const b3VoxelGridCellUpdate* updates, int count,
+	float voxelMeters, bool occupancy, b3PreparedVoxelCell* cells, b3AABB* affected )
+{
+	for ( int n = 0; n < count; ++n )
+	{
+		int cell = updates[n].cell;
+		if ( cell < 0 || cell >= grid->moduleCount || !b3VoxelEditModuleFits( grid, updates[n].module, voxelMeters, occupancy ) ) return false;
+		int i, j, k;
+		b3VoxelGridCellCoordinates( grid, cell, &i, &j, &k );
+		if ( grid->paddedModules[b3VoxelGridPaddedIndex( grid, i, j, k )] != cell ) return false;
+		cells[n].cell = cell;
+		cells[n].expected = grid->modules[cell];
+		cells[n].candidate = updates[n].module;
+		b3Vec3 corner = b3VoxelGridCellCorner( grid, cell );
+		b3AABB bounds = { corner, b3Add( corner, (b3Vec3){ grid->cellMeters, grid->cellMeters, grid->cellMeters } ) };
+		// Neighbor cell faces can change even when their box keys stay stable.
+		*affected = b3AABB_Union( *affected, b3AABB_Inflate( bounds, grid->cellMeters ) );
+	}
+	qsort( cells, (size_t)count, sizeof( b3PreparedVoxelCell ), b3ComparePreparedVoxelCells );
+	for ( int n = 1; n < count; ++n ) if ( cells[n - 1].cell == cells[n].cell ) return false;
+	return true;
+}
+
+b3PreparedVoxelGridEdit* b3PrepareVoxelGridEdit( b3ShapeId shapeId,
+	const b3VoxelGridCellUpdate* collisionUpdates, int collisionCount,
+	const b3VoxelGridCellUpdate* occupancyUpdates, int occupancyCount, b3AABB changed )
+{
+	if ( !b3Shape_IsValid( shapeId ) || !b3VoxelEditBoundIsValid( changed ) || collisionUpdates == NULL || occupancyUpdates == NULL ||
+		collisionCount <= 0 || occupancyCount <= 0 ) return NULL;
+	b3World* world = b3GetWorld( shapeId.world0 );
+	if ( world->locked ) return NULL;
+	b3Shape* shape = b3GetShape( world, shapeId );
+	if ( shape->type != b3_voxelGridShape ) return NULL;
+	b3VoxelGrid* collision = shape->voxelGrid;
+	b3VoxelGrid* occupancy = collision->occupancy;
+	if ( !b3VoxelEditLayoutIsValid( collision ) || !b3VoxelEditLayoutIsValid( occupancy ) ||
+		collisionCount > collision->moduleCount || occupancyCount > occupancy->moduleCount ||
+		collision->shapeUsers != 1 || collision->occupancyUsers != 0 || occupancy->shapeUsers != 0 || occupancy->occupancyUsers != 1 ||
+		collision->origin.x != occupancy->origin.x || collision->origin.y != occupancy->origin.y || collision->origin.z != occupancy->origin.z ) return NULL;
+	float voxelMeters = occupancy->cellMeters / (float)occupancy->cellVoxels;
+	float regionRatio = collision->cellMeters / occupancy->cellMeters;
+	if ( !b3IsValidFloat( voxelMeters ) || voxelMeters <= 0.0f || regionRatio < 1.0f ||
+		fabsf( regionRatio - roundf( regionRatio ) ) > 1.0e-4f ) return NULL;
+	b3PreparedVoxelGridEdit* edit = b3Alloc( sizeof( b3PreparedVoxelGridEdit ) );
+	memset( edit, 0, sizeof( *edit ) );
+	edit->collisionCells = b3Alloc( (size_t)collisionCount * sizeof( b3PreparedVoxelCell ) );
+	edit->occupancyCells = b3Alloc( (size_t)occupancyCount * sizeof( b3PreparedVoxelCell ) );
+	edit->affected = changed;
+	bool valid = b3PrepareVoxelCells( collision, collisionUpdates, collisionCount, voxelMeters, false, edit->collisionCells, &edit->affected ) &&
+		b3PrepareVoxelCells( occupancy, occupancyUpdates, occupancyCount, voxelMeters, true, edit->occupancyCells, &edit->affected );
+	if ( !valid )
+	{
+		b3Free( edit->collisionCells, (size_t)collisionCount * sizeof( b3PreparedVoxelCell ) );
+		b3Free( edit->occupancyCells, (size_t)occupancyCount * sizeof( b3PreparedVoxelCell ) );
+		b3Free( edit, sizeof( *edit ) );
+		return NULL;
+	}
+	edit->shapeId = shapeId;
+	edit->collision = collision;
+	edit->occupancy = occupancy;
+	edit->collisionRevision = collision->editRevision;
+	edit->occupancyRevision = occupancy->editRevision;
+	edit->changed = changed;
+	edit->stats = (b3VoxelGridEditStats){ collisionCount, occupancyCount, 0 };
+	b3RetainVoxelGrid( collision );
+	b3RetainVoxelGrid( occupancy );
+	for ( int list = 0; list < 2; ++list )
+	{
+		b3PreparedVoxelCell* cells = list == 0 ? edit->collisionCells : edit->occupancyCells;
+		int count = list == 0 ? collisionCount : occupancyCount;
+		for ( int n = 0; n < count; ++n )
+		{
+			b3RetainVoxelGridModule( cells[n].expected );
+			b3RetainVoxelGridModule( cells[n].candidate );
+		}
+	}
+	return edit;
+}
+
+bool b3ValidatePreparedVoxelGridEdit( const b3PreparedVoxelGridEdit* edit )
+{
+	if ( edit == NULL || edit->committed || !b3Shape_IsValid( edit->shapeId ) ) return false;
+	b3World* world = b3GetWorld( edit->shapeId.world0 );
+	if ( world->locked ) return false;
+	b3Shape* shape = b3GetShape( world, edit->shapeId );
+	if ( shape->type != b3_voxelGridShape || shape->voxelGrid != edit->collision || edit->collision->occupancy != edit->occupancy ||
+		edit->collision->editRevision != edit->collisionRevision || edit->occupancy->editRevision != edit->occupancyRevision ||
+		!b3VoxelEditLayoutIsValid( edit->collision ) || !b3VoxelEditLayoutIsValid( edit->occupancy ) ||
+		edit->collision->shapeUsers != 1 || edit->collision->occupancyUsers != 0 || edit->occupancy->shapeUsers != 0 || edit->occupancy->occupancyUsers != 1 ) return false;
+	for ( int list = 0; list < 2; ++list )
+	{
+		const b3PreparedVoxelCell* cells = list == 0 ? edit->collisionCells : edit->occupancyCells;
+		const b3VoxelGrid* grid = list == 0 ? edit->collision : edit->occupancy;
+		int count = list == 0 ? edit->stats.collisionCells : edit->stats.occupancyCells;
+		for ( int n = 0; n < count; ++n ) if ( grid->modules[cells[n].cell] != cells[n].expected ) return false;
+	}
+	return true;
+}
+
+bool b3CommitPreparedVoxelGridEdit( b3PreparedVoxelGridEdit* edit )
+{
+	if ( !b3ValidatePreparedVoxelGridEdit( edit ) ) return false;
+	b3World* world = b3GetWorld( edit->shapeId.world0 );
+	b3Shape* shape = b3GetShape( world, edit->shapeId );
+	world->locked = true;
+	// No normal failure or payload allocation after this point. Both grids publish before callbacks observe them.
+	for ( int list = 0; list < 2; ++list )
+	{
+		b3PreparedVoxelCell* cells = list == 0 ? edit->collisionCells : edit->occupancyCells;
+		b3VoxelGrid* grid = list == 0 ? edit->collision : edit->occupancy;
+		int count = list == 0 ? edit->stats.collisionCells : edit->stats.occupancyCells;
+		for ( int n = 0; n < count; ++n )
+		{
+			b3RetainVoxelGridModule( cells[n].candidate );
+			grid->modules[cells[n].cell] = cells[n].candidate;
+			b3ReleaseVoxelGridModule( cells[n].expected );
+			edit->stats.aggregateRefitNodes += b3VoxelGrid_RefitCell( grid, cells[n].cell );
+		}
+		grid->editRevision += 1;
+	}
+	edit->committed = true;
+	b3RefreshVoxelGridContacts( world, shape, edit->affected, edit->changed, true );
+	// Preserve contacts while publishing the new moving-grid AABB into the broad phase.
+	b3Body* body = b3Array_Get( world->bodies, shape->bodyId );
+	b3BodyType proxyType = shape->proxyKey == B3_NULL_INDEX ? body->type : B3_PROXY_TYPE( shape->proxyKey );
+	b3UpdateShapeAABBs( shape, b3GetBodyTransformQuick( world, body ), proxyType );
+	if ( shape->proxyKey != B3_NULL_INDEX ) b3BroadPhase_MoveProxy( &world->broadPhase, shape->proxyKey, shape->fatAABB );
+	world->locked = false;
+	return true;
+}
+
+b3VoxelGridEditStats b3GetPreparedVoxelGridEditStats( const b3PreparedVoxelGridEdit* edit )
+{
+	return edit != NULL ? edit->stats : (b3VoxelGridEditStats){ 0 };
+}
+
+void b3DestroyPreparedVoxelGridEdit( b3PreparedVoxelGridEdit* edit )
+{
+	if ( edit == NULL ) return;
+	for ( int list = 0; list < 2; ++list )
+	{
+		b3PreparedVoxelCell* cells = list == 0 ? edit->collisionCells : edit->occupancyCells;
+		int count = list == 0 ? edit->stats.collisionCells : edit->stats.occupancyCells;
+		for ( int n = 0; n < count; ++n )
+		{
+			b3ReleaseVoxelGridModule( cells[n].expected );
+			b3ReleaseVoxelGridModule( cells[n].candidate );
+		}
+		b3Free( cells, (size_t)count * sizeof( b3PreparedVoxelCell ) );
+	}
+	b3ReleaseVoxelGrid( edit->collision );
+	b3ReleaseVoxelGrid( edit->occupancy );
+	b3Free( edit, sizeof( *edit ) );
+}
+
 void b3Shape_SetSphere( b3ShapeId shapeId, const b3Sphere* sphere )
 {
 	b3World* world = b3GetUnlockedWorld( shapeId.world0 );
@@ -1871,6 +2530,12 @@ b3Vec3 b3Shape_GetClosestPoint( b3ShapeId shapeId, b3Vec3 target )
 	// Low level closest point query is a documented float carve-out far from the origin
 	b3Transform transform = b3ToRelativeTransform( b3GetBodyTransformQuick( world, body ), b3Pos_zero );
 
+	// Only convex shapes have a proxy; a mesh, height field, compound or voxel grid answers with the target itself
+	if ( shape->type != b3_capsuleShape && shape->type != b3_sphereShape && shape->type != b3_hullShape )
+	{
+		return target;
+	}
+
 	b3DistanceInput input;
 	input.proxyA = b3MakeShapeProxy( shape );
 	input.proxyB = (b3ShapeProxy){ &target, 1, 0.0f };
@@ -2165,6 +2830,114 @@ static bool b3MeshTimeOfImpactFcn( b3Vec3 a, b3Vec3 b, b3Vec3 c, int triangleInd
 	return true;
 }
 
+typedef struct b3VoxelImpactContext
+{
+	const b3VoxelGrid* grid;
+	b3TOIInput toiInput;
+	b3TOIOutput toiOutput;
+
+	// Centroid of shape in body B local space
+	b3Vec3 localCentroidB;
+
+	// Centroid of shape at beginning and end of sweep in grid local space. Used for early out.
+	b3Vec3 gridLocalCentroidB1, gridLocalCentroidB2;
+	float fallbackRadius;
+	bool isSensor;
+	int visitCount;
+} b3VoxelImpactContext;
+
+// Time of impact versus one box of a voxel grid. Like the mesh version this skips a face the centroid starts behind or
+// finishes in front of, but only the faces that are exposed are candidates: a face that solid voxels cover is a seam
+// between boxes and must not stop a body sliding along them. A box with no candidate face is skipped.
+static bool b3VoxelTimeOfImpactFcn( int cell, int box, b3AABB bounds, void* context )
+{
+	B3_UNUSED( bounds );
+	b3VoxelImpactContext* toiContext = context;
+	const b3VoxelGrid* grid = toiContext->grid;
+
+	toiContext->visitCount += 1;
+
+	const b3VoxelGridModule* module = b3GetVoxelGridCellModule( grid, cell );
+	const b3HullData* hull = &module->hulls[box].base;
+	b3Vec3 corner = b3VoxelGridCellCorner( grid, cell );
+
+	uint8_t covered = b3GetVoxelBoxCoveredFaces( grid, cell, box );
+	const b3Plane* planes = b3GetHullPlanes( hull );
+	b3Vec3 c1 = b3Sub( toiContext->gridLocalCentroidB1, corner );
+	b3Vec3 c2 = b3Sub( toiContext->gridLocalCentroidB2, corner );
+
+	bool candidate = false;
+	for ( int face = 0; face < 6 && candidate == false; ++face )
+	{
+		if ( covered & ( 1 << face ) )
+		{
+			continue;
+		}
+
+		float offset1 = b3PlaneSeparation( planes[face], c1 );
+		float offset2 = b3PlaneSeparation( planes[face], c2 );
+
+		if ( offset1 < 0.0f )
+		{
+			// Started behind or finished in front
+			continue;
+		}
+
+		if ( toiContext->isSensor == false && offset1 - offset2 < toiContext->fallbackRadius &&
+			 offset2 > toiContext->fallbackRadius )
+		{
+			// Finished in front
+			continue;
+		}
+
+		candidate = true;
+	}
+
+	if ( candidate == false )
+	{
+		return true;
+	}
+
+	// The hull is in the cell frame, the sweep in the grid frame
+	b3Vec3 points[8];
+	const b3Vec3* hullPoints = b3GetHullPoints( hull );
+	for ( int i = 0; i < hull->vertexCount; ++i )
+	{
+		points[i] = b3Add( hullPoints[i], corner );
+	}
+
+	toiContext->toiInput.proxyA.points = points;
+	toiContext->toiInput.proxyA.count = hull->vertexCount;
+	toiContext->toiInput.proxyA.radius = 0.0f;
+
+	b3TOIOutput output = b3TimeOfImpact( &toiContext->toiInput );
+
+	// It is possible for a hit at fraction == 0
+
+	if ( 0.0f < output.fraction && output.fraction < toiContext->toiInput.maxFraction )
+	{
+		toiContext->toiOutput = output;
+		toiContext->toiInput.maxFraction = output.fraction;
+	}
+	else if ( 0.0f == output.fraction )
+	{
+		// fallback to TOI of a small circle around the fast shape centroid
+		b3TOIInput fallbackInput = toiContext->toiInput;
+		fallbackInput.proxyB = (b3ShapeProxy){ &toiContext->localCentroidB, 1, toiContext->fallbackRadius + B3_LINEAR_SLOP };
+		output = b3TimeOfImpact( &fallbackInput );
+
+		if ( 0.0f < output.fraction && output.fraction < toiContext->toiInput.maxFraction )
+		{
+			toiContext->toiOutput = output;
+			toiContext->toiInput.maxFraction = output.fraction;
+			toiContext->toiOutput.usedFallback = true;
+		}
+	}
+
+	// Continue the query
+	return true;
+}
+
 typedef struct b3CompoundImpactContext
 {
 	b3TOIInput toiInput;
@@ -2271,8 +3044,97 @@ static bool b3CompoundTimeOfImpactFcn( const b3CompoundData* compound, int child
 	return true;
 }
 
+b3TOIOutput b3ShapeTimeOfImpact( b3Shape* shapeA, b3Shape* shapeB, b3Sweep* sweepA, b3Sweep* sweepB, float maxFraction );
+
+// Time of impact of a voxel grid that moves (B) against any shape A that is taken as static. The grid is the union of its
+// boxes, so its time of impact is the earliest of theirs. Each exposed box is a hull in the body frame (a box covered on every
+// face cannot reach anything before the boxes around it) and goes through the same routine as any hull against A. The bounds
+// of the sweeping boxes against the bounds of A first leave out the boxes that cannot reach it.
+static b3TOIOutput b3VoxelGridTimeOfImpact( b3Shape* shapeA, b3Shape* shapeB, b3Sweep* sweepA, b3Sweep* sweepB, float maxFraction )
+{
+	const b3VoxelGrid* grid = shapeB->voxelGrid;
+	b3TOIOutput best = { 0 };
+
+	b3Transform xfA = {
+		.p = b3Sub( sweepA->c1, b3RotateVector( sweepA->q1, sweepA->localCenter ) ),
+		.q = sweepA->q1,
+	};
+	b3Transform xfB1 = {
+		.p = b3Sub( sweepB->c1, b3RotateVector( sweepB->q1, sweepB->localCenter ) ),
+		.q = sweepB->q1,
+	};
+	b3Transform xfB2 = {
+		.p = b3Sub( sweepB->c2, b3RotateVector( sweepB->q2, sweepB->localCenter ) ),
+		.q = sweepB->q2,
+	};
+
+	float margin = 2.0f * B3_SPECULATIVE_DISTANCE;
+	b3AABB boundsA = b3ComputeShapeAABB( shapeA, xfA );
+	boundsA = b3AABB_Inflate( boundsA, margin );
+
+	// The whole grid first
+	b3AABB sweptGrid = b3AABB_Union( b3ComputeVoxelGridOccupiedAABB( grid, xfB1 ), b3ComputeVoxelGridOccupiedAABB( grid, xfB2 ) );
+	if ( b3AABB_Overlaps( sweptGrid, boundsA ) == false )
+	{
+		return best;
+	}
+
+	float bestFraction = maxFraction;
+	int cellCount = grid->size[0] * grid->size[1] * grid->size[2];
+	for ( int cell = 0; cell < cellCount; ++cell )
+	{
+		const b3VoxelGridModule* module = b3GetVoxelGridCellModule( grid, cell );
+		if ( module == NULL || module->boxCount == 0 )
+		{
+			continue;
+		}
+
+		b3Vec3 corner = b3VoxelGridCellCorner( grid, cell );
+		b3AABB moduleBounds = { b3Add( corner, module->bounds.lowerBound ), b3Add( corner, module->bounds.upperBound ) };
+		b3AABB sweptModule = b3AABB_Union( b3AABB_Transform( xfB1, moduleBounds ), b3AABB_Transform( xfB2, moduleBounds ) );
+		if ( b3AABB_Overlaps( sweptModule, boundsA ) == false )
+		{
+			continue;
+		}
+
+		for ( int box = 0; box < module->boxCount; ++box )
+		{
+			b3AABB local = b3GetVoxelBoxLocalBounds( module, box );
+			local.lowerBound = b3Add( local.lowerBound, corner );
+			local.upperBound = b3Add( local.upperBound, corner );
+			b3AABB swept = b3AABB_Union( b3AABB_Transform( xfB1, local ), b3AABB_Transform( xfB2, local ) );
+			if ( b3AABB_Overlaps( swept, boundsA ) == false || b3IsVoxelBoxEnclosed( grid, cell, box ) )
+			{
+				continue;
+			}
+
+			// The box as a hull shape in the body frame
+			b3Vec3 extent = b3AABB_Extents( local );
+			b3BoxHull hull = b3MakeOffsetBoxHull( extent.x, extent.y, extent.z, b3AABB_Center( local ) );
+			b3Shape boxShape = { 0 };
+			boxShape.type = b3_hullShape;
+			boxShape.hull = &hull.base;
+			boxShape.sensorIndex = B3_NULL_INDEX;
+
+			b3TOIOutput output = b3ShapeTimeOfImpact( shapeA, &boxShape, sweepA, sweepB, bestFraction );
+			if ( 0.0f < output.fraction && output.fraction < bestFraction )
+			{
+				best = output;
+				bestFraction = output.fraction;
+			}
+		}
+	}
+
+	return best;
+}
+
 b3TOIOutput b3ShapeTimeOfImpact( b3Shape* shapeA, b3Shape* shapeB, b3Sweep* sweepA, b3Sweep* sweepB, float maxFraction )
 {
+	if ( shapeB->type == b3_voxelGridShape )
+	{
+		return b3VoxelGridTimeOfImpact( shapeA, shapeB, sweepA, sweepB, maxFraction );
+	}
+
 	bool isSensor = shapeA->sensorIndex != B3_NULL_INDEX;
 
 	b3ShapeType typeA = shapeA->type;
@@ -2303,6 +3165,50 @@ b3TOIOutput b3ShapeTimeOfImpact( b3Shape* shapeA, b3Shape* shapeB, b3Sweep* swee
 		context.localSweepBoundsB = localBounds;
 
 		b3QueryCompound( shapeA->compound, localBounds, b3CompoundTimeOfImpactFcn, &context );
+
+		return context.toiOutput;
+	}
+
+	if ( typeA == b3_voxelGridShape )
+	{
+		// Assume the grid is static
+		b3VoxelImpactContext context = { 0 };
+		context.grid = shapeA->voxelGrid;
+		context.toiInput.sweepA = *sweepA;
+		context.toiInput.proxyB = b3MakeShapeProxy( shapeB );
+		context.toiInput.sweepB = *sweepB;
+		context.toiInput.maxFraction = maxFraction;
+		context.isSensor = isSensor;
+
+		b3Vec3 localCentroidB = b3GetShapeCentroid( shapeB );
+		context.localCentroidB = localCentroidB;
+
+		b3Transform xfA = {
+			.p = b3Sub( sweepA->c1, b3RotateVector( sweepA->q1, sweepA->localCenter ) ),
+			.q = sweepA->q1,
+		};
+
+		b3Transform xfB1 = {
+			.p = b3Sub( sweepB->c1, b3RotateVector( sweepB->q1, sweepB->localCenter ) ),
+			.q = sweepB->q1,
+		};
+
+		b3Transform xfB2 = {
+			.p = b3Sub( sweepB->c2, b3RotateVector( sweepB->q2, sweepB->localCenter ) ),
+			.q = sweepB->q2,
+		};
+
+		context.gridLocalCentroidB1 = b3InvTransformPoint( xfA, b3TransformPoint( xfB1, localCentroidB ) );
+		context.gridLocalCentroidB2 = b3InvTransformPoint( xfA, b3TransformPoint( xfB2, localCentroidB ) );
+
+		b3ShapeExtent extents = b3ComputeShapeExtent( shapeB, context.localCentroidB );
+		context.fallbackRadius = b3MaxFloat( 0.5f * extents.minExtent, B3_LINEAR_SLOP );
+
+		// Swept bounds of shapeB, local to the grid
+		b3AABB bounds = b3ComputeSweptShapeAABB( shapeB, sweepB, maxFraction );
+		b3AABB localBounds = b3AABB_Transform( b3InvertTransform( xfA ), bounds );
+
+		b3QueryVoxelGrid( shapeA->voxelGrid, localBounds, b3VoxelTimeOfImpactFcn, &context );
 
 		return context.toiOutput;
 	}
@@ -2364,7 +3270,8 @@ b3TOIOutput b3ShapeTimeOfImpact( b3Shape* shapeA, b3Shape* shapeB, b3Sweep* swee
 		return context.toiOutput;
 	}
 
-	B3_ASSERT( shapeB->type != b3_compoundShape && shapeB->type != b3_meshShape && shapeB->type != b3_heightShape );
+	B3_ASSERT( shapeB->type != b3_compoundShape && shapeB->type != b3_meshShape && shapeB->type != b3_heightShape &&
+			   shapeB->type != b3_voxelGridShape );
 
 	b3TOIInput input;
 	input.proxyA = b3MakeShapeProxy( shapeA );
