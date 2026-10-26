@@ -23,6 +23,7 @@
 #include "simd.h"
 #include "solver.h"
 #include "solver_set.h"
+#include "voxel_grid.h"
 
 #include "box3d/box3d.h"
 #include "box3d/constants.h"
@@ -323,6 +324,7 @@ b3WorldId b3CreateWorld( const b3WorldDef* def )
 	world->endEventArrayIndex = 0;
 
 	world->stepIndex = 0;
+    b3AtomicStoreInt( &world->ccdClipEventCount, 0 );
 	world->splitIslandId = B3_NULL_INDEX;
 	world->activeTaskCount = 0;
 	world->taskCount = 0;
@@ -360,6 +362,9 @@ b3WorldId b3CreateWorld( const b3WorldDef* def )
 	world->locked = false;
 	world->enableWarmStarting = true;
 	world->enableContinuous = def->enableContinuous;
+	world->enableLimitPassThrough = true;
+	world->enableVoxelPointContacts = false;
+	world->voxelMinSeparation = FLT_MAX;
 	world->enableSpeculative = true;
 	world->userTreeTask = NULL;
 	world->userData = def->userData;
@@ -377,7 +382,7 @@ b3WorldId b3CreateWorld( const b3WorldDef* def )
 	{
 		// Built-in scheduler
 		world->workerCount = b3MinInt( def->workerCount, B3_MAX_WORKERS );
-		world->scheduler = b3CreateScheduler( world->workerCount );
+		world->scheduler = b3CreateScheduler( world->workerCount, def->workerPriority );
 		world->enqueueTaskFcn = b3SchedulerEnqueueTask;
 		world->finishTaskFcn = b3SchedulerFinishTask;
 		world->userTaskContext = world->scheduler;
@@ -885,6 +890,10 @@ static void b3Collide( b3StepContext* context )
 		b3TaskContext* taskContext = world->taskContexts.data + i;
 		b3SetBitCountAndClear( &taskContext->contactStateBitSet, contactIdCapacity );
 		taskContext->satCallCount = 0;
+		taskContext->voxelSampleCount = 0;
+		taskContext->voxelPointCount = 0;
+		taskContext->voxelGridPairCount = 0;
+		taskContext->voxelMinSeparation = FLT_MAX;
 		taskContext->satCacheHitCount = 0;
 		taskContext->recycledContactCount = 0;
 		memset( taskContext->manifoldCounts, 0, sizeof( taskContext->manifoldCounts ) );
@@ -908,6 +917,10 @@ static void b3Collide( b3StepContext* context )
 	b3BitSet* bitSet = &world->taskContexts.data[0].contactStateBitSet;
 	world->satCallCount = satMultiplier * world->taskContexts.data[0].satCallCount;
 	world->satCacheHitCount = satMultiplier * world->taskContexts.data[0].satCacheHitCount;
+	world->voxelSampleCount = world->taskContexts.data[0].voxelSampleCount;
+	world->voxelPointCount = world->taskContexts.data[0].voxelPointCount;
+	world->voxelGridPairCount = world->taskContexts.data[0].voxelGridPairCount;
+	world->voxelMinSeparation = world->taskContexts.data[0].voxelMinSeparation;
 	memcpy( world->manifoldCounts, world->taskContexts.data[0].manifoldCounts,
 			B3_CONTACT_MANIFOLD_COUNT_BUCKETS * sizeof( int ) );
 
@@ -916,6 +929,10 @@ static void b3Collide( b3StepContext* context )
 		b3InPlaceUnion( bitSet, &world->taskContexts.data[i].contactStateBitSet );
 		world->satCallCount += world->taskContexts.data[i].satCallCount;
 		world->satCacheHitCount += world->taskContexts.data[i].satCacheHitCount;
+		world->voxelSampleCount += world->taskContexts.data[i].voxelSampleCount;
+		world->voxelPointCount += world->taskContexts.data[i].voxelPointCount;
+		world->voxelGridPairCount += world->taskContexts.data[i].voxelGridPairCount;
+		world->voxelMinSeparation = b3MinFloat( world->voxelMinSeparation, world->taskContexts.data[i].voxelMinSeparation );
 		for ( int j = 0; j < B3_CONTACT_MANIFOLD_COUNT_BUCKETS; ++j )
 		{
 			world->manifoldCounts[j] += world->taskContexts.data[i].manifoldCounts[j];
@@ -1044,6 +1061,8 @@ void b3World_Step( b3WorldId worldId, float timeStep, int subStepCount )
 	}
 
 	B3_REC( world, Step, worldId, timeStep, subStepCount );
+
+    b3AtomicStoreInt( &world->ccdClipEventCount, 0 );
 
 	world->locked = true;
 
@@ -1347,6 +1366,9 @@ static bool DrawQueryCallback( int proxyId, uint64_t userData, void* context )
 				case b3_sphereShape:
 					debugShape.sphere = &shape->sphere;
 					shape->userShape = world->createDebugShape( &debugShape, world->userDebugShapeContext );
+					break;
+				case b3_voxelGridShape:
+					// No debug geometry for voxel grids
 					break;
 				default:
 					B3_ASSERT( false );
@@ -2067,6 +2089,34 @@ void b3World_EnableContinuous( b3WorldId worldId, bool flag )
 	world->enableContinuous = flag;
 }
 
+void b3World_EnableLimitPassThrough( b3WorldId worldId, bool flag )
+{
+	b3World* world = b3GetUnlockedWorldFromId( worldId );
+	if ( world == NULL )
+	{
+		return;
+	}
+
+	world->enableLimitPassThrough = flag;
+}
+
+void b3World_EnableVoxelPointContacts( b3WorldId worldId, bool flag )
+{
+	b3World* world = b3GetUnlockedWorldFromId( worldId );
+	if ( world == NULL )
+	{
+		return;
+	}
+
+	world->enableVoxelPointContacts = flag;
+}
+
+bool b3World_IsVoxelPointContactsEnabled( b3WorldId worldId )
+{
+	b3World* world = b3GetWorldFromId( worldId );
+	return world != NULL && world->enableVoxelPointContacts;
+}
+
 bool b3World_IsContinuousEnabled( b3WorldId worldId )
 {
 	b3World* world = b3GetWorldFromId( worldId );
@@ -2640,6 +2690,10 @@ b3Counters b3World_GetCounters( b3WorldId worldId )
 
 	s.satCallCount = world->satCallCount;
 	s.satCacheHitCount = world->satCacheHitCount;
+	s.voxelGridPairCount = world->voxelGridPairCount;
+	s.voxelSampleCount = world->voxelSampleCount;
+	s.voxelPointCount = world->voxelPointCount;
+	s.voxelMinSeparation = world->voxelMinSeparation;
 	memcpy( s.manifoldCounts, world->manifoldCounts, B3_CONTACT_MANIFOLD_COUNT_BUCKETS * sizeof( int ) );
 	s.stackUsed = world->stack.maxAllocation;
 	s.byteCount = (int64_t)b3GetWorldByteCount( world, false );
@@ -2755,6 +2809,118 @@ b3TreeStats b3World_OverlapAABB( b3WorldId worldId, b3AABB aabb, b3QueryFilter f
 	}
 
 	return treeStats;
+}
+
+// Terra gameplay candidate queries: explicit readiness, no shape narrowphase.
+// The query holds the existing world lock across callbacks to forbid mutation/reentry.
+typedef struct b3CandidateQueryContext
+{
+    b3World* world;
+    b3QueryFilter filter;
+    b3OverlapResultFcn* callback;
+    void* context;
+    bool stopped;
+} b3CandidateQueryContext;
+
+static bool b3CandidateShape( uint64_t userData, b3CandidateQueryContext* query )
+{
+    int shapeIndex = (int)userData;
+    b3Shape* shape = b3Array_Get( query->world->shapes, shapeIndex );
+    if ( b3ShouldQueryCollide( &shape->filter, &query->filter ) == false )
+    {
+        return true;
+    }
+    b3ShapeId shapeId = { shapeIndex + 1, query->world->worldId, shape->generation };
+    bool proceed = query->callback( shapeId, query->context );
+    query->stopped = proceed == false;
+    return proceed;
+}
+
+static bool b3CandidateAABBCallback( int proxyId, uint64_t userData, void* context )
+{
+    B3_UNUSED( proxyId );
+    return b3CandidateShape( userData, context );
+}
+
+static float b3CandidateRayCallback( const b3RayCastInput* input, int proxyId, uint64_t userData, void* context )
+{
+    B3_UNUSED( input );
+    B3_UNUSED( proxyId );
+    // A zero-distance shape hit must not implicitly terminate other initial-overlap candidates.
+    // Only the caller's explicit bool false stops; otherwise keep the entire finite segment.
+    return b3CandidateShape( userData, context ) ? 1.0f : 0.0f;
+}
+
+static b3World* b3CandidateQueryWorld( b3WorldId worldId )
+{
+    // The upstream unlocked getter asserts on invalid/locked IDs. Readiness is a normal result here.
+    if ( b3World_IsValid( worldId ) == false )
+    {
+        return NULL;
+    }
+    b3World* world = b3_worlds + ( worldId.index1 - 1 );
+    return world->locked ? NULL : world;
+}
+
+bool b3World_QueryAABBCandidates( b3WorldId worldId, b3AABB bounds, b3QueryFilter filter,
+                                b3OverlapResultFcn* callback, void* context, b3TreeStats* stats )
+{
+    if ( stats == NULL )
+    {
+        return false;
+    }
+    *stats = (b3TreeStats){ 0 };
+    b3World* world = b3CandidateQueryWorld( worldId );
+    if ( world == NULL || callback == NULL || b3IsValidAABB( bounds ) == false )
+    {
+        return false;
+    }
+    b3CandidateQueryContext query = { world, filter, callback, context, false };
+    world->locked = true;
+    for ( int i = 0; i < b3_bodyTypeCount && query.stopped == false; ++i )
+    {
+        b3TreeStats result = b3DynamicTree_Query( world->broadPhase.trees + i, bounds, filter.maskBits, false,
+                                                b3CandidateAABBCallback, &query );
+        stats->nodeVisits += result.nodeVisits;
+        stats->leafVisits += result.leafVisits;
+    }
+    world->locked = false;
+    return true;
+}
+
+bool b3World_QueryRayCandidates( b3WorldId worldId, b3Pos origin, b3Vec3 translation, b3QueryFilter filter,
+                               b3OverlapResultFcn* callback, void* context, b3TreeStats* stats )
+{
+    if ( stats == NULL )
+    {
+        return false;
+    }
+    *stats = (b3TreeStats){ 0 };
+    b3World* world = b3CandidateQueryWorld( worldId );
+    if ( world == NULL || callback == NULL || b3IsValidPosition( origin ) == false || b3IsValidVec3( translation ) == false )
+    {
+        return false;
+    }
+    b3Vec3 start = b3ToVec3( origin );
+    b3Vec3 end = b3Add( start, translation );
+    if ( b3IsValidVec3( start ) == false || b3IsValidVec3( end ) == false )
+    {
+        return false;
+    }
+    // Lower traversal combines inclusive segment AABB overlap and an inclusive ray/AABB SAT.
+    // It includes the origin and endpoint, including zero-length point segments; no shape ray test.
+    b3RayCastInput input = { start, translation, 1.0f };
+    b3CandidateQueryContext query = { world, filter, callback, context, false };
+    world->locked = true;
+    for ( int i = 0; i < b3_bodyTypeCount && query.stopped == false; ++i )
+    {
+        b3TreeStats result = b3DynamicTree_RayCast( world->broadPhase.trees + i, &input, filter.maskBits, false,
+                                                  b3CandidateRayCallback, &query );
+        stats->nodeVisits += result.nodeVisits;
+        stats->leafVisits += result.leafVisits;
+    }
+    world->locked = false;
+    return true;
 }
 
 typedef struct WorldOverlapContext
@@ -4157,7 +4323,16 @@ void b3ValidateContacts( b3World* world )
 				B3_ASSERT( contact->meshContact.triangleCache.capacity >= cacheCount );
 
 				b3Shape* shapeA = b3Array_Get( world->shapes, contact->shapeIdA );
-				if ( shapeA->type == b3_meshShape )
+				b3Shape* contactShapeB = b3Array_Get( world->shapes, contact->shapeIdB );
+				if ( contactShapeB->type == b3_voxelGridShape && shapeA->type != b3_voxelGridShape )
+				{
+					// A voxel grid on a mesh or height field: the cache holds hashes of pairs, ascending
+					for ( int i = 0; i < cacheCount; ++i )
+					{
+						B3_ASSERT( 0 <= contact->meshContact.triangleCache.data[i].triangleIndex );
+					}
+				}
+				else if ( shapeA->type == b3_meshShape )
 				{
 					int triangleCount = shapeA->mesh.data->triangleCount;
 					for ( int i = 0; i < cacheCount; ++i )
@@ -4173,6 +4348,26 @@ void b3ValidateContacts( b3World* world )
 					{
 						int triangleIndex = contact->meshContact.triangleCache.data[i].triangleIndex;
 						B3_ASSERT( 0 <= triangleIndex && triangleIndex < triangleCount );
+					}
+				}
+				else if ( shapeA->type == b3_voxelGridShape )
+				{
+					// Against a convex shape the cache holds voxel keys, cell and box. Against another grid it holds the hash
+					// of a pair of keys, in ascending order.
+					b3Shape* shapeB = b3Array_Get( world->shapes, contact->shapeIdB );
+					const b3VoxelGrid* grid = shapeA->voxelGrid;
+					int cellCount = grid->size[0] * grid->size[1] * grid->size[2];
+					for ( int i = 0; i < cacheCount; ++i )
+					{
+						int key = contact->meshContact.triangleCache.data[i].triangleIndex;
+						if ( shapeB->type == b3_voxelGridShape )
+						{
+							B3_ASSERT( 0 <= key );
+						}
+						else
+						{
+							B3_ASSERT( 0 <= b3VoxelGridKeyCell( grid, key ) && b3VoxelGridKeyCell( grid, key ) < cellCount );
+						}
 					}
 				}
 				else
@@ -4214,3 +4409,20 @@ void b3ValidateContacts( b3World* world )
 }
 
 #endif
+
+// No copy/allocation or state mutation. All tasks have joined before the world unlocks.
+bool b3World_ReadCcdClipEvents( b3WorldId worldId, const b3CcdClipEvent** events, int* count, int* overflow )
+{
+    if ( events == NULL || count == NULL || overflow == NULL ) { return false; }
+    *events = NULL;
+    *count = 0;
+    *overflow = 0;
+    b3World* world = b3GetUnlockedWorldFromId( worldId );
+    if ( world == NULL ) { return false; }
+    int total = b3AtomicLoadInt( &world->ccdClipEventCount );
+    *events = world->ccdClipEvents;
+    *count = b3MinInt( total, B3_CCD_CLIP_CAPACITY );
+    *overflow = b3MaxInt( total - B3_CCD_CLIP_CAPACITY, 0 );
+    return true;
+}
+int b3CcdClipEventSize( void ) { return (int)sizeof( b3CcdClipEvent ); }

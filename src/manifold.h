@@ -90,3 +90,17 @@ static inline b3SeparatingAxis b3GetBestAxis( const b3AxisQuery* query )
 
 	return query->faceB;
 }
+
+// Terra Prime: collide a box hull A with a shape B using only the face axes of A in faceMask (one bit per face). Used for voxel
+// grid boxes whose other faces are covered by solid. The manifold is in frame A with the normal pointing from A to B.
+bool b3CollideHullFaces( b3LocalManifold* manifold, int capacity, const b3HullData* hullA, int faceMask, const b3HullData* hullB,
+						 b3Transform transformBtoA, b3SATCache* cache );
+bool b3CollideHullFacesAndSphere( b3LocalManifold* manifold, int capacity, const b3HullData* hullA, int faceMask,
+								  const b3Sphere* sphereB, b3Transform transformBtoA );
+bool b3CollideHullFacesAndCapsule( b3LocalManifold* manifold, int capacity, const b3HullData* hullA, int faceMask,
+								   const b3Capsule* capsuleB, b3Transform transformBtoA );
+
+// Terra Prime: a triangle against a voxel grid box, answered on the box faces in faceMask only. The manifold is in the frame of
+// the hull with the normal from the triangle to the hull.
+void b3CollideTriangleAndHullFaces( b3LocalManifold* manifold, int capacity, b3Vec3 v1, b3Vec3 v2, b3Vec3 v3, int triangleFlags,
+									const b3HullData* hullB, int faceMask, b3SATCache* cache, bool enableSpeculative );

@@ -15,11 +15,25 @@
 
 #include <float.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 _Static_assert( B3_ROOT_NODE == 0, "bad root" );
 _Static_assert( sizeof( b3TreeNode ) == 32, "expected size" );
 _Static_assert( sizeof( b3TreeProxy ) == 24, "expected size" );
+
+// Terra: shared query/ray traversal (including solver callers) must never silently discard children.
+// Preserve the existing stack and hot traversal; exhaustion remains an explicit fatal backend limit.
+static void b3RequireTraversalStackSpace( int stackCount, const char* query )
+{
+	if ( stackCount >= B3_TREE_STACK_SIZE - 1 )
+	{
+		fprintf( stderr, "Box3D fatal %s shared tree traversal stack overflow: pending=%d capacity=%d\n", query, stackCount,
+				 B3_TREE_STACK_SIZE );
+		fflush( stderr );
+		abort();
+	}
+}
 
 // The free sibling pair list is chained through the parent index of their first node. A pair comes from the
 // free list when there is one and from the bump pointer otherwise. A rebuild empties the free list, so
@@ -928,7 +942,7 @@ B3_FORCE_INLINE b3TreeStats b3QueryTreeView( const b3TreeView* view, b3AABB aabb
 				}
 				else
 				{
-					B3_ASSERT( stackCount < B3_TREE_STACK_SIZE - 1 );
+					b3RequireTraversalStackSpace( stackCount, "AABB" );
 				}
 			}
 		}
@@ -1196,7 +1210,7 @@ B3_FORCE_INLINE b3TreeStats b3RayCastTreeView( const b3TreeView* view, const b3R
 				}
 				else
 				{
-					B3_ASSERT( stackCount < B3_TREE_STACK_SIZE - 1 );
+					b3RequireTraversalStackSpace( stackCount, "ray" );
 				}
 			}
 		}
