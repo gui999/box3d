@@ -8,7 +8,9 @@
 #include "contact.h"
 #include "joint.h"
 #include "physics_world.h"
+#include "shape.h"
 
+#include <float.h>
 #include <string.h>
 
 // Solver using graph coloring. Islands are only used for sleep.
@@ -92,8 +94,18 @@ void b3AddContactToGraph( b3World* world, b3Contact* contact )
 	b3BodyType typeB = bodyB->type;
 	B3_ASSERT( typeA == b3_dynamicBody || typeB == b3_dynamicBody );
 
+	// Terra: a contact under a shape's impulse limit is solved on the scalar overflow path, which alone shares the limit
+	// across its points. The limit routes a contact when it starts touching.
+	const b3Shape* shapeA = b3Array_Get( world->shapes, contact->shapeIdA );
+	const b3Shape* shapeB = b3Array_Get( world->shapes, contact->shapeIdB );
+	bool limited = shapeA->maxNormalImpulse < FLT_MAX || shapeB->maxNormalImpulse < FLT_MAX;
+
 #if B3_FORCE_OVERFLOW == 0
-	if ( typeA == b3_dynamicBody && typeB == b3_dynamicBody )
+	if ( limited )
+	{
+		// Stays in the overflow color
+	}
+	else if ( typeA == b3_dynamicBody && typeB == b3_dynamicBody )
 	{
 		// Dynamic constraint colors cannot encroach on colors reserved for static constraints
 		for ( int i = 0; i < B3_DYNAMIC_COLOR_COUNT; ++i )
