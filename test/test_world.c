@@ -1797,6 +1797,57 @@ static int BodySimLocatorTest( void )
 	return LocatorFastFlagTest();
 }
 
+// Terra: a ball fired through a thin static plank whose impulse limit is low keeps most of its speed and ends up past
+// the plank; the same ball against an unlimited plank stops in front of it. Returns the ball's final x and speed.
+static void ImpulseLimitPlankShot( float maxNormalImpulse, float* finalX, float* finalSpeed )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.gravity = b3Vec3_zero;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	b3BodyDef plankDef = b3DefaultBodyDef();
+	b3BodyId plankId = b3CreateBody( worldId, &plankDef );
+	b3BoxHull plank = b3MakeBoxHull( 0.05f, 1.0f, 1.0f );
+	b3ShapeDef plankShapeDef = b3DefaultShapeDef();
+	plankShapeDef.maxNormalImpulse = maxNormalImpulse;
+	b3CreateHullShape( plankId, &plankShapeDef, &plank.base );
+
+	b3BodyDef ballDef = b3DefaultBodyDef();
+	ballDef.type = b3_dynamicBody;
+	ballDef.position = (b3Pos){ -2.0f, 0.0f, 0.0f };
+	ballDef.linearVelocity = (b3Vec3){ 20.0f, 0.0f, 0.0f };
+	b3BodyId ballId = b3CreateBody( worldId, &ballDef );
+	b3ShapeDef ballShapeDef = b3DefaultShapeDef();
+	ballShapeDef.density = 1000.0f;
+	b3Sphere ball = { { 0.0f, 0.0f, 0.0f }, 0.2f };
+	b3CreateSphereShape( ballId, &ballShapeDef, &ball );
+
+	for ( int i = 0; i < 30; ++i )
+	{
+		b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	}
+
+	*finalX = (float)b3Body_GetPosition( ballId ).x;
+	*finalSpeed = b3Length( b3Body_GetLinearVelocity( ballId ) );
+	b3DestroyWorld( worldId );
+}
+
+static int ImpulseLimitPlankTest( void )
+{
+	// The ball is about 33.5 kg at 20 m/s, so 670 N*s of momentum; the plank may take 20 N*s per step.
+	float limitedX, limitedSpeed;
+	ImpulseLimitPlankShot( 20.0f, &limitedX, &limitedSpeed );
+	ENSURE( limitedX > 0.5f );
+	ENSURE( limitedSpeed > 0.8f * 20.0f );
+
+	float solidX, solidSpeed;
+	ImpulseLimitPlankShot( FLT_MAX, &solidX, &solidSpeed );
+	printf( "  impulse limit plank: limited x %.3f speed %.3f, unlimited x %.3f speed %.3f\n", limitedX, limitedSpeed, solidX, solidSpeed );
+	ENSURE( solidX < 0.0f );
+	ENSURE( solidSpeed < 0.5f * 20.0f );
+	return 0;
+}
+
 int WorldTest( void )
 {
 	RUN_SUBTEST( HelloWorld );
@@ -1825,6 +1876,7 @@ int WorldTest( void )
 	RUN_SUBTEST( TestEnlargedProxyDestroyed );
 	RUN_SUBTEST( TestCompoundShapeCount );
 	RUN_SUBTEST( BodySimLocatorTest );
+	RUN_SUBTEST( ImpulseLimitPlankTest );
 
 	return 0;
 }
