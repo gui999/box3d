@@ -95,7 +95,7 @@ void b3AddContactToGraph( b3World* world, b3Contact* contact )
 	B3_ASSERT( typeA == b3_dynamicBody || typeB == b3_dynamicBody );
 
 	// Terra: a contact under a shape's impulse limit is solved on the scalar overflow path, which alone shares the limit
-	// across its points. The limit routes a contact when it starts touching.
+	// across its points. The limit routes a contact when it starts touching; b3Shape_SetMaxNormalImpulse moves live ones.
 	const b3Shape* shapeA = b3Array_Get( world->shapes, contact->shapeIdA );
 	const b3Shape* shapeB = b3Array_Get( world->shapes, contact->shapeIdB );
 	bool limited = shapeA->maxNormalImpulse < FLT_MAX || shapeB->maxNormalImpulse < FLT_MAX;
