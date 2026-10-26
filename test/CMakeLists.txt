@@ -9,7 +9,6 @@ set(BOX3D_TEST_FILES
 	test_broad_phase.c
 	test_collision.c
 	test_compound.c
-	test_contention.c
 	test_container.c
     test_determinism.c
     test_distance.c

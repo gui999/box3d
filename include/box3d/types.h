@@ -209,10 +209,6 @@ typedef struct b3WorldDef
 	/// threads and use an internal scheduler.
 	uint32_t workerCount;
 
-	/// Terra: OS priority of the internal scheduler's worker threads (ignored with a user task system):
-	/// 0 normal, 1 above normal, 2 highest, 3 time critical. Implemented on Windows; other platforms ignore it.
-	int workerPriority;
-
 	/// function to spawn task
 	b3EnqueueTaskCallback* enqueueTask;
 
@@ -2801,12 +2797,6 @@ typedef struct b3ManifoldPoint
 	/// This includes the warm starting impulse, the sub-step delta impulse, and the restitution
 	/// impulse.
 	float totalNormalImpulse;
-
-	/// The net normal impulse applied over the whole time step in N*s: the sum over the sub-steps of the accumulated
-	/// impulse left after the relax iteration, plus the restitution impulse. Unlike totalNormalImpulse it counts neither
-	/// the solve and the relax twice nor the push-out impulse that the relax takes back, so for a body at rest it is the
-	/// contact force times the time step. (Terra)
-	float appliedNormalImpulse;
 
 	/// Relative normal velocity pre-solve. Negative when approaching. This is only
 	/// computed if hit events are enabled.
