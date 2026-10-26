@@ -175,7 +175,10 @@ static void b3CreateWorkerContexts( b3World* world )
 
 	for ( int i = 0; i < world->workerCount; ++i )
 	{
-		world->taskContexts.data[i].arena = b3CreateArena( 128 * 1024 );
+		// Terra: one voxel-grid sampled pair bumps two B3_MAX_VOXEL_SAMPLE_POINTS buffers plus its
+		// accepted manifolds (~327 KB). Below that every new pair overflows to the heap and the
+		// blocks stay held until b3ArenaSync, so a step creating thousands of pairs stalls.
+		world->taskContexts.data[i].arena = b3CreateArena( 1024 * 1024 );
 		b3Array_Reserve( world->taskContexts.data[i].sensorHits, 8 );
 		b3Array_Reserve( world->taskContexts.data[i].pairKeys, 64 );
 		world->taskContexts.data[i].contactStateBitSet = b3CreateBitSet( 1024 );
