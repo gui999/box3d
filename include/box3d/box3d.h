@@ -185,6 +185,10 @@ B3_API void b3World_EnableLimitPassThrough( b3WorldId worldId, bool flag );
 /// instead of box pair by box pair. Other shape pairs are unchanged. Off by default.
 B3_API void b3World_EnableVoxelPointContacts( b3WorldId worldId, bool flag );
 
+/// Terra: a speculative point-sampled voxel sample within a thin band of a coplanar solid edge of the other grid moves
+/// onto the solid side, one sample inset from the edge, so overlap corners on seams answer every time. Off by default.
+B3_API void b3World_EnableVoxelEdgeSnap( b3WorldId worldId, bool flag );
+
 /// Terra: are voxel grid pair contacts point-sampled?
 B3_API bool b3World_IsVoxelPointContactsEnabled( b3WorldId worldId );
 

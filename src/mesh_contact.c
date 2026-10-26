@@ -2262,6 +2262,9 @@ typedef struct b3VoxelSampler
 	// Self is shape B of the contact: the points are flipped into the contact's convention afterwards
 	bool selfIsB;
 
+	// Terra: samples on a solid edge of other move onto its solid side (b3World_EnableVoxelEdgeSnap)
+	bool edgeSnap;
+
 	b3LocalManifoldPoint* points;
 	b3Vec3* normals;
 	int capacity;
@@ -2328,6 +2331,63 @@ static inline void b3VoxelCoordinates( const b3VoxelGrid* grid, float invVoxel, 
 	v[2] = (int)floorf( ( p.z - grid->origin.z ) * invVoxel );
 }
 
+// Terra: a speculative sample this close to a solid edge of the other grid, as a fraction of a voxel, sits on a seam: float
+// noise decides whether its probe finds the solid side, so an overlap corner there answers in one contact and not in the
+// next and the support outline goes lopsided. It moves onto the solid side, the sample inset from the edge, like the corner
+// samples of a face. Samples inside the other grid are left alone: moving those changes their exit and pushed stepped
+// pieces through each other.
+#define B3_VOXEL_EDGE_BAND 0.02f
+#define B3_VOXEL_EDGE_SNAP 0.05f
+
+// Moves q, in the frame of other, onto a solid voxel of other within the edge band, across the two axes tangent to outward,
+// when q and its probe one reach out along outward are both in empty voxels. A solid neighbour that is also solid beside q
+// itself is a riser, not a coplanar face edge, and does not pull the sample.
+static b3Vec3 b3SnapToVoxelEdge( const b3VoxelGrid* other, float voxel, b3Vec3 q, b3Vec3 outward, float reach )
+{
+	float invVoxel = 1.0f / voxel;
+	int own[3], probe[3];
+	b3VoxelCoordinates( other, invVoxel, q, own );
+	b3VoxelCoordinates( other, invVoxel, b3MulAdd( q, reach, outward ), probe );
+	if ( b3IsVoxelSolid( other, own[0], own[1], own[2], false ) || b3IsVoxelSolid( other, probe[0], probe[1], probe[2], false ) )
+	{
+		return q;
+	}
+
+	const float o[3] = { fabsf( outward.x ), fabsf( outward.y ), fabsf( outward.z ) };
+	int normalAxis = o[0] >= o[1] ? ( o[0] >= o[2] ? 0 : 2 ) : ( o[1] >= o[2] ? 1 : 2 );
+	const float origin[3] = { other->origin.x, other->origin.y, other->origin.z };
+	float p[3] = { q.x, q.y, q.z };
+	for ( int a = 0; a < 3; ++a )
+	{
+		if ( a == normalAxis )
+		{
+			continue;
+		}
+
+		float f = ( p[a] - origin[a] ) * invVoxel - (float)probe[a];
+		int step = f < B3_VOXEL_EDGE_BAND ? -1 : ( f > 1.0f - B3_VOXEL_EDGE_BAND ? 1 : 0 );
+		if ( step == 0 )
+		{
+			continue;
+		}
+
+		int w[3] = { probe[0], probe[1], probe[2] };
+		w[a] += step;
+		int beside[3] = { own[0], own[1], own[2] };
+		beside[a] += step;
+		if ( b3IsVoxelSolid( other, w[0], w[1], w[2], true ) == false ||
+			 b3IsVoxelSolid( other, beside[0], beside[1], beside[2], true ) )
+		{
+			continue;
+		}
+
+		// One snap past the edge into the neighbour
+		float edge = step < 0 ? (float)probe[a] : (float)( probe[a] + 1 );
+		p[a] = origin[a] + ( edge + (float)step * B3_VOXEL_EDGE_SNAP ) * voxel;
+	}
+	return ( b3Vec3 ){ p[0], p[1], p[2] };
+}
+
 // One sample: p is on a face of self, just inside it, with the face's outward direction, both in the frame of self. The
 // point goes in the frame of other with the normal from self to other.
 static void b3SampleVoxelPoint( b3VoxelSampler* sampler, b3Vec3 p, b3Vec3 faceNormal, int id )
@@ -2345,6 +2405,10 @@ static void b3SampleVoxelPoint( b3VoxelSampler* sampler, b3Vec3 p, b3Vec3 faceNo
 
 	sampler->sampleCount += 1;
 	b3Vec3 outward = b3RotateVector( sampler->selfToOther.q, faceNormal );
+	if ( sampler->edgeSnap )
+	{
+		q = b3SnapToVoxelEdge( other, voxel, q, outward, B3_SPECULATIVE_DISTANCE + 0.05f * voxel );
+	}
 	const float qa[3] = { q.x, q.y, q.z };
 	const float origin[3] = { other->origin.x, other->origin.y, other->origin.z };
 
@@ -2625,6 +2689,7 @@ static bool b3ComputeVoxelGridSampledManifolds( b3World* world, int workerIndex,
 		sampler.selfToOther = transformAtoB;
 		sampler.otherBounds = (b3AABB){ b3Sub( gridB->occupiedBounds.lowerBound, grow ), b3Add( gridB->occupiedBounds.upperBound, grow ) };
 		sampler.selfIsB = false;
+		sampler.edgeSnap = world->enableVoxelEdgeSnap;
 		sampler.points = points;
 		sampler.normals = normals;
 		sampler.capacity = B3_MAX_VOXEL_SAMPLE_POINTS;
@@ -2657,6 +2722,7 @@ static bool b3ComputeVoxelGridSampledManifolds( b3World* world, int workerIndex,
 		samplerB.selfToOther = transformBtoA;
 		samplerB.otherBounds = (b3AABB){ b3Sub( gridA->occupiedBounds.lowerBound, grow ), b3Add( gridA->occupiedBounds.upperBound, grow ) };
 		samplerB.selfIsB = true;
+		samplerB.edgeSnap = world->enableVoxelEdgeSnap;
 		samplerB.points = points + countA;
 		samplerB.normals = normals + countA;
 		samplerB.capacity = B3_MAX_VOXEL_SAMPLE_POINTS - countA;

@@ -312,6 +312,9 @@ typedef struct b3World
 	bool enableLimitPassThrough;
 	// Terra: voxel grid against voxel grid contacts are point-sampled against occupancy instead of collided box pair by box pair
 	bool enableVoxelPointContacts;
+
+	// Terra: point-sampled voxel samples on a solid edge of the other grid snap onto the solid side
+	bool enableVoxelEdgeSnap;
 	bool enableSpeculative;
 	bool inUse;
 } b3World;

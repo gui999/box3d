@@ -2114,6 +2114,17 @@ void b3World_EnableVoxelPointContacts( b3WorldId worldId, bool flag )
 	world->enableVoxelPointContacts = flag;
 }
 
+void b3World_EnableVoxelEdgeSnap( b3WorldId worldId, bool flag )
+{
+	b3World* world = b3GetUnlockedWorldFromId( worldId );
+	if ( world == NULL )
+	{
+		return;
+	}
+
+	world->enableVoxelEdgeSnap = flag;
+}
+
 bool b3World_IsVoxelPointContactsEnabled( b3WorldId worldId )
 {
 	b3World* world = b3GetWorldFromId( worldId );
