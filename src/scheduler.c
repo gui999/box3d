@@ -12,13 +12,6 @@
 #include <stdio.h>
 #include <string.h>
 
-#if defined( _WIN32 )
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN 1
-#endif
-#include <windows.h>
-#endif
-
 enum b3SchedulerTaskStatus
 {
 	b3_schedulerFree = 0,
@@ -38,7 +31,6 @@ typedef struct b3SchedulerWorkerContext
 {
 	struct b3Scheduler* scheduler;
 	int threadIndex;
-	int priority;
 } b3SchedulerWorkerContext;
 
 typedef struct b3Scheduler
@@ -92,18 +84,6 @@ static void b3SchedulerWorkerMain( void* context )
 	b3SchedulerWorkerContext* workerContext = context;
 	b3Scheduler* scheduler = workerContext->scheduler;
 
-	// Terra: raise this worker above ordinary background threads so the OS preempts those, not a worker
-	// that holds a solver block while the stepping thread spins on it.
-#if defined( _WIN32 )
-	if ( workerContext->priority > 0 )
-	{
-		static const int priorities[] = { THREAD_PRIORITY_NORMAL, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_HIGHEST,
-										  THREAD_PRIORITY_TIME_CRITICAL };
-		int index = workerContext->priority < 3 ? workerContext->priority : 3;
-		SetThreadPriority( GetCurrentThread(), priorities[index] );
-	}
-#endif
-
 	while ( true )
 	{
 		b3WaitSemaphore( scheduler->taskSemaphore );
@@ -120,7 +100,7 @@ static void b3SchedulerWorkerMain( void* context )
 	}
 }
 
-b3Scheduler* b3CreateScheduler( int workerCount, int workerPriority )
+b3Scheduler* b3CreateScheduler( int workerCount )
 {
 	B3_ASSERT( 0 < workerCount && workerCount <= B3_MAX_WORKERS );
 
@@ -140,7 +120,6 @@ b3Scheduler* b3CreateScheduler( int workerCount, int workerPriority )
 	{
 		scheduler->workerContexts[i].scheduler = scheduler;
 		scheduler->workerContexts[i].threadIndex = i + 1;
-		scheduler->workerContexts[i].priority = workerPriority;
 
 		char name[16];
 		snprintf( name, sizeof( name ), "box3d_worker_%02d", i + 1 );

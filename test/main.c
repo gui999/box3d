@@ -33,7 +33,6 @@ extern int BroadPhaseTest( void );
 extern int CollisionTest( void );
 extern int CompoundTest( void );
 extern int ContainerTest( void );
-extern int ContentionBench( void );
 extern int DeterminismTest( void );
 extern int DistanceTest( void );
 extern int DynamicTreeTest( void );
@@ -107,12 +106,6 @@ int main( int argc, char** argv )
 		printf( "Filter: %s\n", filter );
 	}
 	printf( "======================================\n" );
-
-	// Terra: scheduler contention benchmark, only on request.
-	if ( filter != NULL && strcmp( filter, "ContentionBench" ) == 0 )
-	{
-		RUN_TEST( ContentionBench );
-	}
 
 	// Terra: voxel grid pair contacts, box pairs against point samples, only on request.
 	if ( filter != NULL && strcmp( filter, "VoxelPointBench" ) == 0 )
