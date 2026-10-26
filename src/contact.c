@@ -141,8 +141,6 @@ void b3InitializeContactRegisters( void )
 		b3AddType( b3_voxelGridShape, b3_capsuleShape );
 		b3AddType( b3_voxelGridShape, b3_hullShape );
 		b3AddType( b3_voxelGridShape, b3_voxelGridShape );
-		b3AddType( b3_meshShape, b3_voxelGridShape );
-		b3AddType( b3_heightShape, b3_voxelGridShape );
 		s_initialized = true;
 	}
 }
@@ -597,7 +595,6 @@ static bool b3ComputeConvexManifold( b3World* world, int workerIndex, b3Contact*
 	{
 		b3ManifoldPoint* pt2 = manifold->points + i;
 		pt2->totalNormalImpulse = 0.0f;
-		pt2->appliedNormalImpulse = 0.0f;
 		pt2->persisted = false;
 
 		for ( int j = 0; j < oldCount; ++j )
@@ -849,21 +846,6 @@ bool b3UpdateContact( b3World* world, int workerIndex, b3Contact* contact, b3Sha
 	else if ( shapeA->type == b3_voxelGridShape )
 	{
 		touching = b3ComputeVoxelGridManifolds( world, workerIndex, contact, shapeA, xfA, shapeB, xfB, isFast, arena );
-
-		if ( touching && ( ( shapeA->flags & b3_enableHitEvents ) || ( shapeB->flags & b3_enableHitEvents ) ) )
-		{
-			contact->flags |= b3_simEnableHitEvent;
-		}
-		else
-		{
-			contact->flags &= ~b3_simEnableHitEvent;
-		}
-
-		B3_ASSERT( ( touching == true && contact->manifoldCount > 0 ) || ( touching == false && contact->manifoldCount == 0 ) );
-	}
-	else if ( ( shapeA->type == b3_meshShape || shapeA->type == b3_heightShape ) && shapeB->type == b3_voxelGridShape )
-	{
-		touching = b3ComputeMeshVoxelGridManifolds( world, workerIndex, contact, shapeA, xfA, shapeB, xfB, isFast, arena );
 
 		if ( touching && ( ( shapeA->flags & b3_enableHitEvents ) || ( shapeB->flags & b3_enableHitEvents ) ) )
 		{
