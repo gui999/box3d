@@ -2458,6 +2458,27 @@ static bool b3FindAnyVoxelBoxCallback( int cell, int box, b3AABB bounds, void* c
 	return false;
 }
 
+// Terra: whether any box of the other grid overlaps a face slab of this grid, tested in this
+// grid's frame (the transformed box AABB is conservative under rotation).
+typedef struct b3VoxelSlabQuery
+{
+	b3AABB slab;
+	b3Transform otherToSelf;
+	bool found;
+} b3VoxelSlabQuery;
+
+static bool b3FindSlabBoxCallback( int cell, int box, b3AABB bounds, void* context )
+{
+	B3_UNUSED( cell, box );
+	b3VoxelSlabQuery* query = context;
+	if ( b3AABB_Overlaps( b3AABB_Transform( query->otherToSelf, bounds ), query->slab ) )
+	{
+		query->found = true;
+		return false;
+	}
+	return true;
+}
+
 static bool b3SampleVoxelBoxCallback( int cell, int box, b3AABB bounds, void* context )
 {
 	b3VoxelSampler* sampler = context;
@@ -2507,6 +2528,33 @@ static bool b3SampleVoxelBoxCallback( int cell, int box, b3AABB bounds, void* co
 		float n[3] = { 0.0f, 0.0f, 0.0f };
 		n[axis] = sign;
 		b3Vec3 faceNormal = { n[0], n[1], n[2] };
+
+		// Terra: a sample yields a point only when the other grid is solid at the sample (inset
+		// inside this face) or one reach out along the face normal. Both lie in this face's slab,
+		// at least `inset` from its edges, so a face whose slab no other box overlaps with positive
+		// area is skipped: edge-only neighbours give no samples, and every point is unchanged.
+		{
+			float reach = B3_SPECULATIVE_DISTANCE + 0.05f * voxel;
+			float eps = 1.0e-4f * voxel;
+			float slabLow[3] = { low[0], low[1], low[2] };
+			float slabHigh[3] = { high[0], high[1], high[2] };
+			slabLow[axis] = ( ( face & 1 ) ? plane - inset : plane - reach ) - eps;
+			slabHigh[axis] = ( ( face & 1 ) ? plane + reach : plane + inset ) + eps;
+			slabLow[ua] += inset - eps;
+			slabHigh[ua] -= inset - eps;
+			slabLow[va] += inset - eps;
+			slabHigh[va] -= inset - eps;
+			b3VoxelSlabQuery slab = {
+				.slab = { { slabLow[0], slabLow[1], slabLow[2] }, { slabHigh[0], slabHigh[1], slabHigh[2] } },
+				.otherToSelf = b3InvertTransform( sampler->selfToOther ),
+				.found = false,
+			};
+			b3QueryVoxelGrid( sampler->other, b3AABB_Transform( sampler->selfToOther, slab.slab ), b3FindSlabBoxCallback, &slab );
+			if ( slab.found == false )
+			{
+				continue;
+			}
+		}
 
 		float us[3] = { low[ua] + inset, 0.5f * ( low[ua] + high[ua] ), high[ua] - inset };
 		float vs[3] = { low[va] + inset, 0.5f * ( low[va] + high[va] ), high[va] - inset };
