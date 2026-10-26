@@ -2339,11 +2339,22 @@ static inline void b3VoxelCoordinates( const b3VoxelGrid* grid, float invVoxel, 
 #define B3_VOXEL_EDGE_BAND 0.02f
 #define B3_VOXEL_EDGE_SNAP 0.05f
 
+// The snap applies only when the face is this close to an axis of other: the other two axes are then tangent to it, and a
+// snap of at most ( band + snap ) voxel moves the sample at most 0.003 voxel along its normal, inside its 0.05 voxel inset
+#define B3_VOXEL_EDGE_SNAP_ALIGNMENT 0.999f
+
 // Moves q, in the frame of other, onto a solid voxel of other within the edge band, across the two axes tangent to outward,
 // when q and its probe one reach out along outward are both in empty voxels. A solid neighbour that is also solid beside q
-// itself is a riser, not a coplanar face edge, and does not pull the sample.
+// itself is a riser, not a coplanar face edge, and does not pull the sample. The band is measured from q's own voxel.
 static b3Vec3 b3SnapToVoxelEdge( const b3VoxelGrid* other, float voxel, b3Vec3 q, b3Vec3 outward, float reach )
 {
+	const float o[3] = { fabsf( outward.x ), fabsf( outward.y ), fabsf( outward.z ) };
+	int normalAxis = o[0] >= o[1] ? ( o[0] >= o[2] ? 0 : 2 ) : ( o[1] >= o[2] ? 1 : 2 );
+	if ( o[normalAxis] < B3_VOXEL_EDGE_SNAP_ALIGNMENT )
+	{
+		return q;
+	}
+
 	float invVoxel = 1.0f / voxel;
 	int own[3], probe[3];
 	b3VoxelCoordinates( other, invVoxel, q, own );
@@ -2353,8 +2364,6 @@ static b3Vec3 b3SnapToVoxelEdge( const b3VoxelGrid* other, float voxel, b3Vec3 q
 		return q;
 	}
 
-	const float o[3] = { fabsf( outward.x ), fabsf( outward.y ), fabsf( outward.z ) };
-	int normalAxis = o[0] >= o[1] ? ( o[0] >= o[2] ? 0 : 2 ) : ( o[1] >= o[2] ? 1 : 2 );
 	const float origin[3] = { other->origin.x, other->origin.y, other->origin.z };
 	float p[3] = { q.x, q.y, q.z };
 	for ( int a = 0; a < 3; ++a )
@@ -2364,14 +2373,24 @@ static b3Vec3 b3SnapToVoxelEdge( const b3VoxelGrid* other, float voxel, b3Vec3 q
 			continue;
 		}
 
-		float f = ( p[a] - origin[a] ) * invVoxel - (float)probe[a];
-		int step = f < B3_VOXEL_EDGE_BAND ? -1 : ( f > 1.0f - B3_VOXEL_EDGE_BAND ? 1 : 0 );
+		float f = ( p[a] - origin[a] ) * invVoxel - (float)own[a];
+		int step = 0;
+		if ( 0.0f <= f && f < B3_VOXEL_EDGE_BAND )
+		{
+			step = -1;
+		}
+		else if ( 1.0f - B3_VOXEL_EDGE_BAND < f && f <= 1.0f )
+		{
+			step = 1;
+		}
 		if ( step == 0 )
 		{
 			continue;
 		}
 
-		int w[3] = { probe[0], probe[1], probe[2] };
+		// The neighbour one reach out: q's own voxel on the tangent axes, the probe's along the normal
+		int w[3] = { own[0], own[1], own[2] };
+		w[normalAxis] = probe[normalAxis];
 		w[a] += step;
 		int beside[3] = { own[0], own[1], own[2] };
 		beside[a] += step;
@@ -2382,7 +2401,7 @@ static b3Vec3 b3SnapToVoxelEdge( const b3VoxelGrid* other, float voxel, b3Vec3 q
 		}
 
 		// One snap past the edge into the neighbour
-		float edge = step < 0 ? (float)probe[a] : (float)( probe[a] + 1 );
+		float edge = step < 0 ? (float)own[a] : (float)( own[a] + 1 );
 		p[a] = origin[a] + ( edge + (float)step * B3_VOXEL_EDGE_SNAP ) * voxel;
 	}
 	return ( b3Vec3 ){ p[0], p[1], p[2] };
@@ -2596,18 +2615,26 @@ static bool b3SampleVoxelBoxCallback( int cell, int box, b3AABB bounds, void* co
 		// Terra: a sample yields a point only when the other grid is solid at the sample (inset
 		// inside this face) or one reach out along the face normal. Both lie in this face's slab,
 		// at least `inset` from its edges, so a face whose slab no other box overlaps with positive
-		// area is skipped: edge-only neighbours give no samples, and every point is unchanged.
+		// area is skipped: edge-only neighbours give no samples, and every point is unchanged. With
+		// edge snap on, a sample answers for a box of other up to the edge band beyond it, so the
+		// slab grows tangentially by that band, in voxels of other.
 		{
 			float reach = B3_SPECULATIVE_DISTANCE + 0.05f * voxel;
 			float eps = 1.0e-4f * voxel;
+			float tangentInset = inset;
+			if ( sampler->edgeSnap )
+			{
+				const b3VoxelGrid* otherOccupancy = b3VoxelGridOccupancy( sampler->other );
+				tangentInset -= B3_VOXEL_EDGE_BAND * otherOccupancy->cellMeters / (float)otherOccupancy->cellVoxels;
+			}
 			float slabLow[3] = { low[0], low[1], low[2] };
 			float slabHigh[3] = { high[0], high[1], high[2] };
 			slabLow[axis] = ( ( face & 1 ) ? plane - inset : plane - reach ) - eps;
 			slabHigh[axis] = ( ( face & 1 ) ? plane + reach : plane + inset ) + eps;
-			slabLow[ua] += inset - eps;
-			slabHigh[ua] -= inset - eps;
-			slabLow[va] += inset - eps;
-			slabHigh[va] -= inset - eps;
+			slabLow[ua] += tangentInset - eps;
+			slabHigh[ua] -= tangentInset - eps;
+			slabLow[va] += tangentInset - eps;
+			slabHigh[va] -= tangentInset - eps;
 			b3VoxelSlabQuery slab = {
 				.slab = { { slabLow[0], slabLow[1], slabLow[2] }, { slabHigh[0], slabHigh[1], slabHigh[2] } },
 				.otherToSelf = b3InvertTransform( sampler->selfToOther ),
