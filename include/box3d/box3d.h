@@ -1084,9 +1084,10 @@ B3_API float b3Shape_GetFriction( b3ShapeId shapeId );
 /// Takes effect at the next step. FLT_MAX is no limit.
 B3_API void b3Shape_SetMaxNormalImpulse( b3ShapeId shapeId, float impulse );
 
-/// Terra: keep a voxel grid's AABB on its occupied boxes when its body is later set static (b3Body_SetType).
-/// By default a static grid gets the AABB of the whole grid, which stays valid when voxels are added; a kept
-/// tight AABB is only valid while edits remove voxels. Applies at the next type change.
+/// Terra: keep a voxel grid's AABB on its occupied boxes while its body is static. By default a static grid
+/// gets the AABB of its whole cell lattice. Applies at once to a grid on an enabled static body, otherwise at
+/// the next type change or enable. A prepared edit (b3CommitPreparedVoxelGridEdit) refits the kept AABB, so
+/// it stays valid when voxels are added or removed.
 B3_API void b3Shape_KeepTightGridBounds( b3ShapeId shapeId, bool keep );
 
 /// Terra: get the shape's normal impulse limit per time step.
