@@ -1332,6 +1332,25 @@ float b3Shape_GetFriction( b3ShapeId shapeId )
 	return b3GetShapeMaterials( shape )[0].friction;
 }
 
+void b3Shape_KeepTightGridBounds( b3ShapeId shapeId, bool keep )
+{
+	b3World* world = b3GetUnlockedWorld( shapeId.world0 );
+	if ( world == NULL )
+	{
+		return;
+	}
+
+	b3Shape* shape = b3GetShape( world, shapeId );
+	if ( keep )
+	{
+		shape->flags |= b3_keepTightGridBounds;
+	}
+	else
+	{
+		shape->flags &= (uint8_t)~b3_keepTightGridBounds;
+	}
+}
+
 void b3Shape_SetMaxNormalImpulse( b3ShapeId shapeId, float impulse )
 {
 	B3_ASSERT( impulse >= 0.0f );

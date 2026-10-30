@@ -1771,9 +1771,14 @@ void b3Body_SetType( b3BodyId bodyId, b3BodyType type )
 		if ( shape->type == b3_voxelGridShape )
 		{
 			// A voxel grid on a moving body has the AABB of its boxes, on a static body that of the whole grid
-			if ( type == b3_staticBody )
+			// Terra: unless the shape asked to keep its tight AABB (b3Shape_KeepTightGridBounds)
+			if ( type == b3_staticBody && ( shape->flags & b3_keepTightGridBounds ) == 0 )
 			{
 				shape->flags &= (uint8_t)~b3_tightGridBounds;
+			}
+			else if ( type == b3_staticBody )
+			{
+				shape->flags |= b3_tightGridBounds;
 			}
 			else
 			{

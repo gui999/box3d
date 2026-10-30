@@ -20,7 +20,9 @@ typedef enum b3ShapeFlags
 	b3_enableCustomFiltering = 0x04,
 	b3_enableHitEvents = 0x08,
 	b3_enablePreSolveEvents = 0x10,
-	// 0x20 is free, it was the enlarged AABB flag before the broad-phase marked the tree
+	// Terra: a voxel grid that keeps b3_tightGridBounds when its body turns static (b3Shape_KeepTightGridBounds).
+	// 0x20 was the enlarged AABB flag before the broad-phase marked the tree.
+	b3_keepTightGridBounds = 0x20,
 	b3_enableSpeculative = 0x40,
 
 	// A voxel grid on a kinematic or dynamic body: its AABB is that of the occupied boxes, not the whole grid
