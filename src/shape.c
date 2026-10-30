@@ -1349,6 +1349,31 @@ void b3Shape_KeepTightGridBounds( b3ShapeId shapeId, bool keep )
 	{
 		shape->flags &= (uint8_t)~b3_keepTightGridBounds;
 	}
+
+	// A grid already on a static body takes the new bounds now; on a disabled body there is no proxy yet
+	// and the enable builds it from these bounds. A moving grid is tight either way and keeps the flag for
+	// its next type change.
+	b3Body* body = b3Array_Get( world->bodies, shape->bodyId );
+	if ( shape->type != b3_voxelGridShape || body->type != b3_staticBody )
+	{
+		return;
+	}
+
+	uint8_t tight = keep ? b3_tightGridBounds : 0;
+	if ( ( shape->flags & b3_tightGridBounds ) == tight )
+	{
+		return;
+	}
+
+	shape->flags = (uint8_t)( ( shape->flags & ~b3_tightGridBounds ) | tight );
+	if ( shape->proxyKey != B3_NULL_INDEX )
+	{
+		// Moving a static proxy marks it, so the next pair update seeds pairs from its new bounds and
+		// pairs outside them end at the next collide.
+		b3AABB* fatAABB = world->fatAABBs.data + shape->id;
+		b3UpdateShapeAABBs( shape, fatAABB, b3GetBodyTransformQuick( world, body ), b3_staticBody );
+		b3BroadPhase_MoveProxy( &world->broadPhase, shape->proxyKey, *fatAABB );
+	}
 }
 
 void b3Shape_SetMaxNormalImpulse( b3ShapeId shapeId, float impulse )
