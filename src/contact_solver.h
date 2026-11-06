@@ -10,6 +10,8 @@ typedef struct b3ManifoldConstraintPoint
 {
 	b3Vec3 rA, rB;
 	float baseSeparation;
+	// Terra: the normal speed at which posed parts close this point (b3Shape_SetLocalPose), zero for unposed shapes
+	float prescribedNormalSpeed;
 	float relativeVelocity;
 	float normalImpulse;
 	float totalNormalImpulse;

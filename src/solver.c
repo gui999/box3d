@@ -884,6 +884,18 @@ static void b3FinalizeBodiesTask( int startIndex, int endIndex, int workerIndex,
 			}
 		}
 
+		// Terra: a posed part finished its motion; the next step moves it on from here
+		if ( body->posableShapeCount > 0 )
+		{
+			int posedId = body->headShapeId;
+			while ( posedId != B3_NULL_INDEX )
+			{
+				b3Shape* posed = b3Array_Get( world->shapes, posedId );
+				posed->previousPose = posed->localPose;
+				posedId = posed->nextShapeId;
+			}
+		}
+
 		// Update shapes AABBs
 		// For fast non-bullet bodies the AABB has already been updated in b3SolveContinuous
 		// For fast bullet bodies the AABB will be updated at a later stage
@@ -1329,6 +1341,8 @@ static void b3SolverTask( void* taskContext )
 			{
 				// Overflow constraints have lower priority. Typically these are dynamic-vs-dynamic.
 				b3SolveJoints_Overflow( context, useBias );
+				// Terra: positions are integrated up to the start of this sub-step
+				context->overflowElapsed = (float)subStepIndex * context->h;
 				b3PushContacts_Overflow( context );
 
 				for ( int colorIndex = 0; colorIndex < activeColorCount; ++colorIndex )
@@ -1357,6 +1371,8 @@ static void b3SolverTask( void* taskContext )
 			for ( int j = 0; j < RELAX_ITERATIONS; ++j )
 			{
 				b3SolveJoints_Overflow( context, useBias );
+				// Terra: positions are integrated through this sub-step
+				context->overflowElapsed = (float)( subStepIndex + 1 ) * context->h;
 				b3SolveContacts_Overflow( context );
 
 				for ( int colorIndex = 0; colorIndex < activeColorCount; ++colorIndex )

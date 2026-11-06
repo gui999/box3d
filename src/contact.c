@@ -749,6 +749,28 @@ bool b3UpdateContact( b3World* world, int workerIndex, b3Contact* contact, b3Sha
 
 	B3_ASSERT( shapeB->type != b3_compoundShape );
 
+	// Terra: a posed voxel grid collides in its posed frame. Collide unposed copies in the composed frames so no shape
+	// level function applies the pose again, then move the anchors from the posed frame origins back to the body origins.
+	b3Quat bodyRotationA = xfA.q;
+	b3Quat bodyRotationB = xfB.q;
+	b3Vec3 poseOffsetA = b3Vec3_zero;
+	b3Vec3 poseOffsetB = b3Vec3_zero;
+	b3Shape unposedA, unposedB;
+	if ( shapeA->isPosed )
+	{
+		poseOffsetA = b3RotateVector( xfA.q, shapeA->localPose.p );
+		xfA = b3MulWorldTransforms( xfA, shapeA->localPose );
+		unposedA = b3UnposedShapeCopy( shapeA );
+		shapeA = &unposedA;
+	}
+	if ( shapeB->isPosed )
+	{
+		poseOffsetB = b3RotateVector( xfB.q, shapeB->localPose.p );
+		xfB = b3MulWorldTransforms( xfB, shapeB->localPose );
+		unposedB = b3UnposedShapeCopy( shapeB );
+		shapeB = &unposedB;
+	}
+
 	if ( shapeA->type == b3_compoundShape )
 	{
 		int childIndex = contact->childIndex;
@@ -887,8 +909,9 @@ bool b3UpdateContact( b3World* world, int workerIndex, b3Contact* contact, b3Sha
 
 	if ( touching )
 	{
-		b3Vec3 centerA = b3RotateVector( xfA.q, localCenterA );
-		b3Vec3 centerB = b3RotateVector( xfB.q, localCenterB );
+		// The anchors are relative to the shape frame origins; the centers of mass are in the body frames
+		b3Vec3 centerA = b3Sub( b3RotateVector( bodyRotationA, localCenterA ), poseOffsetA );
+		b3Vec3 centerB = b3Sub( b3RotateVector( bodyRotationB, localCenterB ), poseOffsetB );
 
 		// Adjust anchors to be relative to center of mass
 		for ( int i = 0; i < contact->manifoldCount; ++i )

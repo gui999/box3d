@@ -212,6 +212,17 @@ static float b3ShareNormalImpulseLimit( b3ContactConstraint* contactConstraint, 
 // s_base = s0 + dot(cB0 - cA0, normal)
 
 // Prepare overflow constraints
+// Terra: the velocity of the material point at anchor r (relative to the body's center of mass, world orientation) of a
+// posed shape moving from its previous pose to its current pose over the step (b3Shape_SetLocalPose).
+static b3Vec3 b3PrescribedPointVelocity( const b3Shape* shape, const b3BodySim* sim, b3Vec3 r, float inv_dt )
+{
+	b3Quat q = sim->transform.q;
+	b3Vec3 bodyLocal = b3Add( b3InvRotateVector( q, r ), sim->localCenter );
+	b3Vec3 shapeLocal = b3InvTransformPoint( shape->localPose, bodyLocal );
+	b3Vec3 previous = b3TransformPoint( shape->previousPose, shapeLocal );
+	return b3MulSV( inv_dt, b3RotateVector( q, b3Sub( bodyLocal, previous ) ) );
+}
+
 void b3PrepareContacts_Mesh( b3SolverBlock block, b3StepContext* context )
 {
 	b3TracyCZoneNC( prepare_contact, "Prepare Contact", b3_colorYellow, true );
@@ -326,6 +337,12 @@ void b3PrepareContacts_Mesh( b3SolverBlock block, b3StepContext* context )
 			contactConstraint->maxNormalImpulse = b3MinFloat( limitShapeA->maxNormalImpulse, limitShapeB->maxNormalImpulse );
 			contactConstraint->spentNormalImpulse = 0.0f;
 
+			// Terra: a posed part that moved since the last step brings its own motion (b3Shape_SetLocalPose)
+			bool movingA = indexA != B3_NULL_INDEX && limitShapeA->isPosable &&
+						   memcmp( &limitShapeA->localPose, &limitShapeA->previousPose, sizeof( b3Transform ) ) != 0;
+			bool movingB = indexB != B3_NULL_INDEX && limitShapeB->isPosable &&
+						   memcmp( &limitShapeB->localPose, &limitShapeB->previousPose, sizeof( b3Transform ) ) != 0;
+
 			// Only sample contact point normal velocity if needed.
 			bool haveRestitution = contact->restitution > 0.0f;
 			bool hitEvents = ( contact->flags & b3_simEnableHitEvent ) != 0;
@@ -376,6 +393,7 @@ void b3PrepareContacts_Mesh( b3SolverBlock block, b3StepContext* context )
 				b3Vec3 centerA = b3Vec3_zero;
 				b3Vec3 centerB = b3Vec3_zero;
 				float totalFrictionWeight = 0.0f;
+				b3Vec3 prescribedTangential = b3Vec3_zero;
 
 				for ( int pointIndex = 0; pointIndex < pointCount; ++pointIndex )
 				{
@@ -388,6 +406,21 @@ void b3PrepareContacts_Mesh( b3SolverBlock block, b3StepContext* context )
 
 					float s = mp->separation;
 					cp->baseSeparation = s - b3Dot( b3Sub( cp->rB, cp->rA ), normal );
+
+					// Terra: the manifold is at the posed parts' end of step geometry. They start the step back along their
+					// motion and close the point at the prescribed speed, so the separation starts that far larger.
+					cp->prescribedNormalSpeed = 0.0f;
+					if ( movingA || movingB )
+					{
+						b3Vec3 uA = movingA ? b3PrescribedPointVelocity( limitShapeA, bodySims + indexA, cp->rA, context->inv_dt )
+											: b3Vec3_zero;
+						b3Vec3 uB = movingB ? b3PrescribedPointVelocity( limitShapeB, bodySims + indexB, cp->rB, context->inv_dt )
+											: b3Vec3_zero;
+						b3Vec3 du = b3Sub( uB, uA );
+						cp->prescribedNormalSpeed = b3Dot( du, normal );
+						cp->baseSeparation -= cp->prescribedNormalSpeed * context->dt;
+						prescribedTangential = b3Sub( prescribedTangential, du );
+					}
 					cp->normalImpulse = warmStartScale * mp->normalImpulse;
 					cp->totalNormalImpulse = 0.0f;
 					cp->restitutionImpulse = 0.0f;
@@ -436,6 +469,14 @@ void b3PrepareContacts_Mesh( b3SolverBlock block, b3StepContext* context )
 				centerB = b3MulSV( invWeight, centerB );
 				constraint->centerA = centerA;
 				constraint->centerB = centerB;
+
+				// Terra: friction carries the posed parts' mean sliding motion like a conveyor surface
+				if ( ( movingA || movingB ) && pointCount > 0 )
+				{
+					b3Vec3 slide = b3MulSV( 1.0f / (float)pointCount, prescribedTangential );
+					constraint->tangentVelocity1 += b3Dot( slide, tangent1 );
+					constraint->tangentVelocity2 += b3Dot( slide, tangent2 );
+				}
 
 				for ( int pointIndex = 0; pointIndex < pointCount; ++pointIndex )
 				{
@@ -633,7 +674,7 @@ void b3PushContacts_Mesh( b3SolverBlock block, b3StepContext* context )
 				// compute current separation
 				// this is subject to round-off error if the anchor is far from the body center of mass
 				b3Vec3 ds = b3Add( dp, b3Sub( b3RotateVector( dqB, rB ), b3RotateVector( dqA, rA ) ) );
-				float s = b3Dot( ds, normal ) + cp->baseSeparation;
+				float s = b3Dot( ds, normal ) + cp->baseSeparation + cp->prescribedNormalSpeed * context->overflowElapsed;
 
 				float velocityBias;
 				float massScale;
@@ -656,7 +697,7 @@ void b3PushContacts_Mesh( b3SolverBlock block, b3StepContext* context )
 				// relative normal velocity at contact
 				b3Vec3 vrA = b3Add( vA, b3Cross( wA, rA ) );
 				b3Vec3 vrB = b3Add( vB, b3Cross( wB, rB ) );
-				float vn = b3Dot( b3Sub( vrB, vrA ), normal );
+				float vn = b3Dot( b3Sub( vrB, vrA ), normal ) + cp->prescribedNormalSpeed;
 
 				// incremental normal impulse
 				float deltaImpulse = -cp->normalMass * ( massScale * vn + velocityBias ) - impulseScale * cp->normalImpulse;
@@ -761,7 +802,7 @@ void b3SolveContacts_Mesh( b3SolverBlock block, b3StepContext* context )
 				// compute current separation
 				// this is subject to round-off error if the anchor is far from the body center of mass
 				b3Vec3 ds = b3Add( dp, b3Sub( b3RotateVector( dqB, rB ), b3RotateVector( dqA, rA ) ) );
-				float s = b3Dot( ds, normal ) + cp->baseSeparation;
+				float s = b3Dot( ds, normal ) + cp->baseSeparation + cp->prescribedNormalSpeed * context->overflowElapsed;
 
 				// speculative bias, zero when overlapped
 				float velocityBias = s > 0.0f ? s * inv_h : 0.0f;
@@ -769,7 +810,7 @@ void b3SolveContacts_Mesh( b3SolverBlock block, b3StepContext* context )
 				// relative normal velocity at contact
 				b3Vec3 vrA = b3Add( vA, b3Cross( wA, rA ) );
 				b3Vec3 vrB = b3Add( vB, b3Cross( wB, rB ) );
-				float vn = b3Dot( b3Sub( vrB, vrA ), normal );
+				float vn = b3Dot( b3Sub( vrB, vrA ), normal ) + cp->prescribedNormalSpeed;
 
 				// incremental normal impulse
 				float deltaImpulse = -cp->normalMass * ( vn + velocityBias );
@@ -993,14 +1034,14 @@ void b3ApplyRestitution_Mesh( b3SolverBlock block, b3StepContext* context )
 				else
 				{
 					b3Vec3 ds = b3Add( dp, b3Sub( b3RotateVector( dqB, rB ), b3RotateVector( dqA, rA ) ) );
-					float s = b3Dot( ds, normal ) + cp->baseSeparation;
+					float s = b3Dot( ds, normal ) + cp->baseSeparation + cp->prescribedNormalSpeed * context->dt;
 
 					velocityBias = s > 0.0f ? s * inv_h : 0.0f;
 				}
 
 				b3Vec3 vrA = b3Add( vA, b3Cross( wA, rA ) );
 				b3Vec3 vrB = b3Add( vB, b3Cross( wB, rB ) );
-				float vn = b3Dot( b3Sub( vrB, vrA ), normal );
+				float vn = b3Dot( b3Sub( vrB, vrA ), normal ) + cp->prescribedNormalSpeed;
 
 				float impulse = -cp->normalMass * ( vn + velocityBias );
 

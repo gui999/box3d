@@ -19,6 +19,8 @@
 
 #include <stdlib.h>
 
+static void b3RerouteShapeContacts( b3World* world, const b3Shape* shape );
+
 static b3Shape* b3GetShape( b3World* world, b3ShapeId shapeId )
 {
 	int id = shapeId.index1 - 1;
@@ -180,6 +182,10 @@ static b3Shape* b3CreateShapeInternal( b3World* world, b3Body* body, b3WorldTran
 	shape->explosionScale = def->explosionScale;
 	shape->maxNormalImpulse = def->maxNormalImpulse;
 	shape->limitReachedStep = 0;
+	shape->localPose = b3Transform_identity;
+	shape->previousPose = b3Transform_identity;
+	shape->isPosed = false;
+	shape->isPosable = false;
 	shape->filter = def->filter;
 	shape->userData = def->userData;
 	shape->userShape = NULL;
@@ -508,6 +514,12 @@ static void b3DestroyShapeInternal( b3World* world, b3Shape* shape, b3Body* body
 		world->compoundShapeCount -= 1;
 	}
 
+	if ( shape->isPosable )
+	{
+		B3_ASSERT( body->posableShapeCount > 0 );
+		body->posableShapeCount -= 1;
+	}
+
 	// Remove the shape from the body's doubly linked list.
 	if ( shape->prevShapeId != B3_NULL_INDEX )
 	{
@@ -626,6 +638,7 @@ void b3DestroyShape( b3ShapeId shapeId, bool updateBodyMass )
 
 b3AABB b3ComputeShapeAABB( const b3Shape* shape, b3Transform transform )
 {
+	transform = b3GetShapeFrame( shape, transform );
 	switch ( shape->type )
 	{
 		case b3_capsuleShape:
@@ -684,6 +697,8 @@ b3AABB b3ComputeSweptShapeAABB( const b3Shape* shape, const b3Sweep* sweep, floa
 	B3_ASSERT( 0.0f <= time && time <= 1.0f );
 	b3Transform xf1 = { b3Sub( sweep->c1, b3RotateVector( sweep->q1, sweep->localCenter ) ), sweep->q1 };
 	b3Transform xf2 = b3GetSweepTransform( sweep, time );
+	xf1 = b3GetShapeFrame( shape, xf1 );
+	xf2 = b3GetShapeFrame( shape, xf2 );
 
 	switch ( shape->type )
 	{
@@ -731,8 +746,11 @@ b3Vec3 b3GetShapeCentroid( const b3Shape* shape )
 			return b3AABB_Center( aabb );
 		}
 		case b3_voxelGridShape:
-			return b3AABB_Center( ( shape->flags & b3_tightGridBounds ) ? b3ComputeVoxelGridOccupiedAABB( shape->voxelGrid, b3Transform_identity )
-																			 : shape->voxelGrid->bounds );
+		{
+			b3Vec3 center = b3AABB_Center( ( shape->flags & b3_tightGridBounds ) ? b3ComputeVoxelGridOccupiedAABB( shape->voxelGrid, b3Transform_identity )
+																				 : shape->voxelGrid->bounds );
+			return shape->isPosed ? b3TransformPoint( shape->localPose, center ) : center;
+		}
 		default:
 			return b3Vec3_zero;
 	}
@@ -798,7 +816,17 @@ b3MassData b3ComputeShapeMass( const b3Shape* shape )
 			return b3ComputeSphereMass( &shape->sphere, shape->density );
 
 		case b3_voxelGridShape:
-			return b3ComputeVoxelGridMass( shape->voxelGrid, shape->density );
+		{
+			b3MassData massData = b3ComputeVoxelGridMass( shape->voxelGrid, shape->density );
+			if ( shape->isPosed )
+			{
+				// The inertia is about the grid's own center of mass, so the pose only rotates it
+				b3Matrix3 rotation = b3MakeMatrixFromQuat( shape->localPose.q );
+				massData.center = b3TransformPoint( shape->localPose, massData.center );
+				massData.inertia = b3MulMM( b3MulMM( rotation, massData.inertia ), b3Transpose( rotation ) );
+			}
+			return massData;
+		}
 
 		default:
 			return (b3MassData){ 0 };
@@ -849,7 +877,18 @@ b3ShapeExtent b3ComputeShapeExtent( const b3Shape* shape, b3Vec3 localCenter )
 			break;
 
 		case b3_voxelGridShape:
-			extent = b3ComputeVoxelGridExtent( shape->voxelGrid, localCenter );
+			if ( shape->isPosed )
+			{
+				// The thinnest extent does not depend on the pose; the farthest reach comes from the posed occupied boxes
+				extent.minExtent = b3ComputeVoxelGridExtent( shape->voxelGrid, b3InvTransformPoint( shape->localPose, localCenter ) ).minExtent;
+				b3AABB aabb = b3ComputeVoxelGridOccupiedAABB( shape->voxelGrid, shape->localPose );
+				b3Vec3 p = b3FarthestPointOnAABB( aabb, localCenter );
+				extent.maxExtent = b3Abs( b3Sub( p, localCenter ) );
+			}
+			else
+			{
+				extent = b3ComputeVoxelGridExtent( shape->voxelGrid, localCenter );
+			}
 			break;
 
 		case b3_meshShape:
@@ -891,6 +930,7 @@ float b3ComputeShapeMinExtent( const b3Shape* shape, b3Vec3 localCenter )
 
 b3CastOutput b3RayCastShape( const b3Shape* shape, b3Transform transform, const b3RayCastInput* input )
 {
+	transform = b3GetShapeFrame( shape, transform );
 	b3RayCastInput localInput = *input;
 	localInput.origin = b3InvTransformPoint( transform, input->origin );
 	localInput.translation = b3InvRotateVector( transform.q, input->translation );
@@ -930,6 +970,7 @@ b3CastOutput b3RayCastShape( const b3Shape* shape, b3Transform transform, const 
 
 b3CastOutput b3ShapeCastShape( const b3Shape* shape, b3Transform transform, const b3ShapeCastInput* input )
 {
+	transform = b3GetShapeFrame( shape, transform );
 	b3ShapeCastInput localInput = *input;
 	b3Vec3 localPoints[B3_MAX_SHAPE_CAST_POINTS];
 
@@ -983,6 +1024,7 @@ b3CastOutput b3ShapeCastShape( const b3Shape* shape, b3Transform transform, cons
 
 bool b3OverlapShape( const b3Shape* shape, b3Transform transform, const b3ShapeProxy* proxy )
 {
+	transform = b3GetShapeFrame( shape, transform );
 	b3ShapeType type = shape->type;
 	switch ( type )
 	{
@@ -1020,6 +1062,8 @@ int b3CollideMover( b3PlaneResult* planes, int planeCapacity, const b3Shape* sha
 	{
 		return 0;
 	}
+
+	transform = b3GetShapeFrame( shape, transform );
 
 	b3Capsule localMover;
 	localMover.center1 = b3InvTransformPoint( transform, mover->center1 );
@@ -1332,6 +1376,96 @@ float b3Shape_GetFriction( b3ShapeId shapeId )
 	return b3GetShapeMaterials( shape )[0].friction;
 }
 
+void b3Shape_SetLocalPose( b3ShapeId shapeId, b3Transform pose, bool move )
+{
+	B3_ASSERT( b3IsValidVec3( pose.p ) );
+	B3_ASSERT( b3IsValidQuat( pose.q ) );
+
+	b3World* world = b3GetUnlockedWorld( shapeId.world0 );
+	if ( world == NULL )
+	{
+		return;
+	}
+
+	b3Shape* shape = b3GetShape( world, shapeId );
+	B3_ASSERT( shape->type == b3_voxelGridShape );
+	if ( shape->type != b3_voxelGridShape )
+	{
+		return;
+	}
+
+	b3Body* body = b3Array_Get( world->bodies, shape->bodyId );
+	B3_ASSERT( body->type != b3_staticBody );
+	if ( body->type == b3_staticBody )
+	{
+		return;
+	}
+
+	pose.q = b3NormalizeQuat( pose.q );
+	shape->localPose = pose;
+	if ( move == false )
+	{
+		// Placed: no motion to solve this step
+		shape->previousPose = pose;
+	}
+	if ( shape->isPosable == false )
+	{
+		shape->isPosable = true;
+		body->posableShapeCount += 1;
+		b3RerouteShapeContacts( world, shape );
+	}
+	shape->isPosed = b3LengthSquared( pose.p ) > 0.0f || pose.q.v.x != 0.0f || pose.q.v.y != 0.0f || pose.q.v.z != 0.0f ||
+					 pose.q.s != 1.0f;
+	shape->localCentroid = b3GetShapeCentroid( shape );
+
+	// The part moved against everything it touches: no contact of the body may be recycled from the old pose
+	int edgeKey = body->headContactKey;
+	while ( edgeKey != B3_NULL_INDEX )
+	{
+		int contactId = edgeKey >> 1;
+		int edgeIndex = edgeKey & 1;
+		b3Contact* contact = b3Array_Get( world->contacts, contactId );
+		contact->flags &= ~b3_relativeTransformValid;
+		edgeKey = contact->edges[edgeIndex].nextKey;
+	}
+
+	b3WakeBodyWithLock( world, body );
+
+	// The body's reach for sleeping and continuous collision follows the posed parts
+	b3BodySim* bodySim = b3GetBodySim( world, body );
+	bodySim->minExtent = B3_HUGE;
+	bodySim->maxExtent = b3Vec3_zero;
+	int otherId = body->headShapeId;
+	while ( otherId != B3_NULL_INDEX )
+	{
+		const b3Shape* other = b3Array_Get( world->shapes, otherId );
+		b3ShapeExtent extent = b3ComputeShapeExtent( other, bodySim->localCenter );
+		bodySim->minExtent = b3MinFloat( bodySim->minExtent, extent.minExtent );
+		bodySim->maxExtent = b3Max( bodySim->maxExtent, extent.maxExtent );
+		otherId = other->nextShapeId;
+	}
+
+	// Bounds at the new pose now, so queries before the next step see the part where it is
+	b3AABB aabb = b3ComputeFatShapeAABB( shape, bodySim->transform, B3_SPECULATIVE_DISTANCE );
+	shape->aabb = aabb;
+	b3AABB* fatAABB = world->fatAABBs.data + shape->id;
+	if ( b3AABB_Contains( *fatAABB, aabb ) == false )
+	{
+		*fatAABB = b3AABB_Inflate( aabb, shape->aabbMargin );
+		if ( shape->proxyKey != B3_NULL_INDEX )
+		{
+			b3BroadPhase_MoveProxy( &world->broadPhase, shape->proxyKey, *fatAABB );
+		}
+	}
+}
+
+b3Transform b3Shape_GetLocalPose( b3ShapeId shapeId )
+{
+	b3World* world = b3GetWorld( shapeId.world0 );
+	b3Shape* shape = b3GetShape( world, shapeId );
+	return shape->localPose;
+}
+
 void b3Shape_KeepTightGridBounds( b3ShapeId shapeId, bool keep )
 {
 	b3World* world = b3GetUnlockedWorld( shapeId.world0 );
@@ -1376,6 +1510,37 @@ void b3Shape_KeepTightGridBounds( b3ShapeId shapeId, bool keep )
 	}
 }
 
+// Terra: the graph picks a contact's solver when the contact joins it: limited and posed contacts go to the scalar
+// overflow color, the only path that honours a limit and moves a posed part. Move this shape's live contacts so a
+// change applies at the next step.
+static void b3RerouteShapeContacts( b3World* world, const b3Shape* shape )
+{
+	b3Body* body = b3Array_Get( world->bodies, shape->bodyId );
+	int contactKey = body->headContactKey;
+	while ( contactKey != B3_NULL_INDEX )
+	{
+		b3Contact* contact = b3Array_Get( world->contacts, contactKey >> 1 );
+		contactKey = contact->edges[contactKey & 1].nextKey;
+		if ( contact->colorIndex == B3_NULL_INDEX || ( contact->shapeIdA != shape->id && contact->shapeIdB != shape->id ) )
+		{
+			continue;
+		}
+
+		const b3Shape* shapeA = b3Array_Get( world->shapes, contact->shapeIdA );
+		const b3Shape* shapeB = b3Array_Get( world->shapes, contact->shapeIdB );
+		bool overflow = b3ShapeNeedsOverflowSolve( shapeA ) || b3ShapeNeedsOverflowSolve( shapeB );
+		if ( overflow == ( contact->colorIndex == B3_OVERFLOW_INDEX ) )
+		{
+			continue;
+		}
+
+		bool meshContact = contact->flags & b3_simMeshContact;
+		b3RemoveContactFromGraph( world, contact->edges[0].bodyId, contact->edges[1].bodyId, contact->colorIndex,
+								  contact->localIndex, meshContact );
+		b3AddContactToGraph( world, contact );
+	}
+}
+
 void b3Shape_SetMaxNormalImpulse( b3ShapeId shapeId, float impulse )
 {
 	B3_ASSERT( impulse >= 0.0f );
@@ -1393,32 +1558,7 @@ void b3Shape_SetMaxNormalImpulse( b3ShapeId shapeId, float impulse )
 		return;
 	}
 
-	// The graph picks a contact's solver when the contact joins it: limited contacts go to the scalar overflow color,
-	// the only path that honours the limit. Move this shape's live contacts so the change applies at the next step.
-	b3Body* body = b3Array_Get( world->bodies, shape->bodyId );
-	int contactKey = body->headContactKey;
-	while ( contactKey != B3_NULL_INDEX )
-	{
-		b3Contact* contact = b3Array_Get( world->contacts, contactKey >> 1 );
-		contactKey = contact->edges[contactKey & 1].nextKey;
-		if ( contact->colorIndex == B3_NULL_INDEX || ( contact->shapeIdA != shape->id && contact->shapeIdB != shape->id ) )
-		{
-			continue;
-		}
-
-		const b3Shape* shapeA = b3Array_Get( world->shapes, contact->shapeIdA );
-		const b3Shape* shapeB = b3Array_Get( world->shapes, contact->shapeIdB );
-		bool limited = shapeA->maxNormalImpulse < FLT_MAX || shapeB->maxNormalImpulse < FLT_MAX;
-		if ( limited == ( contact->colorIndex == B3_OVERFLOW_INDEX ) )
-		{
-			continue;
-		}
-
-		bool meshContact = contact->flags & b3_simMeshContact;
-		b3RemoveContactFromGraph( world, contact->edges[0].bodyId, contact->edges[1].bodyId, contact->colorIndex,
-								  contact->localIndex, meshContact );
-		b3AddContactToGraph( world, contact );
-	}
+	b3RerouteShapeContacts( world, shape );
 }
 
 float b3Shape_GetMaxNormalImpulse( b3ShapeId shapeId )
@@ -1864,7 +2004,7 @@ static bool b3VoxelOverlapWakeCallback( int proxyId, uint64_t userData, void* co
 static void b3RefreshVoxelGridContacts( b3World* world, b3Shape* shape, b3AABB affected, b3AABB changed, bool touching )
 {
 	b3Body* body = b3Array_Get( world->bodies, shape->bodyId );
-	b3Transform gridTransform = b3ToRelativeTransform( b3GetBodyTransformQuick( world, body ), b3Pos_zero );
+	b3Transform gridTransform = b3GetShapeFrame( shape, b3ToRelativeTransform( b3GetBodyTransformQuick( world, body ), b3Pos_zero ) );
 
 	// Boxes in the cells next to a changed cell change their covered faces
 	// The cached query bounds of a contact are in the grid frame
@@ -3205,7 +3345,35 @@ static b3TOIOutput b3VoxelGridTimeOfImpact( b3Shape* shapeA, b3Shape* shapeB, b3
 	return best;
 }
 
+static b3TOIOutput b3UnposedShapeTimeOfImpact( b3Shape* shapeA, b3Shape* shapeB, b3Sweep* sweepA, b3Sweep* sweepB, float maxFraction );
+
+// Terra: the sweep of a posed shape's frame from the sweep of its body. The rotation gains the pose and the center of
+// mass is expressed in the shape frame, so the frame origin follows the body exactly.
+static b3Sweep b3MakePosedShapeSweep( const b3Shape* shape, const b3Sweep* bodySweep )
+{
+	b3Sweep sweep = *bodySweep;
+	sweep.localCenter = b3InvTransformPoint( shape->localPose, bodySweep->localCenter );
+	sweep.q1 = b3MulQuat( bodySweep->q1, shape->localPose.q );
+	sweep.q2 = b3MulQuat( bodySweep->q2, shape->localPose.q );
+	return sweep;
+}
+
 b3TOIOutput b3ShapeTimeOfImpact( b3Shape* shapeA, b3Shape* shapeB, b3Sweep* sweepA, b3Sweep* sweepB, float maxFraction )
+{
+	if ( shapeA->isPosed == false && shapeB->isPosed == false )
+	{
+		return b3UnposedShapeTimeOfImpact( shapeA, shapeB, sweepA, sweepB, maxFraction );
+	}
+
+	// Fold each pose into its sweep and run the time of impact on unposed copies, so no pose is applied twice
+	b3Shape copyA = b3UnposedShapeCopy( shapeA );
+	b3Shape copyB = b3UnposedShapeCopy( shapeB );
+	b3Sweep posedSweepA = shapeA->isPosed ? b3MakePosedShapeSweep( shapeA, sweepA ) : *sweepA;
+	b3Sweep posedSweepB = shapeB->isPosed ? b3MakePosedShapeSweep( shapeB, sweepB ) : *sweepB;
+	return b3UnposedShapeTimeOfImpact( &copyA, &copyB, &posedSweepA, &posedSweepB, maxFraction );
+}
+
+static b3TOIOutput b3UnposedShapeTimeOfImpact( b3Shape* shapeA, b3Shape* shapeB, b3Sweep* sweepA, b3Sweep* sweepB, float maxFraction )
 {
 	if ( shapeB->type == b3_voxelGridShape )
 	{

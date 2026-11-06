@@ -296,6 +296,7 @@ b3BodyId b3CreateBody( b3WorldId worldId, const b3BodyDef* def )
 	body->generation += 1;
 	body->headShapeId = B3_NULL_INDEX;
 	body->shapeCount = 0;
+	body->posableShapeCount = 0;
 	body->headChainId = B3_NULL_INDEX;
 	body->headContactKey = B3_NULL_INDEX;
 	body->contactCount = 0;
