@@ -438,7 +438,9 @@ void b3PrepareContacts_Mesh( b3SolverBlock block, b3StepContext* context )
 					{
 						b3Vec3 vrA = b3Add( vA, b3Cross( wA, rA ) );
 						b3Vec3 vrB = b3Add( vB, b3Cross( wB, rB ) );
-						float vn = b3Dot( normal, b3Sub( vrB, vrA ) );
+						// Terra: a posed part's prescribed motion counts in the approach speed, so it arms restitution
+						// and hit events like rigid body motion does.
+						float vn = b3Dot( normal, b3Sub( vrB, vrA ) ) + cp->prescribedNormalSpeed;
 
 						cp->relativeVelocity = vn;
 						mp->normalVelocity = hitEvents ? vn : 0.0f;
