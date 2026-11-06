@@ -1466,6 +1466,163 @@ b3Transform b3Shape_GetLocalPose( b3ShapeId shapeId )
 	return shape->localPose;
 }
 
+// Terra: the part's own path between two poses (b3Shape_SweepLocalPose)
+
+#define B3_PART_SWEEP_STEP 0.025f
+#define B3_PART_SWEEP_MAX_STEPS 256
+#define B3_PART_SWEEP_MAX_TOUCHED 64
+
+typedef struct b3PartSweepContext
+{
+	b3World* world;
+	int bodyId;
+	int touched[B3_PART_SWEEP_MAX_TOUCHED];
+	int touchedCount;
+	bool collect;
+	bool overflow;
+	bool passed;
+} b3PartSweepContext;
+
+static bool b3PartSweepCallback( b3ShapeId shapeId, void* context )
+{
+	b3PartSweepContext* sweep = context;
+	const b3Shape* other = b3Array_Get( sweep->world->shapes, shapeId.index1 - 1 );
+	if ( other->bodyId == sweep->bodyId )
+	{
+		return true;
+	}
+
+	if ( sweep->collect )
+	{
+		if ( sweep->touchedCount < B3_PART_SWEEP_MAX_TOUCHED )
+		{
+			sweep->touched[sweep->touchedCount++] = other->id;
+			return true;
+		}
+		sweep->overflow = true;
+		return false;
+	}
+
+	for ( int i = 0; i < sweep->touchedCount; ++i )
+	{
+		if ( sweep->touched[i] == other->id )
+		{
+			return true;
+		}
+	}
+
+	// A shape on the way that the end pose does not touch: the part would pass through it
+	sweep->passed = true;
+	return false;
+}
+
+static void b3PartSweepQuery( b3PartSweepContext* sweep, b3WorldId worldId, b3WorldTransform bodyTransform, b3Transform pose,
+							  b3AABB box, float radius, b3QueryFilter filter )
+{
+	b3Vec3 points[8];
+	for ( int i = 0; i < 8; ++i )
+	{
+		b3Vec3 corner = { ( i & 1 ) ? box.upperBound.x : box.lowerBound.x, ( i & 2 ) ? box.upperBound.y : box.lowerBound.y,
+						  ( i & 4 ) ? box.upperBound.z : box.lowerBound.z };
+		points[i] = b3RotateVector( bodyTransform.q, b3TransformPoint( pose, corner ) );
+	}
+	b3ShapeProxy proxy = { points, 8, radius };
+	b3World_OverlapShape( worldId, bodyTransform.p, &proxy, filter, b3PartSweepCallback, sweep );
+}
+
+static b3Transform b3PartSweepPose( b3Transform from, b3Transform to, float alpha )
+{
+	return (b3Transform){ b3Lerp( from.p, to.p, alpha ), b3NLerp( from.q, to.q, alpha ) };
+}
+
+b3Transform b3Shape_SweepLocalPose( b3ShapeId shapeId, b3Transform target, float radius, b3QueryFilter filter )
+{
+	b3World* world = b3GetUnlockedWorld( shapeId.world0 );
+	if ( world == NULL )
+	{
+		return target;
+	}
+
+	b3Shape* shape = b3GetShape( world, shapeId );
+	B3_ASSERT( shape->type == b3_voxelGridShape );
+	if ( shape->type != b3_voxelGridShape )
+	{
+		return target;
+	}
+
+	target.q = b3NormalizeQuat( target.q );
+	b3Transform from = shape->localPose;
+	b3AABB box = shape->voxelGrid->occupiedBounds;
+	if ( box.lowerBound.x > box.upperBound.x )
+	{
+		// An empty grid touches nothing
+		return target;
+	}
+
+	// Steps no longer than a quarter voxel at any corner of the part's box
+	float reach = 0.0f;
+	for ( int i = 0; i < 8; ++i )
+	{
+		b3Vec3 corner = { ( i & 1 ) ? box.upperBound.x : box.lowerBound.x, ( i & 2 ) ? box.upperBound.y : box.lowerBound.y,
+						  ( i & 4 ) ? box.upperBound.z : box.lowerBound.z };
+		reach = b3MaxFloat( reach, b3Distance( b3TransformPoint( from, corner ), b3TransformPoint( target, corner ) ) );
+	}
+	int stepCount = (int)ceilf( reach / B3_PART_SWEEP_STEP );
+	if ( stepCount <= 1 )
+	{
+		// Nothing fits between the two poses: the end pose's contacts take it from here
+		return target;
+	}
+	stepCount = b3MinInt( stepCount, B3_PART_SWEEP_MAX_STEPS );
+
+	b3Body* body = b3Array_Get( world->bodies, shape->bodyId );
+	b3WorldTransform bodyTransform = b3GetBodyTransformQuick( world, body );
+	b3WorldId worldId = { (uint16_t)( shapeId.world0 + 1 ), world->generation };
+
+	b3PartSweepContext sweep = { 0 };
+	sweep.world = world;
+	sweep.bodyId = shape->bodyId;
+	sweep.collect = true;
+	b3PartSweepQuery( &sweep, worldId, bodyTransform, target, box, radius, filter );
+	if ( sweep.overflow )
+	{
+		return target;
+	}
+	sweep.collect = false;
+
+	for ( int step = 1; step < stepCount; ++step )
+	{
+		float alpha = (float)step / (float)stepCount;
+		sweep.passed = false;
+		b3PartSweepQuery( &sweep, worldId, bodyTransform, b3PartSweepPose( from, target, alpha ), box, radius, filter );
+		if ( sweep.passed == false )
+		{
+			continue;
+		}
+
+		// Stop just before the first shape on the way: the last free fraction, refined by bisection
+		float free = (float)( step - 1 ) / (float)stepCount;
+		float blocked = alpha;
+		for ( int i = 0; i < 6; ++i )
+		{
+			float middle = 0.5f * ( free + blocked );
+			sweep.passed = false;
+			b3PartSweepQuery( &sweep, worldId, bodyTransform, b3PartSweepPose( from, target, middle ), box, radius, filter );
+			if ( sweep.passed )
+			{
+				blocked = middle;
+			}
+			else
+			{
+				free = middle;
+			}
+		}
+		return b3PartSweepPose( from, target, free );
+	}
+
+	return target;
+}
+
 void b3Shape_KeepTightGridBounds( b3ShapeId shapeId, bool keep )
 {
 	b3World* world = b3GetUnlockedWorld( shapeId.world0 );

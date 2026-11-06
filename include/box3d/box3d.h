@@ -1104,6 +1104,14 @@ B3_API void b3Shape_SetLocalPose( b3ShapeId shapeId, b3Transform pose, bool move
 /// Terra: the pose of a voxel grid shape in its body frame, identity unless set.
 B3_API b3Transform b3Shape_GetLocalPose( b3ShapeId shapeId );
 
+/// Terra: the farthest pose along the part's own path from its current local pose toward target before it would pass
+/// through a shape the target pose does not touch (a limb swung through a thin wall in one step). Target itself when
+/// nothing is skipped: a target that overlaps something is left to the contacts of the next step to push apart. The
+/// path is sampled at quarter-voxel steps of the part's box corners (position lerp, rotation nlerp), each an exact
+/// overlap of the part's occupied bounds grown by radius against other bodies' shapes passing filter, refined by
+/// bisection. Conservative for a part that does not fill its bounds. Pass the result to b3Shape_SetLocalPose.
+B3_API b3Transform b3Shape_SweepLocalPose( b3ShapeId shapeId, b3Transform target, float radius, b3QueryFilter filter );
+
 /// Terra: get the shape's normal impulse limit per time step.
 B3_API float b3Shape_GetMaxNormalImpulse( b3ShapeId shapeId );
 
