@@ -1090,6 +1090,20 @@ B3_API void b3Shape_SetMaxNormalImpulse( b3ShapeId shapeId, float impulse );
 /// it stays valid when voxels are added or removed.
 B3_API void b3Shape_KeepTightGridBounds( b3ShapeId shapeId, bool keep );
 
+/// Terra: pose a voxel grid shape in the frame of its body (a character part placed by its animation). The grid then
+/// collides, casts, overlaps and weighs at that pose, and its contacts act on the body, so a posed arm against a wall
+/// pushes the body back. Call between steps, as often as every step; it wakes the body and refreshes the shape bounds
+/// at once. With move true the next step moves the part from the pose it had at the end of the last step to this one
+/// as a prescribed motion: contacts see the part's own velocity and push the body (or what the part hits) during the
+/// step instead of resolving the overlap afterwards. With move false the part is placed with no motion (spawn,
+/// handover, reattachment). The body's mass is not recomputed (call b3Body_ApplyMassFromShapes or set it). Continuous
+/// collision sweeps the body's motion with the part at its pose, not the part's own motion. Contacts of a posed shape
+/// are solved on the scalar overflow path. Only a voxel grid on a kinematic or dynamic body can be posed.
+B3_API void b3Shape_SetLocalPose( b3ShapeId shapeId, b3Transform pose, bool move );
+
+/// Terra: the pose of a voxel grid shape in its body frame, identity unless set.
+B3_API b3Transform b3Shape_GetLocalPose( b3ShapeId shapeId );
+
 /// Terra: get the shape's normal impulse limit per time step.
 B3_API float b3Shape_GetMaxNormalImpulse( b3ShapeId shapeId );
 

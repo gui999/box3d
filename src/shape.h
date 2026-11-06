@@ -8,6 +8,8 @@
 #include "box3d/collision.h"
 #include "box3d/types.h"
 
+#include <float.h>
+
 #include <stdbool.h>
 
 typedef struct b3BroadPhase b3BroadPhase;
@@ -45,6 +47,14 @@ typedef struct b3Shape
 	uint64_t limitReachedStep;
 	float aabbMargin;
 
+	// Terra: the pose of a voxel grid shape in its body frame (b3Shape_SetLocalPose). Identity unless isPosed.
+	// previousPose is the pose at the end of the last step: the solver moves the part from it to localPose during the
+	// step. isPosable stays set once a shape has been posed and routes its contacts to the scalar overflow solver.
+	b3Transform localPose;
+	b3Transform previousPose;
+	bool isPosed;
+	bool isPosable;
+
 	b3AABB aabb;
 	b3Vec3 localCentroid;
 
@@ -81,6 +91,35 @@ typedef struct b3Shape
 static inline b3SurfaceMaterial* b3GetShapeMaterials( const b3Shape* shape )
 {
 	return shape->materials != NULL ? shape->materials : (b3SurfaceMaterial*)&shape->material;
+}
+
+// Terra: the frame of a shape given its body transform. A posed voxel grid sits at its local pose on the body;
+// every other shape is in the body frame. The shape level functions below (AABB, centroid, extent, mass, ray and
+// shape casts, overlap, mover, time of impact) apply the pose themselves; code that has already composed the pose
+// passes an unposed copy (b3UnposedShapeCopy) so it is not applied twice.
+static inline b3Transform b3GetShapeFrame( const b3Shape* shape, b3Transform bodyTransform )
+{
+	return shape->isPosed ? b3MulTransforms( bodyTransform, shape->localPose ) : bodyTransform;
+}
+
+static inline b3WorldTransform b3GetShapeWorldFrame( const b3Shape* shape, b3WorldTransform bodyTransform )
+{
+	return shape->isPosed ? b3MulWorldTransforms( bodyTransform, shape->localPose ) : bodyTransform;
+}
+
+// Terra: a contact is solved on the scalar overflow path when a shape has an impulse limit (only that path shares
+// it) or has been posed (only that path moves a part along its prescribed motion).
+static inline bool b3ShapeNeedsOverflowSolve( const b3Shape* shape )
+{
+	return shape->maxNormalImpulse < FLT_MAX || shape->isPosable;
+}
+
+static inline b3Shape b3UnposedShapeCopy( const b3Shape* shape )
+{
+	b3Shape copy = *shape;
+	copy.isPosed = false;
+	copy.localPose = b3Transform_identity;
+	return copy;
 }
 
 void b3CreateShapeProxy( b3World* world, b3Shape* shape, b3BodyType type, b3WorldTransform transform, bool forcePairCreation );

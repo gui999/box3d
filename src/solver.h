@@ -193,6 +193,9 @@ typedef struct b3StepContext
 
 	int subStepCount;
 
+	// Terra: time since the start of the step at the current overflow contact solve, for posed shapes' motion
+	float overflowElapsed;
+
 	b3Softness contactSoftness;
 	b3Softness staticSoftness;
 

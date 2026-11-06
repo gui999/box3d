@@ -1872,6 +1872,93 @@ static int VoxelGridMergedRegionAddWakesOverlap( void )
 	return 0;
 }
 
+// Terra: a box grid of the given size in meters on a body, its cell lattice at origin (one 2 m cell of 0.1 m voxels)
+static b3ShapeId PosedTestGrid( b3BodyId body, float sx, float sy, float sz, b3Vec3 origin )
+{
+	float box[6] = { 0.0f, 0.0f, 0.0f, sx, sy, sz };
+	b3VoxelGridModule* module = b3CreateVoxelGridModule( box, 1, CELL_METERS, CELL_VOXELS );
+	int padded[27];
+	for ( int i = 0; i < 27; ++i )
+	{
+		padded[i] = -1;
+	}
+	padded[13] = 0;
+	b3VoxelGridDef def = {
+		.cellCountX = 1,
+		.cellCountY = 1,
+		.cellCountZ = 1,
+		.origin = origin,
+		.cellMeters = CELL_METERS,
+		.cellVoxels = CELL_VOXELS,
+		.maxBoxesPerCell = 1,
+		.modules = &module,
+		.moduleCount = 1,
+		.paddedCells = padded,
+	};
+	b3VoxelGrid* grid = b3CreateVoxelGrid( &def );
+	b3ReleaseVoxelGridModule( module );
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	shapeDef.density = 1000.0f;
+	b3ShapeId shape = b3CreateVoxelGridShape( body, &shapeDef, grid );
+	b3ReleaseVoxelGrid( grid );
+	return shape;
+}
+
+// Terra: a posed arm (b3Shape_SetLocalPose) raised into a 0.1 m static wall pushes its upright body back along the
+// arm's prescribed motion and never passes the wall; moving the pose back clears the contact, and the ray hits the arm
+// where its pose puts it.
+static int VoxelGridPosedArmPushesBody( void )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.gravity = b3Vec3_zero;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	b3BodyDef wallDef = b3DefaultBodyDef();
+	wallDef.position = (b3Pos){ 0.55f, 0.0f, -1.0f };
+	b3BodyId wall = b3CreateBody( worldId, &wallDef );
+	PosedTestGrid( wall, 0.1f, 2.0f, 2.0f, b3Vec3_zero );
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	bodyDef.enableSleep = false;
+	bodyDef.motionLocks = (b3MotionLocks){ false, false, false, true, true, true };
+	b3BodyId body = b3CreateBody( worldId, &bodyDef );
+	PosedTestGrid( body, 0.4f, 1.4f, 0.2f, (b3Vec3){ -0.2f, 0.0f, -0.1f } );
+	b3ShapeId arm = PosedTestGrid( body, 0.1f, 0.6f, 0.1f, (b3Vec3){ -0.05f, -0.6f, -0.05f } );
+	b3Vec3 shoulder = { 0.25f, 1.4f, 0.0f };
+	b3Shape_SetLocalPose( arm, (b3Transform){ shoulder, b3Quat_identity }, false );
+	b3Body_ApplyMassFromShapes( body );
+
+	// Raise the arm to point along +x over 30 steps: its 0.85 m reach is 0.3 m past the wall's near face
+	float worstHand = 0.0f;
+	for ( int i = 1; i <= 60; ++i )
+	{
+		float angle = 0.5f * B3_PI * b3MinFloat( 1.0f, (float)i / 30.0f );
+		b3Quat q = b3MakeQuatFromAxisAngle( (b3Vec3){ 0.0f, 0.0f, 1.0f }, angle );
+		b3Shape_SetLocalPose( arm, (b3Transform){ shoulder, q }, true );
+		b3World_Step( worldId, 1.0f / 60.0f, 4 );
+		b3Transform pose = b3Shape_GetLocalPose( arm );
+		b3Vec3 local = b3Add( pose.p, b3RotateVector( pose.q, (b3Vec3){ 0.0f, -0.6f, 0.0f } ) );
+		b3Vec3 hand = b3Add( b3Body_GetPosition( body ), local );
+		worstHand = b3MaxFloat( worstHand, hand.x );
+	}
+
+	b3Pos position = b3Body_GetPosition( body );
+	ENSURE( worstHand < 0.55f + 0.02f );
+	ENSURE( position.x < -0.25f );
+
+	// The ray down onto the raised hand names the arm
+	b3Vec3 hand = b3Add( position, (b3Vec3){ 0.8f, 3.0f, 0.0f } );
+	b3RayResult hit = b3World_CastRayClosest( worldId, hand, (b3Vec3){ 0.0f, -3.0f, 0.0f }, b3DefaultQueryFilter() );
+	ENSURE( hit.hit );
+	ENSURE( B3_ID_EQUALS( hit.shapeId, arm ) );
+	printf( "  posed arm: body %.3f %.3f, hand max %.3f, hit %.3f %.3f\n", position.x, position.y, worstHand, hit.point.x, hit.point.y );
+	ENSURE_SMALL( hit.point.y - ( position.y + 1.45f ), 1e-3f );
+
+	b3DestroyWorld( worldId );
+	return 0;
+}
+
 int VoxelGridTest( void )
 {
 	RUN_SUBTEST( VoxelGridMergedRegionAddWakesOverlap );
@@ -1902,5 +1989,6 @@ int VoxelGridTest( void )
 	RUN_SUBTEST( VoxelGridFastShard );
 	RUN_SUBTEST( VoxelGridMovingQueries );
 	RUN_SUBTEST( VoxelGridShardEdit );
+	RUN_SUBTEST( VoxelGridPosedArmPushesBody );
 	return 0;
 }

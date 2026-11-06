@@ -98,7 +98,7 @@ void b3AddContactToGraph( b3World* world, b3Contact* contact )
 	// across its points. The limit routes a contact when it starts touching; b3Shape_SetMaxNormalImpulse moves live ones.
 	const b3Shape* shapeA = b3Array_Get( world->shapes, contact->shapeIdA );
 	const b3Shape* shapeB = b3Array_Get( world->shapes, contact->shapeIdB );
-	bool limited = shapeA->maxNormalImpulse < FLT_MAX || shapeB->maxNormalImpulse < FLT_MAX;
+	bool limited = b3ShapeNeedsOverflowSolve( shapeA ) || b3ShapeNeedsOverflowSolve( shapeB );
 
 #if B3_FORCE_OVERFLOW == 0
 	if ( limited )

@@ -96,6 +96,8 @@ typedef struct b3Body
 	// todo maybe move this to the body sim
 	int headShapeId;
 	int shapeCount;
+	// Terra: shapes of this body that have been posed (b3Shape_SetLocalPose); their pose motion is solved each step
+	int posableShapeCount;
 
 	int headChainId;
 
