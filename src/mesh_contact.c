@@ -2358,6 +2358,10 @@ static bool b3BuildClusterManifolds( b3World* world, b3Contact* contact, b3Local
 			target->separation = source->separation - restOffset;
 			target->featureId = b3MakeFeatureId( source->pair );
 			target->triangleIndex = source->triangleIndex;
+			// Terra: a voxel pair has no triangle; upstream (#212) added these two fields to b3ManifoldPoint, and the manifold
+			// blocks are recycled, so they are set here
+			target->triangleFeature = b3_featureNone;
+			target->meshFlags = 0;
 
 			// Preserve normal impulse if possible
 			if ( matchedManifold != NULL )
