@@ -2993,6 +2993,10 @@ typedef struct b3VoxelSampler
 	// Terra: samples on a solid edge of other move onto its solid side (b3World_EnableVoxelEdgeSnap)
 	bool edgeSnap;
 
+	// Terra (BR-1211, MR-02): how far inside its face a sample of self sits, 0.05 of self's own voxel. The voxel of other
+	// sizes the walk, the closest-voxel gap and the edge band, never this inset.
+	float selfInset;
+
 	b3LocalManifoldPoint* points;
 	b3Vec3* normals;
 	int capacity;
@@ -3154,7 +3158,7 @@ static void b3SampleVoxelPoint( b3VoxelSampler* sampler, b3Vec3 p, b3Vec3 faceNo
 	b3Vec3 outward = b3RotateVector( sampler->selfToOther.q, faceNormal );
 	if ( sampler->edgeSnap )
 	{
-		q = b3SnapToVoxelEdge( other, voxel, q, outward, B3_SPECULATIVE_DISTANCE + 0.05f * voxel );
+		q = b3SnapToVoxelEdge( other, voxel, q, outward, B3_SPECULATIVE_DISTANCE + sampler->selfInset );
 	}
 	const float qa[3] = { q.x, q.y, q.z };
 	const float origin[3] = { other->origin.x, other->origin.y, other->origin.z };
@@ -3221,7 +3225,7 @@ static void b3SampleVoxelPoint( b3VoxelSampler* sampler, b3Vec3 p, b3Vec3 faceNo
 	}
 
 	// Outside: the voxel one speculative distance out along the face
-	float reach = B3_SPECULATIVE_DISTANCE + 0.05f * voxel;
+	float reach = B3_SPECULATIVE_DISTANCE + sampler->selfInset;
 	b3Vec3 probe = b3MulAdd( q, reach, outward );
 	int u[3];
 	b3VoxelCoordinates( other, invVoxel, probe, u );
@@ -3252,7 +3256,7 @@ static void b3SampleVoxelPoint( b3VoxelSampler* sampler, b3Vec3 p, b3Vec3 faceNo
 		return;
 	}
 
-	float separation = fabsf( gap[axis] ) - 0.05f * voxel;
+	float separation = fabsf( gap[axis] ) - sampler->selfInset;
 	if ( separation > B3_SPECULATIVE_DISTANCE )
 	{
 		return;
@@ -3321,6 +3325,7 @@ static bool b3SampleVoxelBoxCallback( int cell, int box, b3AABB bounds, void* co
 	float voxel = occupancy->cellMeters / (float)occupancy->cellVoxels;
 	float invVoxel = 1.0f / voxel;
 	float inset = 0.05f * voxel;
+	sampler->selfInset = inset;
 	int key = b3VoxelGridKey( self, cell, box );
 	const float low[3] = { bounds.lowerBound.x, bounds.lowerBound.y, bounds.lowerBound.z };
 	const float high[3] = { bounds.upperBound.x, bounds.upperBound.y, bounds.upperBound.z };
